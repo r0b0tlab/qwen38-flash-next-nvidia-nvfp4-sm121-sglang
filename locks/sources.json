@@ -1,0 +1,234 @@
+{
+  "schema": "r0b0tlab.qwen38fn.sources.v1",
+  "frozen_at": "2026-09-07T23:22:51.080993+00:00",
+  "sglang": {
+    "main": "20ca564bf77518604b89dc9f7fdba640daabd88b",
+    "release": "v0.5.19",
+    "prs": {
+      "36497": {
+        "head": "4ccff141dbe992794f9da6c3aa23535b4f72000d",
+        "base": "main",
+        "state": "open",
+        "merged": false,
+        "merge_commit": null,
+        "url": "https://github.com/sgl-project/sglang/pull/36497"
+      },
+      "37500": {
+        "head": "a204895c828f0269cb45b7066caa7f8f43eda374",
+        "base": "main",
+        "state": "open",
+        "merged": false,
+        "merge_commit": null,
+        "url": "https://github.com/sgl-project/sglang/pull/37500"
+      },
+      "37752": {
+        "head": "43696751ba8e73425295bfeed5502adfd9f91a3c",
+        "base": "qwen4-main-squashed-rebased",
+        "state": "open",
+        "merged": false,
+        "merge_commit": "9de3836ce8bc01a962a68505e9016ed93f345b43",
+        "url": "https://github.com/sgl-project/sglang/pull/37752"
+      },
+      "37068": {
+        "head": "0977d22bb005695fef0aee4bc59adfab45b7a496",
+        "base": "qwen4-main-squashed",
+        "state": "closed",
+        "merged": true,
+        "merge_commit": "3a09f089e068fe4295cccf246a94436b3215f22b",
+        "url": "https://github.com/sgl-project/sglang/pull/37068"
+      },
+      "38123": {
+        "head": "a10c499126b4a977faba7d95d2ded51366ab82c3",
+        "base": "qwen4-main-squashed",
+        "state": "closed",
+        "merged": true,
+        "merge_commit": "c093db93089b2ca7db06eddc66d9e360e5712fe8",
+        "url": "https://github.com/sgl-project/sglang/pull/38123"
+      },
+      "36845": {
+        "head": "d0ed31a404274d16fe0ca59623782e37e3620969",
+        "base": "qwen4-main-squashed",
+        "state": "closed",
+        "merged": true,
+        "merge_commit": "78c5024e9d9f589dcb4deb7f4ba4fb23f7e85385",
+        "url": "https://github.com/sgl-project/sglang/pull/36845"
+      },
+      "38308": {
+        "head": "b85a44e24669b44342dac6df4a12e182ff35e097",
+        "base": "qwen4-main-squashed",
+        "state": "closed",
+        "merged": true,
+        "merge_commit": "c8457de59a7ebe231862d7390e2f8d691317406b",
+        "url": "https://github.com/sgl-project/sglang/pull/38308"
+      },
+      "38290": {
+        "head": "7e2a26d5afdbb22197e308a29cefb750ad8d3bf4",
+        "base": "qwen4-main-squashed",
+        "state": "closed",
+        "merged": true,
+        "merge_commit": "4ccff141dbe992794f9da6c3aa23535b4f72000d",
+        "url": "https://github.com/sgl-project/sglang/pull/38290"
+      }
+    }
+  },
+  "model": {
+    "id": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+    "sha": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+    "files": [
+      {
+        "path": ".gitattributes",
+        "size": 1635,
+        "sha256": null,
+        "git_blob": "a09db2ea4d1bd1fc1c09f6fca45e8e4054953535"
+      },
+      {
+        "path": "README.md",
+        "size": 12109,
+        "sha256": null,
+        "git_blob": "f3edfc5b8f2cae8ae751162626d4c5aa3ed071a6"
+      },
+      {
+        "path": "chat_template.jinja",
+        "size": 8952,
+        "sha256": null,
+        "git_blob": "c0c686f9c38d70d179fb7b5f5aa7530bc913dda3"
+      },
+      {
+        "path": "config.json",
+        "size": 30820,
+        "sha256": null,
+        "git_blob": "d9df7636dc5b8bdab82655aba8ce0ebe25b22342"
+      },
+      {
+        "path": "generation_config.json",
+        "size": 202,
+        "sha256": null,
+        "git_blob": "023756cfadf88e5bf69eefeee3e172f38c448d64"
+      },
+      {
+        "path": "hf_quant_config.json",
+        "size": 23001,
+        "sha256": null,
+        "git_blob": "89bb1a48d2358f4b9ab7959bd4357a6d6d04020e"
+      },
+      {
+        "path": "merges.txt",
+        "size": 3353259,
+        "sha256": null,
+        "git_blob": "a494e019ca1502219fd0128658b979e5f05ae8e8"
+      },
+      {
+        "path": "model-00001-of-00010.safetensors",
+        "size": 3115991696,
+        "sha256": "63fde954be6f08b49b876f4f70a0ad0bcfee71aff7b1faa33779b6b32feca2a2",
+        "git_blob": "cc1ea325b748152fc2e2c918a573763754acb04a"
+      },
+      {
+        "path": "model-00002-of-00010.safetensors",
+        "size": 10005510304,
+        "sha256": "4dafaef62a908e49e0d92c7c2a3fa99f4d9651fdeeb0ca09f09a9b40095af4e0",
+        "git_blob": "b27deb837913bec6df4848451aa0faac0e6ff851"
+      },
+      {
+        "path": "model-00003-of-00010.safetensors",
+        "size": 10005364728,
+        "sha256": "3218ddc129258e91a721a8e81329ca8f00588332ec721bd8d2cf7d20e324bf47",
+        "git_blob": "8685aea0a89fd94bae7e45c093d9720cfc08f08c"
+      },
+      {
+        "path": "model-00004-of-00010.safetensors",
+        "size": 10006060112,
+        "sha256": "55e2bdf6a3a1f6e65270787f65c63b2a2a56b308b54eb1fb318dfabc9b48b141",
+        "git_blob": "26b3d2d2875fb47748a2bbaeb66c53e7d5f28957"
+      },
+      {
+        "path": "model-00005-of-00010.safetensors",
+        "size": 10005362392,
+        "sha256": "d3c169d3694bfba846455d01e48f047d770f78d071c5a4d22f129389411d686e",
+        "git_blob": "09a5a9eca64e233417f69658786d4b990ba78dc9"
+      },
+      {
+        "path": "model-00006-of-00010.safetensors",
+        "size": 10005375328,
+        "sha256": "38f65a9d11090428e139cc60d0587e8e5433ea2ce79820883c583d7cfcc53130",
+        "git_blob": "1677993137ed61a8d20c86d8a3309819b52dbda9"
+      },
+      {
+        "path": "model-00007-of-00010.safetensors",
+        "size": 10005956544,
+        "sha256": "8cf3fa05c04cb2e060963b69bb01f7a7b9f43c58435fbe380836a0457a19cd3e",
+        "git_blob": "b0225a45639224068ea9c09a1e626103c8d0fb7e"
+      },
+      {
+        "path": "model-00008-of-00010.safetensors",
+        "size": 10005375200,
+        "sha256": "53d1f80746aa0cc0a7c2f4836587002a8a4dd72c827432cd2e43abae3c3899e4",
+        "git_blob": "cb519eca012d73bc0581602cf11f19c404eddb3e"
+      },
+      {
+        "path": "model-00009-of-00010.safetensors",
+        "size": 5679113808,
+        "sha256": "eaff6a87ece6fbfd6ad0fbaa0a5cf9ff542f8076acba38e62410b1ed55e12cc3",
+        "git_blob": "309a07d3d3571d75a92640fde8d04c4715ec442e"
+      },
+      {
+        "path": "model-00010-of-00010.safetensors",
+        "size": 128587536,
+        "sha256": "0d49b0cf7c15bf9b5bd1e17403b36727315860a8f2a2e0f5a53655547084f640",
+        "git_blob": "242cee9fd1ba2ab3ea64f2465608e6de14a16db8"
+      },
+      {
+        "path": "model-fp8-mtp-ple.safetensors",
+        "size": 53717551730,
+        "sha256": "3525520c8602d850003eb1960aec0b64291dae33b83f8b65dd639a451df78823",
+        "git_blob": "e51653dec2b4181090936870439f2f0f71ce9eca"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "size": 31275518,
+        "sha256": "660414e8300728ba80062e6a3c81cb76a65e2ab136ac9e9ceb450ba0c51c3c0d",
+        "git_blob": "e7b80ae9e50d978fce1a1c49f2ab139ad256530a"
+      },
+      {
+        "path": "preprocessor_config.json",
+        "size": 390,
+        "sha256": null,
+        "git_blob": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64"
+      },
+      {
+        "path": "processor_config.json",
+        "size": 1191,
+        "sha256": null,
+        "git_blob": "33818c7f9e991ad735fd240209f4fa73e6c28c50"
+      },
+      {
+        "path": "tokenizer.json",
+        "size": 12809320,
+        "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+        "git_blob": "9328ce9c41e80f6dd7bc2c66d8ae1fc93bf87440"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "size": 17928,
+        "sha256": null,
+        "git_blob": "5de744b3fca2129d7186979ae47c06be33903243"
+      },
+      {
+        "path": "video_preprocessor_config.json",
+        "size": 385,
+        "sha256": null,
+        "git_blob": "3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe"
+      },
+      {
+        "path": "vocab.json",
+        "size": 6722759,
+        "sha256": null,
+        "git_blob": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176"
+      }
+    ]
+  },
+  "hardware": {
+    "gpu_count": 1,
+    "compute_capability": "12.1"
+  }
+}
