@@ -1,0 +1,11 @@
+.hermes/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+vendor/
+build/
+wheelhouse/
+fixtures/generated/
+config.local.json
+*.env
