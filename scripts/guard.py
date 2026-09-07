@@ -172,7 +172,10 @@ def check_receipt(
     """
     from scripts import verify_files as vf
 
-    receipt = vf.load_receipt(receipt_path)
+    try:
+        receipt = vf.load_receipt(receipt_path)
+    except vf.VerifyError as exc:
+        raise LaunchError("receipt unusable: %s" % (exc,)) from exc
     expected_id = (sources.get("model") or {}).get("id")
     expected_sha = (sources.get("model") or {}).get("sha")
     if expected_id is None or expected_sha is None:
@@ -311,6 +314,66 @@ def run_watchdog(
         if clock() - start > max_seconds:
             return "timeout"
         time.sleep(poll_seconds)
+
+
+# ------------------------------------------------------- scoped stopping
+
+def _default_docker_inspect(cid: str) -> Dict[str, Any]:
+    done = subprocess.run(
+        ["docker", "inspect", "--format", "{{json .Config.Labels}}", cid],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if done.returncode != 0:
+        raise LaunchError(
+            "inspect failed for %s: %s" % (cid, done.stderr.strip()[:200])
+        )
+    try:
+        return {"labels": json.loads(done.stdout)}
+    except json.JSONDecodeError as exc:
+        raise LaunchError("inspect output unparsable for %s" % (cid,)) from exc
+
+
+def _default_docker_stop(cid: str, timeout: Optional[int] = None) -> None:
+    args = ["docker", "stop"]
+    if timeout is not None:
+        args += ["-t", str(timeout)]
+    args.append(cid)
+    done = subprocess.run(args, capture_output=True, text=True, timeout=300)
+    if done.returncode != 0:
+        raise LaunchError(
+            "stop failed for %s: %s" % (cid, done.stderr.strip()[:200])
+        )
+
+
+def stop_owned(
+    cid: str,
+    *,
+    docker_inspect: Optional[Callable[[str], Dict[str, Any]]] = None,
+    docker_stop: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Stop a container only after re-reading its ownership labels.
+
+    The inspect re-read happens at stop time (not launch time) so a
+    reused/recycled CID can never be stopped by mistake. Refuses unknown
+    CIDs and containers without our exact owner label.
+    """
+    if docker_inspect is None:
+        docker_inspect = _default_docker_inspect
+    if docker_stop is None:
+        docker_stop = _default_docker_stop
+    info = docker_inspect(cid)
+    labels = (info or {}).get("labels") or {}
+    if (
+        labels.get(OWNER_LABEL_KEY) != OWNER_LABEL_VALUE
+    ):
+        raise LaunchError(
+            "refusing to stop container %s: owner label mismatch (%r)"
+            % (cid, sorted(labels))
+        )
+    docker_stop(cid)
+    return True
 
 
 # ------------------------------------------------------------- launcher
