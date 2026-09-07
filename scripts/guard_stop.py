@@ -5,13 +5,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
-from typing import List, Optional
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from guard import EXIT_CLEANUP, EXIT_OK, LaunchError, stop_owned
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Ownership-scoped container stop (re-reads labels)."
     )
