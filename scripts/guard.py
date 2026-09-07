@@ -316,6 +316,100 @@ def run_watchdog(
         time.sleep(poll_seconds)
 
 
+# ------------------------------------------------------------- supervise
+
+def supervise(
+    *,
+    proc,
+    journal: Journal,
+    cleanup,
+    reader: Callable[[], Optional[int]] = read_mem_available,
+    floor_kb: int = WATCHDOG_MEM_AVAILABLE_FLOOR_KB,
+    immediate_kb: int = WATCHDOG_MEM_AVAILABLE_IMMEDIATE_KB,
+    sustained_samples: int = WATCHDOG_SUSTAINED_SAMPLES,
+    poll_seconds: float = 1.0,
+    clock: Callable[[], float] = time.monotonic,
+    max_seconds: float = 86400.0,
+) -> int:
+    """Own the server lifecycle end to end.
+
+    ``proc`` is any object with ``poll()`` and ``kill()`` (or a callable
+    returning the exit code once finished). ``cleanup`` is the scoped
+    stop callable. Ordering guarantees:
+
+    - the exit code of the server is PRESERVED verbatim, even when
+      cleanup fails (cleanup failures are recorded in the journal as
+      ``cleanup_failed`` but never masked into the exit code);
+    - a watchdog breach kills the server BEFORE stopping the container,
+      never leaving a long client draining a dying prefill;
+    - once the server has exited, ``kill`` is never called again.
+
+    Returns the server exit code, or EXIT_OOM_FLOOR on watchdog breach.
+    """
+    code = None
+    while True:
+        code = proc.poll() if not callable(proc) else proc()
+        if code is not None:
+            try:
+                journal.emit(
+                    "server_exited",
+                    epoch=0, cid="", detail=json.dumps({"exit_code": code}),
+                )
+            except Exception:
+                pass
+            break
+        sample = reader()
+        low = sample is None or sample <= immediate_kb or sample < floor_kb
+        breach = run_watchdog(
+            proc,
+            journal,
+            reader=reader,
+            floor_kb=floor_kb,
+            immediate_kb=immediate_kb,
+            sustained_samples=sustained_samples,
+            poll_seconds=poll_seconds,
+            clock=clock,
+            max_seconds=max_seconds,
+        ) if low else None
+        if breach == "foreign":
+            try:
+                journal.emit(
+                    "killing_server",
+                    epoch=0, cid="",
+                    detail=json.dumps({"reason": "memory_floor"}),
+                )
+            except Exception:
+                pass
+            kill = getattr(proc, "kill", None)
+            if kill is not None:
+                kill()
+            code = EXIT_OOM_FLOOR
+            break
+        if clock() - _supervise_start(clock) > max_seconds:
+            break
+        time.sleep(poll_seconds)
+
+    # cleanup path: failures recorded, never masked into the exit code
+    try:
+        cleanup()
+        try:
+            journal.emit("cleanup_ok", epoch=0, cid="", detail="{}")
+        except Exception:
+            pass
+    except Exception as exc:  # including LaunchError
+        try:
+            journal.emit(
+                "cleanup_failed", epoch=0, cid="", detail=str(exc)[:400]
+            )
+        except Exception:
+            pass
+    return int(code)
+
+
+def _supervise_start(clock: Callable[[], float]) -> float:
+    return clock()
+
+
 # ------------------------------------------------------- scoped stopping
 
 def _default_docker_inspect(cid: str) -> Dict[str, Any]:
