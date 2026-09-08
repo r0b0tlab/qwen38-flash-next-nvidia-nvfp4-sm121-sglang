@@ -3646,6 +3646,10 @@
       "utils.py": "8e453ae5a32c045cc7f9ee842081e727fbede9ab9c88536ebb299eb122ad8ed8",
       "version.py": "b10f7d9ea276972352b1e9de0eb0bbb47d8ebe64c29469e15ea016a12019bb22"
     },
+    "wheel_omissions": [
+      "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py",
+      "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py"
+    ],
     "source_audit_exclusions": [
       "kernels/aot/",
       "_version.py"

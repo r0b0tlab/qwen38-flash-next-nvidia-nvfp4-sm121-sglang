@@ -17,6 +17,8 @@
 !build/
 !build/sglang/
 !build/sglang/**
+!build/repackage/
+!build/repackage/*.whl
 **/.git
 **/.git/**
 **/__pycache__

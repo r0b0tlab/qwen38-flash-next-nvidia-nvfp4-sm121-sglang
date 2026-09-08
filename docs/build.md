@@ -37,6 +37,31 @@ and writes `build/preparation.json`. Existing `build/sglang` is deliberately
 refused: use a fresh checkout/context rather than merging stale source files.
 Model weights are never part of the Docker context.
 
+## Packaging-only retry from a retained native wheel
+
+The complete source inventory retains all 3,624 tracked Python files. The
+installed-wheel audit omits exactly two upstream `.claude` developer-skill
+helpers that setuptools does not distribute; neither is SRT/runtime code.
+The wheel contains all 3,622 required package source files byte-for-byte,
+plus generated `_version.py` checked through installed package metadata.
+Omitting any runtime source is still a hard failure.
+
+If native compilation completed but a later image audit failed, preserve the
+compiled wheel, its SHA256, source commit/tree, package version and builder
+image evidence. `scripts/prepare_repackage.py` verifies those identities,
+every packaged source hash and all four AArch64 Rust extensions, then derives
+`build/Dockerfile.repackage` from the cold Dockerfile. Only the wheel COPY is
+replaced and an exact checksum check added. BuildKit does not execute the
+unreferenced native builder stage on this explicit packaging-only route:
+
+    python3 scripts/prepare_repackage.py --wheel "$VERIFIED_WHEEL" --receipt "$COMPILED_ARTIFACT_RECEIPT"
+
+Use the same admitted build arguments below, adding
+`-f build/Dockerfile.repackage`, with a fresh attempt directory and current
+wrapper revision. Do not reuse a wheel after changing its source, toolchain,
+package version or native build inputs. The cold Dockerfile still rebuilds
+the native extensions for the final clean-rebuild gate.
+
 ## Native build, only after review/resource admission
 
 Run under one durable build owner with a fresh log/evidence directory. The

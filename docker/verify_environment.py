@@ -16,6 +16,26 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
 
+WHEEL_OMISSIONS = (
+    "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py",
+    "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py",
+)
+
+
+def installed_source_inventory(source):
+    # The full source inventory remains intact for reconstruction. Upstream
+    # wheel packaging omits exactly these two hidden developer-skill scripts.
+    if source.get("wheel_omissions") != list(WHEEL_OMISSIONS):
+        raise ValueError("unrecognized installed-wheel omission policy")
+    if not set(WHEEL_OMISSIONS) <= source["python_files"].keys():
+        raise ValueError("omitted developer files missing from full source inventory")
+    return {
+        name: sha
+        for name, sha in source["python_files"].items()
+        if name not in WHEEL_OMISSIONS
+    }
+
+
 def dependency_violations(packages, environment):
     versions = {canonicalize_name(row["name"]): row["version"] for row in packages}
     errors = []
@@ -90,7 +110,7 @@ def verify(root, phase):
         assert "site-packages" in installed.parts and "/sgl-workspace/" not in str(
             installed
         ), str(installed)
-        for relative, expected in runtime["sglang"]["python_files"].items():
+        for relative, expected in installed_source_inventory(runtime["sglang"]).items():
             path = installed / relative
             assert (
                 path.is_file()
