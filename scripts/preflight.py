@@ -39,7 +39,7 @@ PHASE_SERVE = "serve"
 RAM_AVAILABLE_MIN_GIB = 104.0
 DISK_RESERVE_GIB = 32.0
 BUILD_ALLOWANCE_GIB_DEFAULT = 0.0
-GIB = 1024 ** 3
+GIB = 1024**3
 
 #: filesystem types never acceptable for the PLE/model roots
 REJECT_FILESYSTEMS = frozenset(
@@ -62,6 +62,7 @@ class PreflightError(ValueError):
 
 
 # ---------------------------------------------------------------- probes
+
 
 def read_meminfo(path: str = "/proc/meminfo") -> Optional[Dict[str, int]]:
     """kB-valued meminfo fields, or None when unreadable."""
@@ -101,7 +102,11 @@ def read_gpu_state() -> Optional[Dict[str, Any]]:
             timeout=30,
         )
         apps = subprocess.run(
-            [binary, "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"],
+            [
+                binary,
+                "--query-compute-apps=pid,process_name,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
             capture_output=True,
             text=True,
             timeout=30,
@@ -122,7 +127,9 @@ def read_gpu_state() -> Optional[Dict[str, Any]]:
                     "name": cells[1],
                     "uuid": cells[2],
                     "utilization_percent": float(cells[3]),
-                    "memory_used_mib": None if cells[4] in ("[N/A]", "N/A") else float(cells[4]),
+                    "memory_used_mib": None
+                    if cells[4] in ("[N/A]", "N/A")
+                    else float(cells[4]),
                 }
             )
         except ValueError:
@@ -138,7 +145,9 @@ def read_gpu_state() -> Optional[Dict[str, Any]]:
     return {"gpus": gpus, "compute_apps": compute_apps}
 
 
-def read_mountinfo(path: str = "/proc/self/mountinfo") -> Optional[List[Dict[str, str]]]:
+def read_mountinfo(
+    path: str = "/proc/self/mountinfo",
+) -> Optional[List[Dict[str, str]]]:
     """Parsed mount entries (mount point, fstype, source) or None."""
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -152,7 +161,13 @@ def read_mountinfo(path: str = "/proc/self/mountinfo") -> Optional[List[Dict[str
         if not separator or len(fields) < 6 or len(fs) < 3:
             return None
         unescape = lambda s: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), s)
-        out.append({"mount_point": unescape(fields[4]), "fstype": fs[0], "source": unescape(fs[1])})
+        out.append(
+            {
+                "mount_point": unescape(fields[4]),
+                "fstype": fs[0],
+                "source": unescape(fs[1]),
+            }
+        )
     return out
 
 
@@ -160,9 +175,7 @@ def statvfs(path: str) -> Any:
     return os.statvfs(path)
 
 
-def _mount_for(
-    target: str, mounts: List[Dict[str, str]]
-) -> Optional[Dict[str, str]]:
+def _mount_for(target: str, mounts: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
     """Deepest mount point at or above ``target`` (root "/" included)."""
     best: Optional[Dict[str, str]] = None
     target = os.path.abspath(target)
@@ -240,7 +253,10 @@ def _present_bytes(root: Optional[str], *, allocated: bool = False) -> Optional[
 
 # ---------------------------------------------------------------- engine
 
-def _add_check(checks: List[Dict[str, Any]], name: str, ok: bool, detail: str, known: bool = True) -> None:
+
+def _add_check(
+    checks: List[Dict[str, Any]], name: str, ok: bool, detail: str, known: bool = True
+) -> None:
     checks.append(
         {
             "name": name,
@@ -287,7 +303,13 @@ def run_preflight(
     # ---- RAM available
     meminfo = meminfo_reader()
     if meminfo is None or "MemAvailable" not in meminfo:
-        _add_check(checks, "ram_available", False, "MemAvailable unknown — failing closed", known=False)
+        _add_check(
+            checks,
+            "ram_available",
+            False,
+            "MemAvailable unknown — failing closed",
+            known=False,
+        )
     else:
         available_gib = meminfo["MemAvailable"] * 1024 / GIB
         _add_check(
@@ -301,24 +323,40 @@ def run_preflight(
     # ---- exactly one GB10, idle, no compute apps
     gpu_state = gpu_prober()
     if gpu_state is None:
-        _add_check(checks, "gpu_inventory", False, "GPU inventory unknown — failing closed", known=False)
-        _add_check(checks, "gpu_idle", False, "GPU state unknown — failing closed", known=False)
-        _add_check(checks, "gpu_compute_apps", False, "compute apps unknown — failing closed", known=False)
+        _add_check(
+            checks,
+            "gpu_inventory",
+            False,
+            "GPU inventory unknown — failing closed",
+            known=False,
+        )
+        _add_check(
+            checks, "gpu_idle", False, "GPU state unknown — failing closed", known=False
+        )
+        _add_check(
+            checks,
+            "gpu_compute_apps",
+            False,
+            "compute apps unknown — failing closed",
+            known=False,
+        )
     else:
         gpus = gpu_state["gpus"]
         _add_check(
             checks,
             "gpu_inventory",
-            len(gpus) == 1 and gpus[0].get("index") == 0 and gpus[0].get("name") in ("GB10", "NVIDIA GB10"),
+            len(gpus) == 1
+            and gpus[0].get("index") == 0
+            and gpus[0].get("name") in ("GB10", "NVIDIA GB10"),
             "found %d GPU(s), need exactly 1: %s"
             % (len(gpus), [g.get("name") for g in gpus]),
         )
         if gpus:
             target = gpus[0]
             used = target.get("memory_used_mib")
-            idle = (
-                target["utilization_percent"] == 0.0
-                and (used is None or (math.isfinite(used) and used <= GPU_IDLE_MEMORY_MIB_MAX))
+            idle = target["utilization_percent"] == 0.0 and (
+                used is None
+                or (math.isfinite(used) and used <= GPU_IDLE_MEMORY_MIB_MAX)
             )
             _add_check(
                 checks,
@@ -342,7 +380,11 @@ def run_preflight(
     mounts = mountinfo_reader()
     if mounts is None:
         _add_check(
-            checks, "filesystems", False, "mountinfo unreadable — failing closed", known=False
+            checks,
+            "filesystems",
+            False,
+            "mountinfo unreadable — failing closed",
+            known=False,
         )
         disk_rows: List[Dict[str, Any]] = []
     else:
@@ -350,8 +392,11 @@ def run_preflight(
         ple_present = _present_bytes(ple_dir, allocated=True)
         if model_present is None or ple_present is None:
             _add_check(
-                checks, "filesystems", False,
-                "cannot measure existing trees — failing closed", known=False,
+                checks,
+                "filesystems",
+                False,
+                "cannot measure existing trees — failing closed",
+                known=False,
             )
             disk_rows = []
         else:
@@ -383,7 +428,8 @@ def run_preflight(
                 _charge(build_root, "model_missing", missing_model / GIB)
                 _charge(build_root, "ple_missing", missing_ple / GIB)
                 _charge(
-                    build_root, "build_allowance",
+                    build_root,
+                    "build_allowance",
                     build_allowance_gib if build_allowance_gib > 0 else 0.0,
                 )
                 _charge(build_root, "reserve", DISK_RESERVE_GIB)
@@ -415,7 +461,9 @@ def run_preflight(
                     known=row["known"],
                 )
             for row in disk_rows:
-                if row["fstype"] in REJECT_FILESYSTEMS or str(row["fstype"]).startswith("fuse."):
+                if row["fstype"] in REJECT_FILESYSTEMS or str(row["fstype"]).startswith(
+                    "fuse."
+                ):
                     _add_check(
                         checks,
                         "local_nvme[%s]" % (row["source"],),
@@ -424,7 +472,9 @@ def run_preflight(
                         % (row["fstype"],),
                     )
 
-    status = PREFLIGHT_PASS if all(c["status"] == "pass" for c in checks) else PREFLIGHT_FAIL
+    status = (
+        PREFLIGHT_PASS if all(c["status"] == "pass" for c in checks) else PREFLIGHT_FAIL
+    )
     return {
         "status": status,
         "phase": phase,
@@ -449,7 +499,9 @@ def main(argv: List[str] = None) -> int:
     parser.add_argument("--model-root", default=None)
     parser.add_argument("--ple-dir", default=None)
     parser.add_argument("--build-root", default=None)
-    parser.add_argument("--build-allowance-gib", type=float, default=BUILD_ALLOWANCE_GIB_DEFAULT)
+    parser.add_argument(
+        "--build-allowance-gib", type=float, default=BUILD_ALLOWANCE_GIB_DEFAULT
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     findings = run_preflight(

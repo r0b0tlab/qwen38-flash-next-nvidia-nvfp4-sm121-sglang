@@ -1,596 +1,610 @@
-"""Owned single-GB10 launcher: verify tree -> spawn -> persist -> watch -> clean up.
+"""One owned Docker lifecycle, with immutable inputs and no GPU fallback.
 
-Owns exactly one controller process for one immutable image config ID.
-Spawns the container with a hardened configuration (no restart policy, no
-docker socket, cap-drop ALL, no-new-privileges, read-only root/model,
-loopback-only publish), re-checks the verification receipt against the
-live tree before spawn (never trusts a loose boolean), installs cleanup
-traps before spawn, runs a hard memory watchdog, and persists a JSONL
-telemetry stream.
-
-Status: NOT QUALIFIED. The exact image CLI is validated independently by
-the parent; this launcher only executes the argv compiled by
-``runtime.entrypoint``.
+The optional transport/probes are test seams. The CLI uses the real Docker
+transport and the same create/start/watch/stop control flow exercised by tests.
 """
 
 from __future__ import annotations
 
+import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import math
 import os
+from pathlib import Path
+import re
+import secrets
 import signal
 import subprocess
 import sys
+import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
 
-WORKDIR = "/work"
-HOST_PORT = 30080
-CONTAINER_PORT = 30000
-LOOPBACK = "127.0.0.1"
-GPU_DEVICE = 0
-CPU_COUNT = "14"
-MEMORY_LIMIT = "112g"
-PIDS_LIMIT = 2048
-SHM_SIZE = "8g"
+# Script mode and module mode resolve this repository, not a site-packages tests/scripts package.
+REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from runtime import profile_from_json
+from runtime.entrypoint import build_all
+from scripts import preflight
+
+MODEL_ID = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 OWNER_LABEL_KEY = "io.r0b0tlab.qwen38fn.owner"
-OWNER_LABEL_VALUE = "runtime-contracts"
-OWNER_LABEL = "%s=%s" % (OWNER_LABEL_KEY, OWNER_LABEL_VALUE)
-IMAGE_CONFIG_ID = "qwen38fn-gb10-runtime-contracts-v1"
-LOCK_DIR = "/run/qwen38fn"
-EPOCH_FILE = "epoch"
-
-WATCHDOG_MEM_AVAILABLE_FLOOR_KB = 8 * 1024 * 1024   # 8 GiB sustained floor
-WATCHDOG_MEM_AVAILABLE_IMMEDIATE_KB = 4 * 1024 * 1024  # 4 GiB immediate
-WATCHDOG_SUSTAINED_SAMPLES = 5
-
-EXIT_OK = 0
-EXIT_USAGE = 2
-EXIT_PREFLIGHT = 3
-EXIT_VERIFY = 4
-EXIT_SPAWN = 5
-EXIT_OOM_FLOOR = 6
-EXIT_CLEANUP = 7
+LABEL_PROFILE = "io.r0b0tlab.qwen38fn.profile-sha256"
+LABEL_IMAGE = "io.r0b0tlab.qwen38fn.image-id"
+CACHE_LOCK_NAME = ".qwen38fn-launch.lock"
+GIB = 1 << 30
+PLE_BYTES = 51200245760
+EXIT_OK, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_VERIFY = 0, 2, 3, 4
+EXIT_SPAWN, EXIT_CLEANUP, EXIT_WATCHDOG, EXIT_LOCKED = 5, 7, 8, 9
 
 
-class LaunchError(RuntimeError):
-    """Launcher refused to continue (hard failure, exit code preserved)."""
+class LaunchError(ValueError):
+    pass
 
 
-# ------------------------------------------------------------------ epoch
-
-def _lock_dir(state_dir: str) -> str:
-    return os.path.join(state_dir, "locks")
+class TransportError(RuntimeError):
+    pass
 
 
-def _epoch_path(state_dir: str) -> str:
-    return os.path.join(_lock_dir(state_dir), EPOCH_FILE)
+def _pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise LaunchError("duplicate JSON key")
+        result[key] = value
+    return result
 
 
-def read_epoch(state_dir: str) -> int:
-    path = _epoch_path(state_dir)
+def _constant(value):
+    raise LaunchError("nonfinite JSON value")
+
+
+def read_json(path, limit=16 * 1024 * 1024):
+    with Path(path).open("rb") as stream:
+        raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        raise LaunchError("JSON artifact exceeds its byte limit")
+    return json.loads(raw, object_pairs_hook=_pairs, parse_constant=_constant), raw
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def require_hex(value, length, field):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{%d}" % length, value):
+        raise LaunchError(field + " has an invalid digest")
+    return value
+
+
+def safe_path(value, *, directory=False):
+    path = Path(value)
+    if not path.is_absolute() or any(c in str(path) for c in ("\x00", "\n", "\r", ",")):
+        raise LaunchError(
+            "paths must be absolute and contain no control/comma characters"
+        )
+    if path.is_symlink() or path.resolve() != path:
+        raise LaunchError("symlink/noncanonical path rejected")
+    if directory and path in (Path("/"), Path.home()):
+        raise LaunchError("root/home cannot be a runtime state/cache directory")
+    return path
+
+
+def source_inventory(sources):
+    model = sources.get("model") if isinstance(sources, dict) else None
+    if not isinstance(model, dict) or model.get("id") != MODEL_ID:
+        raise LaunchError("wrong/missing model identity")
+    require_hex(model.get("sha"), 40, "model revision")
+    rows = model.get("files")
+    if not isinstance(rows, list) or not rows:
+        raise LaunchError("sources.model.files must be a nonempty pinned inventory")
+    result = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise LaunchError("invalid inventory entry")
+        name = row.get("path")
+        rel = Path(name) if isinstance(name, str) else Path("/")
+        if (
+            not name
+            or rel.is_absolute()
+            or ".." in rel.parts
+            or "\\" in name
+            or str(rel) != name
+            or any(ord(c) < 32 for c in name)
+            or name in result
+        ):
+            raise LaunchError("unsafe/duplicate inventory path")
+        if type(row.get("size")) is not int or row["size"] < 0:
+            raise LaunchError("invalid inventory byte count")
+        if row.get("sha256") is not None:
+            require_hex(row["sha256"], 64, "file SHA256")
+        else:
+            require_hex(row.get("git_blob"), 40, "Git blob")
+        result[name] = row
+    return result
+
+
+def check_receipt(path, expected_hash, model_root, sources):
+    """The receipt hash is an independent verifier output, never self-derived here."""
+    require_hex(expected_hash, 64, "verified receipt SHA256")
+    receipt, raw = read_json(path)
+    if digest(raw) != expected_hash:
+        raise LaunchError("receipt differs from the independently verified digest")
+    inventory = source_inventory(sources)
+    if not isinstance(receipt, dict):
+        raise LaunchError("receipt must be an object")
+    if receipt.get("kind") != "CHECKPOINT_VERIFIED" or receipt.get("root") != str(
+        model_root
+    ):
+        raise LaunchError("receipt kind/root mismatch")
+    if receipt.get("model") != {k: sources["model"][k] for k in ("id", "sha")}:
+        raise LaunchError("receipt model identity mismatch")
+    rows = receipt.get("files")
+    if (
+        not isinstance(rows, list)
+        or type(receipt.get("file_count")) is not int
+        or receipt["file_count"] != len(inventory)
+    ):
+        raise LaunchError("receipt file count mismatch")
+    if any(not isinstance(row, dict) for row in rows):
+        raise LaunchError("receipt entries must be objects")
+    if len(rows) != len(inventory) or {r.get("path") for r in rows} != set(inventory):
+        raise LaunchError("receipt file set mismatch")
+    total = 0
+    for row in rows:
+        expected = inventory[row["path"]]
+        path = model_root / row["path"]
+        if (
+            path.is_symlink()
+            or not path.resolve(strict=True).is_relative_to(model_root)
+            or not path.is_file()
+        ):
+            raise LaunchError("checkpoint file escapes root or is not regular")
+        stat = path.stat()
+        fields = {
+            "dev": stat.st_dev,
+            "inode": stat.st_ino,
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
+        }
+        if any(
+            type(row.get(k)) is not int or row[k] != value
+            for k, value in fields.items()
+        ):
+            raise LaunchError("checkpoint stat changed after full verification")
+        if row["size"] != expected["size"]:
+            raise LaunchError("checkpoint size differs from source lock")
+        require_hex(row.get("sha256"), 64, "observed file SHA256")
+        if expected.get("sha256") is not None and row["sha256"] != expected["sha256"]:
+            raise LaunchError("receipt digest differs from source lock")
+        if (
+            expected.get("sha256") is None
+            and row.get("git_blob") != expected["git_blob"]
+        ):
+            raise LaunchError("receipt Git blob differs from source lock")
+        total += row["size"]
+    if type(receipt.get("total_bytes")) is not int or receipt["total_bytes"] != total:
+        raise LaunchError("receipt byte total mismatch")
+    return receipt
+
+
+class DockerCliTransport:
+    def command(self, args, timeout=30, *, merge_stderr=False):
+        try:
+            result = subprocess.run(
+                ["docker", *args],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise TransportError(str(error)) from error
+        if result.returncode:
+            raise TransportError(
+                (result.stderr or result.stdout or "Docker command failed").strip()[
+                    :1000
+                ]
+            )
+        return result.stdout.strip()
+
+    def _one_document(self, args):
+        try:
+            docs = json.loads(
+                self.command(args), object_pairs_hook=_pairs, parse_constant=_constant
+            )
+        except ValueError as error:
+            raise TransportError("invalid Docker inspection JSON") from error
+        if (
+            not isinstance(docs, list)
+            or len(docs) != 1
+            or not isinstance(docs[0], dict)
+        ):
+            raise TransportError("Docker inspection must return exactly one object")
+        return docs[0]
+
+    def image_inspect(self, image):
+        return self._one_document(["image", "inspect", image])
+
+    def create(self, argv, cidfile):
+        return self.command(argv, timeout=120)
+
+    def start(self, cid):
+        self.command(["start", cid], timeout=120)
+
+    def inspect(self, cid):
+        return self._one_document(["container", "inspect", cid])
+
+    def stop(self, cid):
+        self.command(["stop", "--time", "120", cid], timeout=150)
+
+    def logs(self, cid):
+        # Docker's per-container rotating log limit bounds this final capture.
+        return self.command(["logs", cid], timeout=30, merge_stderr=True)
+
+
+def verify_ownership(doc, expected):
+    if doc.get("Id") != expected["cid"] or doc.get("Image") != expected["image"]:
+        raise LaunchError("container ID/image ownership mismatch")
+    labels = doc.get("Config", {}).get("Labels") or {}
+    required = {
+        OWNER_LABEL_KEY: expected["nonce"],
+        LABEL_PROFILE: expected["profile_sha256"],
+        LABEL_IMAGE: expected["image"],
+    }
+    if any(labels.get(key) != value for key, value in required.items()):
+        raise LaunchError("container epoch/profile ownership mismatch")
+    return doc
+
+
+def stop_owned(cid, *, expect, transport=None):
+    transport = transport or DockerCliTransport()
+    doc = verify_ownership(transport.inspect(cid), {**expect, "cid": cid})
+    if doc.get("State", {}).get("Running"):
+        transport.stop(cid)
+    final = verify_ownership(transport.inspect(cid), {**expect, "cid": cid})
+    if final.get("State", {}).get("Running") is not False:
+        raise LaunchError("container stop could not be verified")
+    return final
+
+
+@contextmanager
+def lifetime_lock(cache):
+    path = cache / CACHE_LOCK_NAME
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return int(handle.read().strip() or 0)
-    except (OSError, ValueError):
-        return 0
-
-
-def bump_epoch(state_dir: str, writer: Optional[Callable[[str], None]] = None) -> int:
-    """Serialize epoch allocation under an exclusive flock.
-
-    ``writer`` is injectable for tests; default writes ``epoch.tmp`` then
-    atomically renames over ``epoch``.
-    """
-    lock_dir = _lock_dir(state_dir)
-    os.makedirs(lock_dir, exist_ok=True)
-    if writer is None:
-        def default_writer(payload: str) -> None:
-            tmp = _epoch_path(state_dir) + ".tmp"
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-            try:
-                os.write(fd, payload.encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.replace(tmp, _epoch_path(state_dir))
-        writer = default_writer
-    lock_path = os.path.join(lock_dir, "epoch.lock")
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        epoch = read_epoch(state_dir) + 1
-        writer(str(epoch))
-        return epoch
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
     finally:
         os.close(fd)
 
 
-# ------------------------------------------------------------ docker argv
+def _save(path, value):
+    raw = json.dumps(value, indent=2, sort_keys=True, allow_nan=False).encode() + b"\n"
+    temp = path.with_name(path.name + ".tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temp, path)
 
-def _base_docker_argv() -> List[str]:
+
+def build_docker_argv(image, profile, sources, model, cache, state, expect):
     return [
-        "docker",
-        "run",
-        "--rm",
-        "--name", "%s-e%d" % (IMAGE_CONFIG_ID, int(time.time())),
-        "--label", OWNER_LABEL,
-        "--gpus", "device=%d" % (GPU_DEVICE,),
-        "--cpus", CPU_COUNT,
-        "--memory", MEMORY_LIMIT,
-        "--memory-swap", MEMORY_LIMIT,  # equal values => no swap
-        "--pids-limit", str(PIDS_LIMIT),
-        "--shm-size", SHM_SIZE,
-        "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges",
+        "create",
+        "--cidfile",
+        str(state / "container.cid"),
+        "--name",
+        "qwen38fn-" + expect["nonce"],
+        "--label",
+        OWNER_LABEL_KEY + "=" + expect["nonce"],
+        "--label",
+        LABEL_PROFILE + "=" + expect["profile_sha256"],
+        "--label",
+        LABEL_IMAGE + "=" + image,
+        "--gpus",
+        "device=0",
+        "--cpus",
+        "14",
+        "--memory",
+        "112g",
+        "--memory-swap",
+        "112g",
+        "--pids-limit",
+        "2048",
+        "--shm-size",
+        "8g",
+        "--cap-drop",
+        "ALL",
+        "--log-driver",
+        "local",
+        "--log-opt",
+        "max-size=8m",
+        "--log-opt",
+        "max-file=3",
+        "--security-opt",
+        "no-new-privileges",
         "--read-only",
-        "--publish", "%s:%d:%d" % (LOOPBACK, HOST_PORT, CONTAINER_PORT),
-        "--workdir", WORKDIR,
+        "--publish",
+        "127.0.0.1:30080:30000",
+        "--mount",
+        f"type=bind,src={profile},dst=/work/profile.json,readonly",
+        "--mount",
+        f"type=bind,src={sources},dst=/work/sources.json,readonly",
+        "--mount",
+        f"type=bind,src={model},dst=/model,readonly",
+        "--mount",
+        f"type=bind,src={cache},dst=/cache",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,size=4g,mode=1777",
+        image,
+        "--profile",
+        "/work/profile.json",
+        "--sources",
+        "/work/sources.json",
     ]
 
 
-def build_docker_argv(
+def run(
+    argv=None,
     *,
-    image: str,
-    profile_path: str,
-    model_root: str,
-    cache_dir: str,
-    entrypoint_argv: List[str],
-    epoch: int,
-    tmpfs_size: str = SHM_SIZE,
-    name_suffix: str = None,
-) -> List[str]:
-    """Full ``docker run`` argv. All binds are read-only except the cache."""
-    name = "%s-e%d%s" % (
-        IMAGE_CONFIG_ID, epoch, name_suffix if name_suffix else ""
-    )
-    argv = _base_docker_argv()
-    # replace the placeholder name from _base_docker_argv
-    argv[argv.index("--name") + 1] = name
-    argv += [
-        # read-only binds: profile + model
-        "--mount", "type=bind,src=%s,dst=/work/profile.json,ro" % (profile_path,),
-        "--mount", "type=bind,src=%s,dst=/model,ro" % (model_root,),
-        "--mount", "type=bind,src=%s,dst=/cache" % (cache_dir,),
-        "--tmpfs", "/tmp:rw,size=%s" % (tmpfs_size,),
-        "--tmpfs", "/run:rw,size=64m",
-        image,
-    ] + entrypoint_argv
-    return argv
-
-
-# ------------------------------------------------------- receipt re-check
-
-def check_receipt(
-    receipt_path: str, model_root: str, sources: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Re-check the verification receipt against the live tree.
-
-    Fails unless the receipt matches the expected model identity AND its
-    per-file stat identities still hold on the mounted tree.
-    """
-    from scripts import verify_files as vf
-
-    try:
-        receipt = vf.load_receipt(receipt_path)
-    except vf.VerifyError as exc:
-        raise LaunchError("receipt unusable: %s" % (exc,)) from exc
-    expected_id = (sources.get("model") or {}).get("id")
-    expected_sha = (sources.get("model") or {}).get("sha")
-    if expected_id is None or expected_sha is None:
-        raise LaunchError("sources.model.id/sha missing")
-    model = receipt.get("model") or {}
-    if model.get("id") != expected_id:
-        raise LaunchError(
-            "receipt model.id %r != sources %r" % (model.get("id"), expected_id)
-        )
-    if model.get("sha") != expected_sha:
-        raise LaunchError(
-            "receipt model.sha %r != sources %r" % (model.get("sha"), expected_sha)
-        )
-    try:
-        vf.check_receipt_against_tree(receipt, model_root)
-    except vf.VerifyError as exc:
-        raise LaunchError(str(exc)) from exc
-    return receipt
-
-
-# --------------------------------------------------------- journal writer
-
-class Journal:
-    """Append-only JSONL telemetry with strict schema validation."""
-
-    SCHEMA = {
-        "event", "ts", "epoch", "cid", "detail",
-    }
-
-    def __init__(self, path: str) -> None:
-        self._handle = open(path, "a", encoding="utf-8")
-
-    def emit(self, event: str, **fields: Any) -> None:
-        record = {"event": event, "ts": time.time(), **fields}
-        unknown = set(record) - self.SCHEMA
-        if unknown:
-            raise LaunchError(
-                "unknown telemetry fields: %s" % (sorted(unknown),)
-            )
-        self._handle.write(json.dumps(record, sort_keys=True) + "\n")
-        self._handle.flush()
-
-    def close(self) -> None:
-        if not self._handle.closed:
-            self._handle.close()
-
-
-# ------------------------------------------------------------- watchdog
-
-def read_mem_available(meminfo_path: str = "/proc/meminfo") -> Optional[int]:
-    """MemAvailable in kB, or None when unknown."""
-    try:
-        with open(meminfo_path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
-
-
-def _classify(
-    samples: List[Optional[int]],
-    floor: int,
-    immediate: int,
-    sustained_samples: int,
-) -> str:
-    """Classify a watchdog sample window.
-
-    - any unknown sample   -> "unknown" (fail closed)
-    - any sample <= immediate -> "foreign" (hard breach)
-    - ``sustained_samples`` consecutive samples all < floor -> "foreign"
-    - otherwise            -> "stopped" (healthy; server not at risk)
-    """
-    if not samples:
-        return "stopped"
-    if any(value is None for value in samples):
-        return "unknown"
-    if any(value <= immediate for value in samples):
-        return "foreign"   # hard breach: at or below immediate floor
-    if len(samples) >= sustained_samples and all(
-        value < floor for value in samples
+    transport=None,
+    preflight_fn=None,
+    mem_reader=None,
+    stop_event=None,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+):
+    parser = argparse.ArgumentParser(description="Owned single-GB10 runtime lifecycle")
+    for name in (
+        "image",
+        "profile",
+        "model-root",
+        "cache-dir",
+        "sources",
+        "receipt",
+        "receipt-sha256",
+        "state-dir",
     ):
-        return "foreign"   # sustained breach below the soft floor
-    return "stopped"
-
-
-def run_watchdog(
-    proc,
-    journal: Journal,
-    *,
-    reader: Callable[[], Optional[int]] = read_mem_available,
-    floor_kb: int = WATCHDOG_MEM_AVAILABLE_FLOOR_KB,
-    immediate_kb: int = WATCHDOG_MEM_AVAILABLE_IMMEDIATE_KB,
-    sustained_samples: int = WATCHDOG_SUSTAINED_SAMPLES,
-    poll_seconds: float = 1.0,
-    clock: Callable[[], float] = time.monotonic,
-    max_seconds: float = 86400.0,
-) -> str:
-    """Watch MemAvailable while ``proc`` runs.
-
-    Returns "foreign" when the memory floor was breached (breach is a
-    foreign fault, not our failure to clean up), "completed" when the
-    process exited on its own, "killed" when we terminated it.
-    """
-    low_samples: List[Optional[int]] = []
-    start = clock()
-    while True:
-        code = proc.poll()
-        if code is not None:
-            journal.emit(
-                "server_exited",
-                epoch=0, cid="", detail=json.dumps({"exit_code": code}),
-            )
-            return "completed"
-        sample = reader()
-        if sample is None or sample <= immediate_kb or sample < floor_kb:
-            low_samples.append(sample)
-        else:
-            low_samples = []
-        if _classify(low_samples, floor_kb, immediate_kb, sustained_samples) == "foreign":
-            journal.emit(
-                "watchdog_breach",
-                epoch=0, cid="",
-                detail=json.dumps(
-                    {
-                        "samples_kb": [
-                            s for s in low_samples if s is not None
-                        ][:sustained_samples],
-                        "floor_kb": floor_kb,
-                        "immediate_kb": immediate_kb,
-                    }
-                ),
-            )
-            return "foreign"
-        if clock() - start > max_seconds:
-            return "timeout"
-        time.sleep(poll_seconds)
-
-
-# ------------------------------------------------------------- supervise
-
-def supervise(
-    *,
-    proc,
-    journal: Journal,
-    cleanup,
-    reader: Callable[[], Optional[int]] = read_mem_available,
-    floor_kb: int = WATCHDOG_MEM_AVAILABLE_FLOOR_KB,
-    immediate_kb: int = WATCHDOG_MEM_AVAILABLE_IMMEDIATE_KB,
-    sustained_samples: int = WATCHDOG_SUSTAINED_SAMPLES,
-    poll_seconds: float = 1.0,
-    clock: Callable[[], float] = time.monotonic,
-    max_seconds: float = 86400.0,
-) -> int:
-    """Own the server lifecycle end to end.
-
-    ``proc`` is any object with ``poll()`` and ``kill()`` (or a callable
-    returning the exit code once finished). ``cleanup`` is the scoped
-    stop callable. Ordering guarantees:
-
-    - the exit code of the server is PRESERVED verbatim, even when
-      cleanup fails (cleanup failures are recorded in the journal as
-      ``cleanup_failed`` but never masked into the exit code);
-    - a watchdog breach kills the server BEFORE stopping the container,
-      never leaving a long client draining a dying prefill;
-    - once the server has exited, ``kill`` is never called again.
-
-    Returns the server exit code, or EXIT_OOM_FLOOR on watchdog breach.
-    """
-    code = None
-    while True:
-        code = proc.poll() if not callable(proc) else proc()
-        if code is not None:
-            try:
-                journal.emit(
-                    "server_exited",
-                    epoch=0, cid="", detail=json.dumps({"exit_code": code}),
+        parser.add_argument("--" + name, required=True)
+    parser.add_argument("--print", "--dryrun", action="store_true", dest="print_only")
+    parser.add_argument("--max-watch-seconds", type=float, default=0)
+    args = parser.parse_args(argv)
+    rc, cid, record = EXIT_USAGE, None, {}
+    transport = transport or DockerCliTransport()
+    event = stop_event or threading.Event()
+    old_signals = {}
+    interrupted = {"signal": None}
+    state = None
+    expect = None
+    create_attempted = False
+    try:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", args.image):
+            raise LaunchError("image must be an exact sha256 config ID")
+        if not math.isfinite(args.max_watch_seconds) or args.max_watch_seconds < 0:
+            raise LaunchError("invalid watch deadline")
+        profile_path = safe_path(args.profile)
+        source_path = safe_path(args.sources)
+        receipt_path = safe_path(args.receipt)
+        model = safe_path(args.model_root)
+        cache = safe_path(args.cache_dir, directory=True)
+        state = safe_path(args.state_dir, directory=True)
+        roots = (state, model, cache)
+        if any(
+            a.is_relative_to(b) or b.is_relative_to(a)
+            for i, a in enumerate(roots)
+            for b in roots[i + 1 :]
+        ):
+            raise LaunchError("state, model and cache must be disjoint")
+        sources, source_raw = read_json(source_path)
+        inventory = source_inventory(sources)
+        _, profile_raw = read_json(profile_path)
+        profile = profile_from_json(profile_raw.decode("utf-8"))
+        built = build_all(profile, sources)
+        expected_hash = require_hex(args.receipt_sha256, 64, "verified receipt SHA256")
+        if args.print_only:
+            print(
+                json.dumps(
+                    {"status": "PLAN_ONLY", "server": built, "image": args.image},
+                    sort_keys=True,
                 )
-            except Exception:
-                pass
-            break
-        sample = reader()
-        low = sample is None or sample <= immediate_kb or sample < floor_kb
-        breach = run_watchdog(
-            proc,
-            journal,
-            reader=reader,
-            floor_kb=floor_kb,
-            immediate_kb=immediate_kb,
-            sustained_samples=sustained_samples,
-            poll_seconds=poll_seconds,
-            clock=clock,
-            max_seconds=max_seconds,
-        ) if low else None
-        if breach == "foreign":
-            try:
-                journal.emit(
-                    "killing_server",
-                    epoch=0, cid="",
-                    detail=json.dumps({"reason": "memory_floor"}),
+            )
+            return 0
+        if not cache.is_dir() or not model.is_dir():
+            raise LaunchError("existing cache/model directories required")
+        # Fresh per-attempt state; never overwrite a prior epoch's evidence.
+        state.mkdir(mode=0o700, parents=True, exist_ok=False)
+        with lifetime_lock(cache):
+            rc = EXIT_PREFLIGHT
+            findings = (
+                preflight_fn
+                or (
+                    lambda: preflight.run_preflight(
+                        phase="serve",
+                        model_bytes=sum(row["size"] for row in inventory.values()),
+                        ple_bytes=PLE_BYTES,
+                        model_root=str(model),
+                        ple_dir=str(cache / "ple" / sources["model"]["sha"]),
+                    )
                 )
-            except Exception:
-                pass
-            kill = getattr(proc, "kill", None)
-            if kill is not None:
-                kill()
-            code = EXIT_OOM_FLOOR
-            break
-        if clock() - _supervise_start(clock) > max_seconds:
-            break
-        time.sleep(poll_seconds)
-
-    # cleanup path: failures recorded, never masked into the exit code
-    try:
-        cleanup()
-        try:
-            journal.emit("cleanup_ok", epoch=0, cid="", detail="{}")
-        except Exception:
-            pass
-    except Exception as exc:  # including LaunchError
-        try:
-            journal.emit(
-                "cleanup_failed", epoch=0, cid="", detail=str(exc)[:400]
+            )()
+            _save(state / "preflight.json", findings)
+            if findings.get("status") != "PASS":
+                raise LaunchError("host preflight rejected")
+            rc = EXIT_VERIFY
+            check_receipt(receipt_path, expected_hash, model, sources)
+            image = transport.image_inspect(args.image)
+            if (image.get("Id"), image.get("Architecture"), image.get("Os")) != (
+                args.image,
+                "arm64",
+                "linux",
+            ):
+                raise LaunchError("image identity/platform mismatch")
+            # Mount validated bytes, not the caller's subsequently mutable paths.
+            for name, raw in (
+                ("profile.json", profile_raw),
+                ("sources.json", source_raw),
+            ):
+                fd = os.open(state / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(raw)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            expect = {
+                "nonce": secrets.token_hex(16),
+                "image": args.image,
+                "profile_sha256": digest(profile_raw),
+            }
+            command = build_docker_argv(
+                args.image,
+                state / "profile.json",
+                state / "sources.json",
+                model,
+                cache,
+                state,
+                expect,
             )
-        except Exception:
-            pass
-    return int(code)
+            record = {
+                **expect,
+                "source_sha256": digest(source_raw),
+                "receipt_sha256": expected_hash,
+                "model": sources["model"]["id"],
+                "model_sha": sources["model"]["sha"],
+                "argv": ["docker", *command],
+                "status": "STARTING",
+            }
+            _save(state / "launch-record.json", record)
+            if threading.current_thread() is threading.main_thread():
 
+                def on_signal(number, frame):
+                    interrupted["signal"] = number
+                    event.set()
 
-def _supervise_start(clock: Callable[[], float]) -> float:
-    return clock()
-
-
-# ------------------------------------------------------- scoped stopping
-
-def _default_docker_inspect(cid: str) -> Dict[str, Any]:
-    done = subprocess.run(
-        ["docker", "inspect", "--format", "{{json .Config.Labels}}", cid],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if done.returncode != 0:
-        raise LaunchError(
-            "inspect failed for %s: %s" % (cid, done.stderr.strip()[:200])
-        )
-    try:
-        return {"labels": json.loads(done.stdout)}
-    except json.JSONDecodeError as exc:
-        raise LaunchError("inspect output unparsable for %s" % (cid,)) from exc
-
-
-def _default_docker_stop(cid: str, timeout: Optional[int] = None) -> None:
-    args = ["docker", "stop"]
-    if timeout is not None:
-        args += ["-t", str(timeout)]
-    args.append(cid)
-    done = subprocess.run(args, capture_output=True, text=True, timeout=300)
-    if done.returncode != 0:
-        raise LaunchError(
-            "stop failed for %s: %s" % (cid, done.stderr.strip()[:200])
-        )
-
-
-def stop_owned(
-    cid: str,
-    *,
-    docker_inspect: Optional[Callable[[str], Dict[str, Any]]] = None,
-    docker_stop: Optional[Callable[[str], None]] = None,
-) -> bool:
-    """Stop a container only after re-reading its ownership labels.
-
-    The inspect re-read happens at stop time (not launch time) so a
-    reused/recycled CID can never be stopped by mistake. Refuses unknown
-    CIDs and containers without our exact owner label.
-    """
-    if docker_inspect is None:
-        docker_inspect = _default_docker_inspect
-    if docker_stop is None:
-        docker_stop = _default_docker_stop
-    info = docker_inspect(cid)
-    labels = (info or {}).get("labels") or {}
-    if (
-        labels.get(OWNER_LABEL_KEY) != OWNER_LABEL_VALUE
-    ):
-        raise LaunchError(
-            "refusing to stop container %s: owner label mismatch (%r)"
-            % (cid, sorted(labels))
-        )
-    docker_stop(cid)
-    return True
-
-
-# ------------------------------------------------------------- launcher
-
-def launch(
-    *,
-    image: str,
-    profile_path: str,
-    model_root: str,
-    cache_dir: str,
-    sources: Dict[str, Any],
-    receipt_path: str,
-    state_dir: str,
-    preflight_fn: Optional[Callable[[], Dict[str, Any]]] = None,
-    entrypoint_argv: Optional[List[str]] = None,
-    dry_run: bool = False,
-) -> Dict[str, Any]:
-    """One owned launch: preflight -> receipt gate -> spawn -> watch -> cleanup.
-
-    ``dry_run`` skips the actual spawn (used by tests and by ``--print``).
-    """
-    if preflight_fn is not None:
-        findings = preflight_fn()
-        if findings.get("status") != "PASS":
-            raise LaunchError(
-                "preflight did not pass: %s"
-                % (json.dumps(findings.get("checks", []), sort_keys=True),)
-            )
-    receipt = check_receipt(receipt_path, model_root, sources)
-
-    profile_digest = _sha256_file(profile_path)
-    epoch = bump_epoch(state_dir)
-    os.makedirs(state_dir, exist_ok=True)
-    journal = Journal(os.path.join(state_dir, "journal.jsonl"))
-
-    argv = build_docker_argv(
-        image=image,
-        profile_path=profile_path,
-        model_root=model_root,
-        cache_dir=cache_dir,
-        entrypoint_argv=entrypoint_argv or [],
-        epoch=epoch,
-    )
-    record = {
-        "epoch": epoch,
-        "image_config_id": IMAGE_CONFIG_ID,
-        "argv": argv,
-        "profile_sha256": profile_digest,
-        "model_receipt": {
-            "root": receipt.get("root"),
-            "model": receipt.get("model"),
-            "file_count": receipt.get("file_count"),
-            "total_bytes": receipt.get("total_bytes"),
-        },
-        "source": "runtime-contracts",
-        "image": image,
-        "started_ts": time.time(),
-    }
-    with open(
-        os.path.join(state_dir, "launch-record.json"), "w", encoding="utf-8"
-    ) as handle:
-        json.dump(record, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    journal.emit(
-        "launch",
-        epoch=epoch, cid="", detail=json.dumps(
-            {"profile_sha256": profile_digest, "image": image}
-        ),
-    )
-    if dry_run:
-        journal.close()
-        record["dry_run"] = True
-        return record
-
-    # traps are installed by the caller (run()) before spawn
-    return record
-
-
-def _sha256_file(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def run(args: List[str]) -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Owned single-GB10 launcher.")
-    parser.add_argument("--image", required=True)
-    parser.add_argument("--profile", required=True)
-    parser.add_argument("--model-root", required=True)
-    parser.add_argument("--cache-dir", required=True)
-    parser.add_argument("--sources", required=True)
-    parser.add_argument("--receipt", required=True)
-    parser.add_argument("--state-dir", required=True)
-    parser.add_argument("--print", action="store_true", dest="print_only")
-    args = parser.parse_args(args)
-
-    with open(args.sources, "r", encoding="utf-8") as handle:
-        sources = json.load(handle)
-
-    try:
-        record = launch(
-            image=args.image,
-            profile_path=args.profile,
-            model_root=args.model_root,
-            cache_dir=args.cache_dir,
-            sources=sources,
-            receipt_path=args.receipt,
-            state_dir=args.state_dir,
-            entrypoint_argv=["sglang", "serve", "--help"],
-            dry_run=args.print_only,
-        )
-    except LaunchError as exc:
-        print("LAUNCH REFUSED: %s" % (exc,), file=sys.stderr)
-        return EXIT_VERIFY
-    if args.print_only:
-        print(json.dumps(record["argv"]))
-        return EXIT_OK
-    return EXIT_SPAWN
+                for number in (signal.SIGTERM, signal.SIGINT):
+                    old_signals[number] = signal.signal(number, on_signal)
+            rc = EXIT_SPAWN
+            try:
+                if event.is_set():
+                    rc = 128 + (interrupted["signal"] or signal.SIGTERM)
+                else:
+                    create_attempted = True
+                    cid = transport.create(command, str(state / "container.cid"))
+                    require_hex(cid, 64, "container ID")
+                    record["cid"] = cid
+                    _save(state / "launch-record.json", record)
+                    verify_ownership(transport.inspect(cid), {**expect, "cid": cid})
+                    if not event.is_set():
+                        rc = EXIT_VERIFY
+                        check_receipt(receipt_path, expected_hash, model, sources)
+                        rc = EXIT_SPAWN
+                        transport.start(cid)
+                        rc = EXIT_WATCHDOG
+                        start = monotonic()
+                        low = 0
+                        reader = mem_reader or (
+                            lambda: (preflight.read_meminfo() or {}).get("MemAvailable")
+                        )
+                        with (state / "telemetry.jsonl").open(
+                            "x", encoding="utf-8", buffering=1
+                        ) as log:
+                            while True:
+                                doc = verify_ownership(
+                                    transport.inspect(cid), {**expect, "cid": cid}
+                                )
+                                current = doc.get("State") or {}
+                                if current.get("Running") is False:
+                                    value = current.get("ExitCode")
+                                    if type(value) is not int or not 0 <= value <= 255:
+                                        raise LaunchError("invalid container exit code")
+                                    rc = (
+                                        value
+                                        if value or not current.get("OOMKilled")
+                                        else EXIT_WATCHDOG
+                                    )
+                                    break
+                                if current.get("Running") is not True:
+                                    raise LaunchError("container running state unknown")
+                                if event.is_set():
+                                    rc = 128 + (interrupted["signal"] or signal.SIGTERM)
+                                    break
+                                available = reader()
+                                known = type(available) is int and available >= 0
+                                log.write(
+                                    json.dumps(
+                                        {
+                                            "time": time.time(),
+                                            "cid": cid,
+                                            "mem_available_kb": available
+                                            if known
+                                            else None,
+                                        },
+                                        allow_nan=False,
+                                    )
+                                    + "\n"
+                                )
+                                if not known:
+                                    rc = EXIT_WATCHDOG
+                                    break
+                                low = low + 1 if available < 8 * GIB // 1024 else 0
+                                if available < 4 * GIB // 1024 or low >= 5:
+                                    rc = EXIT_WATCHDOG
+                                    break
+                                if (
+                                    args.max_watch_seconds
+                                    and monotonic() - start >= args.max_watch_seconds
+                                ):
+                                    rc = EXIT_WATCHDOG
+                                    break
+                                sleep(1)
+                    else:
+                        rc = 128 + (interrupted["signal"] or signal.SIGTERM)
+            except (OSError, ValueError, TransportError) as error:
+                record["error"] = str(error)[:1500]
+            finally:
+                # Resolve an uncertain create from its exact cidfile/name before
+                # cleanup. Never kill the client and abandon an owned GPU request.
+                if cid is None and create_attempted:
+                    cidfile = state / "container.cid"
+                    if cidfile.is_file():
+                        cid = cidfile.read_text().strip()
+                    else:
+                        try:
+                            doc = transport.inspect("qwen38fn-" + expect["nonce"])
+                            candidate = doc.get("Id")
+                            require_hex(candidate, 64, "recovered container ID")
+                            verify_ownership(doc, {**expect, "cid": candidate})
+                            cid = candidate
+                        except (LaunchError, TransportError):
+                            record["create_outcome"] = "UNKNOWN"
+                if cid:
+                    try:
+                        require_hex(cid, 64, "cleanup container ID")
+                        final = stop_owned(cid, expect=expect, transport=transport)
+                        _save(state / "container.final.json", final)
+                        (state / "server.log").write_text(transport.logs(cid))
+                    except (OSError, ValueError, TransportError) as error:
+                        record["cleanup_error"] = str(error)[:1500]
+                        rc = rc or EXIT_CLEANUP
+                record.update(
+                    status="STOPPED" if rc == 0 else "FAILED", exit_code=rc, cid=cid
+                )
+                _save(state / "launch-record.json", record)
+    except BlockingIOError:
+        rc = EXIT_LOCKED
+    except (OSError, ValueError, TransportError) as error:
+        rc = rc or EXIT_CLEANUP
+        print("LAUNCH REFUSED/FAILED: " + str(error), file=sys.stderr)
+    finally:
+        for number, handler in old_signals.items():
+            signal.signal(number, handler)
+    return rc
 
 
 if __name__ == "__main__":
-    raise SystemExit(run(sys.argv[1:]))
+    raise SystemExit(run())

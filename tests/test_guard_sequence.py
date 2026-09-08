@@ -1,149 +1,65 @@
-"""End-to-end launcher sequencing tests on fake subprocesses: trap
-equivalents before spawn, inspect/stop failure windows, exit-code
-preservation and cleanup-failure honesty. No docker, no GPU."""
+"""Cleanup/lock public contracts; obsolete client-kill helpers are not retained."""
 
 import json
-import os
-
+from pathlib import Path
 import pytest
-
-from scripts import guard
-
-
-def _journal(tmp_path):
-    return guard.Journal(str(tmp_path / "seq.jsonl"))
+from scripts import guard, guard_stop
+from tests.launcher_fixtures import make_env, argv, options, FakeDocker, CID
 
 
-def test_supervise_cleanup_failure_does_not_mask_exit_code(tmp_path):
-    """If the server exits 3 and cleanup fails, exit must still be 3."""
+def test_lock_held_through_stop_and_released_afterwards(tmp_path):
+    env = make_env(tmp_path)
+    docker = FakeDocker(exits_after=None)
+    seen = []
 
-    def cleanup_fail():
-        raise guard.LaunchError("scoped stop failed")
+    def check(d):
+        with pytest.raises(BlockingIOError):
+            with guard.lifetime_lock(Path(env["cache-dir"])):
+                pytest.fail("released before server stop")
+        seen.append(True)
 
-    def failer():
-        return 3
+    docker.hooks["stop"] = check
+    assert guard.run(argv(env), **options(docker, mem_reader=lambda: None)) == 8
+    assert seen == [True]
+    with guard.lifetime_lock(Path(env["cache-dir"])):
+        pass
 
-    code = guard.supervise(
-        proc=failer,
-        journal=_journal(tmp_path),
-        cleanup=cleanup_fail,
-        poll_seconds=0.01,
+
+def test_failed_stop_retains_watchdog_failure_and_cid(tmp_path):
+    env = make_env(tmp_path)
+    docker = FakeDocker(exits_after=None)
+
+    def failed(d):
+        raise guard.TransportError("test-only failed stop")
+
+    docker.hooks["stop"] = failed
+    assert guard.run(argv(env), **options(docker, mem_reader=lambda: None)) == 8
+    record = json.loads((Path(env["state-dir"]) / "launch-record.json").read_text())
+    assert record["cid"] == CID and record["cleanup_error"]
+
+
+def test_stop_command_requires_complete_bound_record(tmp_path):
+    env = make_env(tmp_path)
+    docker = FakeDocker()
+    assert guard.run(argv(env), **options(docker)) == 0
+    record = Path(env["state-dir"]) / "launch-record.json"
+    assert guard_stop.main(["--record", str(record)], transport=docker) == 0
+    doc = json.loads(record.read_text())
+    doc["nonce"] = "11" * 16
+    record.write_text(json.dumps(doc))
+    before = docker.calls.count("stop")
+    assert guard_stop.main(["--record", str(record)], transport=docker) == 7
+    assert docker.calls.count("stop") == before
+
+
+def test_watchdog_never_samples_after_exit(tmp_path):
+    env = make_env(tmp_path)
+    docker = FakeDocker(exits_after=1)
+    assert (
+        guard.run(
+            argv(env),
+            **options(docker, mem_reader=lambda: pytest.fail("sampled dead container")),
+        )
+        == 0
     )
-    assert code == 3
-    events = [
-        json.loads(line)
-        for line in open(tmp_path / "seq.jsonl")
-    ]
-    assert events[-1]["event"] == "cleanup_failed"
-
-
-def test_supervise_zero_exit_with_clean_stop(tmp_path):
-    stopped = []
-
-    def stop_ok():
-        stopped.append(True)
-
-    code = guard.supervise(
-        proc=lambda: 0,
-        journal=_journal(tmp_path),
-        cleanup=stop_ok,
-        poll_seconds=0.01,
-    )
-    assert code == 0
-    assert stopped == [True]
-    events = [json.loads(line) for line in open(tmp_path / "seq.jsonl")]
-    assert events[-1]["event"] == "cleanup_ok"
-
-
-def test_supervise_watchdog_breach_kills_then_stops(tmp_path):
-    killed = []
-    stopped = []
-
-    class FakeProc:
-        @staticmethod
-        def poll():
-            return None  # server "still running"
-
-        @staticmethod
-        def kill():
-            killed.append(True)
-
-    journal = _journal(tmp_path)
-    code = guard.supervise(
-        proc=FakeProc(),
-        journal=journal,
-        cleanup=lambda: stopped.append(True),
-        reader=lambda: 1024 * 1024,  # 1 GiB: below the 4 GiB immediate floor
-        poll_seconds=0.01,
-    )
-    assert code == guard.EXIT_OOM_FLOOR
-    assert killed == [True]
-    assert stopped == [True]
-    events = [json.loads(line) for line in open(tmp_path / "seq.jsonl")]
-    assert [e["event"] for e in events][-2:] == [
-        "killing_server", "cleanup_ok",
-    ]
-
-
-def test_supervise_stop_failure_window_preserves_oom_code(tmp_path):
-    """Breach -> kill succeeds -> stop fails: exit must stay the OOM code."""
-
-    class FakeProc:
-        @staticmethod
-        def poll():
-            return None
-
-        @staticmethod
-        def kill():
-            return None
-
-    def cleanup_fail():
-        raise guard.LaunchError("docker stop exploded")
-
-    code = guard.supervise(
-        proc=FakeProc(),
-        journal=_journal(tmp_path),
-        cleanup=cleanup_fail,
-        reader=lambda: 1024 * 1024,
-        poll_seconds=0.01,
-    )
-    assert code == guard.EXIT_OOM_FLOOR
-
-
-def test_supervise_stop_failure_window_preserves_generic_code(tmp_path):
-    def cleanup_fail():
-        raise guard.LaunchError("docker stop exploded")
-
-    code = guard.supervise(
-        proc=lambda: 7,
-        journal=_journal(tmp_path),
-        cleanup=cleanup_fail,
-        poll_seconds=0.01,
-    )
-    assert code == 7
-
-
-def test_supervise_never_kills_after_exit(tmp_path):
-    """Once the process has exited, supervise must not call kill()."""
-    killed = []
-
-    class FakeProc:
-        calls = {"n": 0}
-
-        @classmethod
-        def poll(cls):
-            cls.calls["n"] += 1
-            return 0  # exited immediately
-
-        @classmethod
-        def kill(cls):
-            killed.append(True)
-
-    guard.supervise(
-        proc=FakeProc(),
-        journal=_journal(tmp_path),
-        cleanup=lambda: None,
-        reader=lambda: 1024 * 1024,  # would breach if sampling continued
-        poll_seconds=0.01,
-    )
-    assert killed == []
+    assert "stop" not in docker.calls
