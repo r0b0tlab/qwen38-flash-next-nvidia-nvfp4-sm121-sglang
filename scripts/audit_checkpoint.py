@@ -230,6 +230,13 @@ def _no_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
     return seen
 
 
+def _finite_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise AuditError("nonfinite JSON numeric value")
+    return parsed
+
+
 def strict_json_loads(text: str, label: str) -> Any:
     """Parse JSON rejecting duplicate keys and NaN/Infinity literals."""
     try:
@@ -237,6 +244,7 @@ def strict_json_loads(text: str, label: str) -> Any:
             text,
             object_pairs_hook=_no_duplicate_keys,
             parse_constant=_reject_constant,
+            parse_float=_finite_float,
         )
     except AuditError:
         raise
@@ -384,6 +392,8 @@ def validate_mtp_expert_family(header: Dict[str, Any], contract: Dict[str, Any])
             match.group(3),
             match.group(4),
         )
+        if name != "mtp.layers.%d.mlp.experts.%d.%s.%s" % (layer, expert, proj, kind):
+            raise AuditError("noncanonical MTP tensor name")
         if layer != 0:
             raise AuditError("unexpected MTP layer index in %r" % (name,))
         if expert < 0 or expert >= mtp["experts"]:
@@ -454,7 +464,10 @@ def validate_ple_family(header: Dict[str, Any], contract: Dict[str, Any]) -> int
         match = _PLE_SHARD_KEY_RE.match(name)
         if not match:
             continue
-        shard_entries[int(match.group(1))] = entry
+        index = int(match.group(1))
+        if name != ple["shard_name"].format(index) or index in shard_entries:
+            raise AuditError("noncanonical/duplicate PLE shard name")
+        shard_entries[index] = entry
     if len(shard_entries) != ple["shard_count"]:
         raise AuditError(
             "PLE tensor-vs-file count mismatch: header carries %d shard "

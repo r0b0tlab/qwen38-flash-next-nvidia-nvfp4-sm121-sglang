@@ -197,3 +197,53 @@ def test_hashless_receipt_with_correct_stats_rejected(tmp_path, checkpoint):
             row.pop(key, None)
     with pytest.raises(vf.VerifyError):
         vf.check_receipt_against_tree(receipt, str(root))
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        (
+            "mtp.layers.0.mlp.experts.0.gate_proj.weight",
+            "mtp.layers.0.mlp.experts.00.gate_proj.weight",
+        ),
+        (f.PLE_SHARD_NAME.format(1), f.PLE_SHARD_NAME.format("01")),
+    ],
+)
+def test_tensor_names_are_literal_not_numeric_aliases(checkpoint, old, new):
+    import struct
+
+    root, contract = checkpoint
+    index_path = root / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    shard_path = root / index["weight_map"][old]
+    with shard_path.open("rb") as stream:
+        length = struct.unpack("<Q", stream.read(8))[0]
+        header = json.loads(stream.read(length))
+        payload = stream.read()
+    header[new] = header.pop(old)
+    index["weight_map"][new] = index["weight_map"].pop(old)
+    f._write_shard(
+        str(root),
+        shard_path.name,
+        None,
+        payload=payload,
+        header_bytes=json.dumps(header).encode(),
+    )
+    index_path.write_text(json.dumps(index))
+    with pytest.raises(ac.AuditError):
+        ac.audit_checkpoint(str(root), contract=contract)
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "1e999"])
+def test_nonfinite_json_spellings_all_rejected(tmp_path, literal):
+    text = '{"ignored":' + literal + "}"
+    with pytest.raises(ac.AuditError):
+        ac.strict_json_loads(text, "test-only")
+    p = tmp_path / "input.json"
+    p.write_text(text)
+    with pytest.raises(vf.VerifyError):
+        vf.load_inventory(str(p))
+    from scripts import guard
+
+    with pytest.raises(guard.LaunchError):
+        guard.read_json(p)

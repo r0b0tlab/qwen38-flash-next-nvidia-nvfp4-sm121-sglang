@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -105,13 +106,25 @@ def _constant(value):
     raise VerifyError("nonfinite JSON number")
 
 
+def _finite_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise VerifyError("nonfinite JSON numeric value")
+    return parsed
+
+
 def _read_json(path):
     try:
         with open(path, "rb") as handle:
             raw = handle.read(16 * 1024 * 1024 + 1)
         if len(raw) > 16 * 1024 * 1024:
             raise VerifyError("inventory/receipt exceeds byte limit")
-        return json.loads(raw, object_pairs_hook=_pairs, parse_constant=_constant), raw
+        return json.loads(
+            raw,
+            object_pairs_hook=_pairs,
+            parse_constant=_constant,
+            parse_float=_finite_float,
+        ), raw
     except (OSError, ValueError, RecursionError) as exc:
         raise VerifyError("cannot read bounded strict JSON: %s" % exc) from exc
 

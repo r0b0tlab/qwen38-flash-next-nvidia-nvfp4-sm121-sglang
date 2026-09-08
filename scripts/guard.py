@@ -63,12 +63,24 @@ def _constant(value):
     raise LaunchError("nonfinite JSON value")
 
 
+def _finite_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise LaunchError("nonfinite JSON numeric value")
+    return parsed
+
+
 def read_json(path, limit=16 * 1024 * 1024):
     with Path(path).open("rb") as stream:
         raw = stream.read(limit + 1)
     if len(raw) > limit:
         raise LaunchError("JSON artifact exceeds its byte limit")
-    return json.loads(raw, object_pairs_hook=_pairs, parse_constant=_constant), raw
+    return json.loads(
+        raw,
+        object_pairs_hook=_pairs,
+        parse_constant=_constant,
+        parse_float=_finite_float,
+    ), raw
 
 
 def digest(raw):
@@ -216,7 +228,10 @@ class DockerCliTransport:
     def _one_document(self, args):
         try:
             docs = json.loads(
-                self.command(args), object_pairs_hook=_pairs, parse_constant=_constant
+                self.command(args),
+                object_pairs_hook=_pairs,
+                parse_constant=_constant,
+                parse_float=_finite_float,
             )
         except ValueError as error:
             raise TransportError("invalid Docker inspection JSON") from error
