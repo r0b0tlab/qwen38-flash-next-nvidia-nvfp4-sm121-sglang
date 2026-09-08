@@ -9,6 +9,7 @@ count/keys gate, vision p95 TTFT gate).
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 
@@ -220,12 +221,16 @@ def _manifest(lever="none", **over):
 
 def _upstream(rate: float, rounds: int = 5, completed: int = 8) -> str:
     lines = []
-    for _ in range(rounds):
+    for repeat in range(rounds):
         dur = 2048 / rate
         lines.append(
             json.dumps(
                 {
                     "duration": dur,
+                    "repeat": repeat,
+                    "native_result_sha256": hashlib.sha256(
+                        f"test-only/{rate}/{repeat}".encode()
+                    ).hexdigest(),
                     "completed": completed,
                     "total_input_tokens": 4096,
                     "total_output_tokens": 2048,

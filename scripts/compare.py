@@ -395,7 +395,27 @@ def upstream_median_rate(
         raise Reject(
             f"{variant}: upstream has {len(detail)} measured rounds, expected {rounds}"
         )
-    return median([_upstream_rate(d["row"], variant, lane) for d in detail])
+    rows = [item["row"] for item in detail]
+    repeats = [row.get("repeat") for row in rows]
+    if any(type(value) is not int for value in repeats) or repeats != list(
+        range(rounds)
+    ):
+        raise Reject(
+            f"{variant}: {lane} repeat identities must be ordered unique 0..{rounds - 1}"
+        )
+    identities = [row.get("native_result_sha256") for row in rows]
+    if any(
+        not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+        for value in identities
+    ):
+        raise Reject(
+            f"{variant}: {lane} native result identities are missing or malformed"
+        )
+    if len(set(identities)) != rounds:
+        raise Reject(f"{variant}: {lane} reuses the same native result artifact")
+    # Identical fixed input hashes and usage counts are intentional across
+    # independent rounds; they are not independent-measurement identities.
+    return median([_upstream_rate(row, variant, lane) for row in rows])
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +567,8 @@ def check_evidence_binding(manifest, rows, lane):
         if "input_sha256" in row and row["input_sha256"] != expected:
             raise Reject("row input hash disagrees with its bound evidence")
         if lane in ("short", "medium"):
+            if row.get("tag") != f"{fingerprint}/{lane}/r{row.get('repeat')}":
+                raise Reject("native round tag differs from bound manifest/lane/repeat")
             payloads = manifest.get("requests", {}).get(lane)
             if not isinstance(payloads, list) or len(payloads) != 8:
                 raise Reject("upstream promotion requires the frozen request values")

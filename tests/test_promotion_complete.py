@@ -56,6 +56,10 @@ def full_side(rate, lever):
             True  # explicit reducer unit fixture, not runtime evidence
         )
         if lane in requests:
+            row["tag"] = f"{manifest['manifest_sha256']}/{lane}/r{row['repeat']}"
+            row["native_result_sha256"] = sha(
+                f"unit-native/{rate}/{lane}/{row['repeat']}"
+            )
             row["request_hashes"] = [input_hash(p) for p in requests[lane]]
         row["_evidence"] = {
             "manifest_sha256": manifest["manifest_sha256"],
@@ -155,6 +159,9 @@ def test_complete_cli_reaches_same_verdict(tmp_path):
             for item in data[prefix + "_" + lane]:
                 row = item["row"] if lane in ("upstream", "medium") else item
                 row["_evidence"]["manifest_sha256"] = m["manifest_sha256"]
+                if lane in ("upstream", "medium"):
+                    declared = "short" if lane == "upstream" else "medium"
+                    row["tag"] = f"{m['manifest_sha256']}/{declared}/r{row['repeat']}"
     args = []
     for side, prefix in (("baseline", "base"), ("candidate", "cand")):
         manifest = tmp_path / (side + ".manifest.json")
