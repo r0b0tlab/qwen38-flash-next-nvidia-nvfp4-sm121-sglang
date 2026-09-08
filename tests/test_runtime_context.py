@@ -44,8 +44,9 @@ def inputs():
     }
     server = {
         "status": "ready",
+        "context_length": 32768,
         "max_total_num_tokens": 32768,
-        "max_req_input_len": 32767,
+        "max_req_input_len": 32762,
         "startup_time": 1.25,
         "launch_command": ["test-only"],
     }
@@ -98,6 +99,56 @@ def test_context_is_derived_from_observed_capacity_and_identity():
         result["total_pool"] == 32768
         and result["epoch"]["container_started_at"] == "test-only-epoch"
     )
+    assert result["max_req_input_len"] == 32762
+
+
+@pytest.mark.parametrize("window", [32768, 262144])
+def test_native_six_token_input_reserve_is_not_lost_total_capacity(window):
+    record, profile, lock, doc, server, model = inputs()
+    profile = profile_from_dict(
+        dict(profile.raw, context_length=window, max_total_tokens=window)
+    )
+    server.update(
+        context_length=window, max_total_num_tokens=window, max_req_input_len=window - 6
+    )
+    context = c.observed_context(
+        record, profile, lock, doc, server, model, "http://127.0.0.1:30080"
+    )
+    assert context["context"] == context["total_pool"] == window
+    assert context["max_req_input_len"] == window - 6
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("max_req_input_len", 32761),
+        ("max_req_input_len", True),
+        ("max_total_num_tokens", 32767),
+        ("context_length", 16384),
+    ],
+)
+def test_real_capacity_and_unexplained_prompt_loss_remain_refused(key, value):
+    record, profile, lock, doc, server, model = inputs()
+    server[key] = value
+    with pytest.raises(ValueError):
+        c.observed_context(
+            record, profile, lock, doc, server, model, "http://127.0.0.1:30080"
+        )
+
+
+def test_runtime_prompt_limit_is_part_of_epoch_verification():
+    record, profile, lock, doc, server, model = inputs()
+    context = c.observed_context(
+        record, profile, lock, doc, server, model, "http://127.0.0.1:30080"
+    )
+
+    def reader(base, path):
+        return server if path == "/server_info" else model
+
+    c.verify_http_epoch({"runtime_context": context}, reader=reader)
+    server["max_req_input_len"] -= 1
+    with pytest.raises(ValueError):
+        c.verify_http_epoch({"runtime_context": context}, reader=reader)
 
 
 @pytest.mark.parametrize("fault", ["no_start", "wrong_port", "capacity", "model"])

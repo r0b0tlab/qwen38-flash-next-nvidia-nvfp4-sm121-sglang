@@ -32,6 +32,18 @@ against that server. Unit-fixture throughput is never benchmark evidence.
   observed visual gain when a vision lever is selected. Changing an additional
   profile field invalidates a single-lever comparison.
 
+## Runtime capacity observations
+
+The configured context and physical token pool are separate from the maximum
+prompt length. The pinned single-node SGLang worker reports
+`max_req_input_len = min(context_length - 1, effective_pool - 1) - 5`.
+Thus a full 32,768-token pool correctly reports a 32,762-token prompt limit.
+The context capture requires the full configured context/pool, validates this
+native reservation exactly, and records/rechecks the prompt limit through the
+HTTP epoch binding. It does not lower serving capacity or waive an unexplained
+prompt-limit shortfall. This host-side harness correction does not alter the
+model image, profiles, kernels or sampling contract.
+
 ## Why the upstream client adapter exists
 
 The pinned upstream OAI parser indexes `choices[0]` and otherwise defaults

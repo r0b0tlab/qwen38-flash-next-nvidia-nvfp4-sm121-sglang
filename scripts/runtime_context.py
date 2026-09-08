@@ -68,10 +68,21 @@ def observed_context(record, profile, lock, doc, server, model, base):
         raise ValueError("scheduler capacity is not observed")
     if (
         server["max_total_num_tokens"] < profile.max_total_tokens
-        or type(server.get("max_req_input_len")) is not int
-        or server["max_req_input_len"] < profile.context_length - 1
+        or type(server.get("context_length")) is not int
+        or server["context_length"] != profile.context_length
     ):
         raise ValueError("effective runtime capacity is below the requested envelope")
+    # Pinned SGLang TpModelWorker.get_worker_info(): total request length is
+    # min(context - 1, effective pool - 1), with five more tokens reserved
+    # for its prompt limit. This is not a loss of the total context/KV pool.
+    expected_prompt_limit = (
+        min(profile.context_length - 1, server["max_total_num_tokens"] - 1) - 5
+    )
+    if (
+        type(server.get("max_req_input_len")) is not int
+        or server["max_req_input_len"] != expected_prompt_limit
+    ):
+        raise ValueError("runtime prompt limit differs from the pinned native reserve")
     if profile.max_running_requests != 1:
         raise ValueError("this comparison contract is C1")
     startup = server.get("startup_time")
@@ -86,6 +97,7 @@ def observed_context(record, profile, lock, doc, server, model, base):
         "source_tree": lock["sglang"]["tree"],
         "context": profile.context_length,
         "total_pool": server["max_total_num_tokens"],
+        "max_req_input_len": server["max_req_input_len"],
         "concurrency": 1,
         "profile": profile.raw,
         "endpoint": base.rstrip("/"),
@@ -154,6 +166,12 @@ def verify_http_epoch(manifest, *, reader=http_json):
         raise ValueError("runtime HTTP epoch/model identity changed")
     if server.get("max_total_num_tokens") != context["total_pool"]:
         raise ValueError("runtime token pool changed")
+    if (
+        type(context.get("max_req_input_len")) is not int
+        or server.get("max_req_input_len") != context["max_req_input_len"]
+        or server.get("context_length") != context["context"]
+    ):
+        raise ValueError("runtime context or prompt limit changed")
 
 
 def main():
