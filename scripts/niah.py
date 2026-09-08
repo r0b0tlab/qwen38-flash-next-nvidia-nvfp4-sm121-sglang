@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""Exact-token Needle-In-A-Haystack for the qualification harness.
+
+Contract:
+- Native context WINDOW = 262,144 tokens; generous RESERVE = 4,096 output
+  tokens. The largest ("full window") prompt therefore uses
+  WINDOW - RESERVE = 258,048 prompt slots.
+- Nine cases: single-key needles at 8192@50%, 32768@50%, 131072@50% and
+  258048@{5,25,50,75,95}% depth, plus one full-window ordered multi-key case
+  with needles at 33% and 66% that must be answered in order.
+- The SAME actual tokenizer and chat template render the traffic; prompts are
+  POSTed to /v1/completions as list[int] token ids (exact-token, no crop, no
+  silent truncation, no rope mutation). If the template-slot encoding does not
+  match, this fails loudly — the encoder is never silently switched.
+- Full input token arrays, their sha256, needle offsets and codes are frozen
+  into a manifest BEFORE any traffic.
+- Sampling: temperature 0, top_p 1, max_tokens 4096, timeout 43,200 s.
+- Row validity: API usage.prompt_tokens == constructed length, finish_reason
+  == stop, and the post-thinking final text contains ALL codes in order.
+  Incomplete thinking is not an answer.
+- Transport/HTTP exceptions are INFRA failures, never needle misses; they are
+  recorded per row and fail the run. All rows persist, or the summary is
+  clearly marked partial with a nonzero exit.
+- This helper never starts, stops or kills any server or client process;
+  cancellation/draining is the parent's responsibility.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from http_client import CompletionResult, OpenAICompatClient  # noqa: E402
+
+MODEL_ID = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+WINDOW = 262_144
+RESERVE = 4_096
+MAX_PROMPT = WINDOW - RESERVE  # 258,048 full-window prompt slots
+MAX_TOKENS = 4_096
+TEMPERATURE = 0.0
+TOP_P = 1.0
+TIMEOUT_S = 43_200.0
+
+SYSTEM_PROMPT = (
+    "You are a precise retrieval assistant. The user will hide one or more "
+    "pass codes inside a long document. Answer with ONLY the requested pass "
+    "codes, in the order they appear in the document, separated by single "
+    "spaces. Do not add any other words."
+)
+
+NEEDLE_TEMPLATE = "One of the special pass codes is {code}."
+QUERY_TEMPLATE = (
+    "The document above contains {n} special pass code sentence(s). "
+    "Return the pass code(s) in the order they appear, separated by single spaces. "
+    "Answer with the code(s) only."
+)
+
+# frozen code pool: distinctive, unlikely to appear in filler prose
+CODE_POOL: Tuple[str, ...] = (
+    "ZEPHYR-4821", "QUARTZ-9173", "MIRAGE-3058", "LUMEN-7742",
+    "COBALT-6519", "HOLLOW-2384", "SPRUCE-5067", "VELVET-8291",
+    "GRANITE-3476", "ORCHID-9158", "FERRITE-6823", "NIMBUS-1509",
+)
+
+FILLER_SENTENCE = (
+    "The old archive lists shipments of tea, paper, lantern oil and tools "
+    "across the district warehouses for each season of the year. "
+)
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer protocol
+# ---------------------------------------------------------------------------
+
+
+class TokenizerProtocol(Protocol):
+    """Minimal tokenizer/template surface used here (actual model tokenizer)."""
+
+    name: str
+
+    def encode(self, text: str) -> List[int]: ...
+
+    def decode(self, ids: Sequence[int]) -> str: ...
+
+    def apply_chat_template(
+        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True
+    ) -> str: ...
+
+
+class FakeTokenizer:
+    """Deterministic word-level tokenizer for CPU unit tests (TEST ONLY).
+
+    Never used for real traffic: every construction function refuses a
+    FakeTokenizer unless explicitly marked test-only, so fake token arrays can
+    never masquerade as real rendered streams.
+    """
+
+    def __init__(self, name: str = "fake-wordlevel"):
+        self.name = f"test-only:{name}"
+        self._vocab: Dict[str, int] = {}
+        self._next = 1
+
+    def _tok(self, word: str) -> int:
+        if word not in self._vocab:
+            self._vocab[word] = self._next
+            self._next += 1
+        return self._vocab[word]
+
+    def encode(self, text: str) -> List[int]:
+        return [self._tok(w) for w in text.split(" ") if w != ""]
+
+    def decode(self, ids: Sequence[int]) -> str:
+        inv = {v: k for k, v in self._vocab.items()}
+        return " ".join(inv.get(i, "<unk>") for i in ids)
+
+    def apply_chat_template(
+        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True
+    ) -> str:
+        parts = [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>" for m in messages]
+        if add_generation_prompt:
+            parts.append("<|im_start|>assistant\n")
+        return "".join(parts)
+
+
+def load_real_tokenizer(tokenizer_dir: str) -> TokenizerProtocol:
+    """Load the actual model tokenizer (requires the model dir; parent runs it)."""
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:  # pragma: no cover - parent env has transformers
+        raise RuntimeError(f"transformers unavailable: {exc}") from exc
+    tok = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=False)
+    tok.name = f"real:{tokenizer_dir}"
+    return tok  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# Case construction
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class Needle:
+    code: str
+    text: str
+    token_ids: List[int]
+    start_offset: int  # first token index of the needle inside the prompt
+
+
+@dataclasses.dataclass(frozen=True)
+class NiahCase:
+    case_id: str
+    n_tokens: int          # constructed prompt token count
+    depths: Tuple[float, ...]
+    needles: Tuple[Needle, ...]
+    prompt_ids: Tuple[int, ...]
+    rendered_text_sha256: str
+    prompt_sha256: str
+
+
+def _build_filler(tokenizer: TokenizerProtocol, sentence: str, n_tokens: int) -> List[int]:
+    """Pre-tokenize one filler sentence, then tile it to >= n_tokens tokens."""
+    one = tokenizer.encode(sentence)
+    if not one:
+        raise RuntimeError("filler sentence encoded to zero tokens")
+    reps = (n_tokens // len(one)) + 2
+    return (one * reps)[:n_tokens]
+
+
+def _encode_with_positions(
+    tokenizer: TokenizerProtocol,
+    system: str,
+    needle_specs: Sequence[Tuple[float, List[int]]],  # (depth, needle_ids)
+    query: str,
+    n_target: int,
+) -> Tuple[List[int], List[int], str]:
+    """Render system+body+query through the chat template in token space.
+
+    Returns (prompt_ids, needle_offsets_in_prompt, rendered_text) with
+    ``len(prompt_ids) == n_target`` exactly.
+
+    Strategy: measure the template wrapper and the query suffix in tokens,
+    size the tiled filler body so the total lands on the target, splice
+    needles at body offsets that map to ``int(depth * n_target)`` in prompt
+    space, then verify by re-encoding the rendered string. If the estimate is
+    off (BPE boundary effects), the body budget is corrected by the measured
+    delta and the build repeats — bounded, and still fail-closed: the loop
+    raises rather than sending a stream whose length differs from the target.
+
+    The body/query boundary is written as ``body + " " + "\n\n" + query``; the
+    single space keeps the separator tokenization independent of the last body
+    word (a merge there would make the length converge structurally wrong).
+    """
+    wrapper_ids = tokenizer.encode(
+        tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": "\x00"},
+            ],
+            add_generation_prompt=True,
+        )
+    )
+    ph_len = len(tokenizer.encode("\x00"))
+    suffix_ids = tokenizer.encode("\n\n" + query)
+    wrapper_est = len(wrapper_ids) - ph_len
+    min_needle = max((len(n) for _, n in needle_specs), default=0)
+
+    adjust = 0
+    for _attempt in range(5):
+        body_budget = n_target - wrapper_est - len(suffix_ids) + adjust
+        if body_budget < min_needle + 10:
+            raise RuntimeError(
+                f"body budget {body_budget} too small for target {n_target} "
+                "(template wrapper + query overhead)"
+            )
+        body_ids = _build_filler(tokenizer, FILLER_SENTENCE, body_budget)
+        # splice descending so earlier offsets stay valid while slicing, but
+        # keep offsets aligned to the caller's spec order
+        order = sorted(range(len(needle_specs)), key=lambda i: -needle_specs[i][0])
+        needle_prompt_offsets: List[int] = [0] * len(needle_specs)
+        for i in order:
+            depth, needle_ids = needle_specs[i]
+            body_off = int(depth * n_target) - wrapper_est
+            body_off = max(0, min(body_off, body_budget - len(needle_ids)))
+            body_ids[body_off : body_off + len(needle_ids)] = needle_ids
+            needle_prompt_offsets[i] = wrapper_est + body_off
+
+        body_text = tokenizer.decode(body_ids)
+        user_content = body_text + " \n\n" + query
+        rendered = tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+            add_generation_prompt=True,
+        )
+        prompt_ids = tokenizer.encode(rendered)
+        if len(prompt_ids) == n_target:
+            return prompt_ids, needle_prompt_offsets, rendered
+        adjust += n_target - len(prompt_ids)
+    raise RuntimeError(
+        f"could not converge rendered stream to {n_target} tokens "
+        f"(last try {len(prompt_ids)}); fix the encoder/template root cause, "
+        "never switch encoders or crop silently"
+    )
+
+
+def build_case(
+    tokenizer: TokenizerProtocol,
+    *,
+    case_id: str,
+    n_prompt_tokens: int,
+    depths: Sequence[float],
+    codes: Sequence[str],
+    query: str,
+    system: str = SYSTEM_PROMPT,
+    filler: str = FILLER_SENTENCE,
+) -> NiahCase:
+    """Construct one exact-token case and validate its internal invariants.
+
+    Each needle occupies a unique contiguous token slot at ``int(depth*N)`` in
+    the final rendered stream. Any encoding mismatch raises; nothing is
+    silently re-encoded, cropped or truncated, and the encoder is never
+    switched.
+    """
+    if not codes or len(codes) != len(depths):
+        raise ValueError("codes and depths must be nonempty and equal length")
+    if len(set(codes)) != len(codes):
+        raise ValueError("codes must be unique within a case")
+    if n_prompt_tokens > MAX_PROMPT:
+        raise ValueError(
+            f"{case_id}: requested {n_prompt_tokens} prompt tokens exceeds "
+            f"full-window budget {MAX_PROMPT} (WINDOW {WINDOW} - RESERVE {RESERVE})"
+        )
+    for d in depths:
+        if not 0.0 < d < 1.0:
+            raise ValueError(f"{case_id}: depth {d} outside (0,1)")
+
+    needles: List[Needle] = []
+    specs: List[Tuple[float, List[int]]] = []
+    for code, depth in zip(codes, depths):
+        text = NEEDLE_TEMPLATE.format(code=code)
+        ids = tokenizer.encode(text)
+        if not ids:
+            raise RuntimeError(f"{case_id}: needle for {code!r} encoded empty")
+        needles.append(Needle(code=code, text=text, token_ids=ids, start_offset=-1))
+        specs.append((depth, ids))
+
+    prompt_ids, offsets, rendered = _encode_with_positions(
+        tokenizer, system, specs, query, n_prompt_tokens
+    )
+
+    # --- hard invariants on the real rendered stream -----------------------
+    prompt_list = list(prompt_ids)
+    spans = sorted((off, off + len(n.token_ids)) for n, off in zip(needles, offsets))
+    for (_, end), (start2, _) in zip(spans, spans[1:]):
+        if start2 < end:
+            raise RuntimeError(f"{case_id}: needle slots overlap: {spans}")
+    for needle, offset in zip(needles, offsets):
+        window = prompt_list[offset : offset + len(needle.token_ids)]
+        if window != needle.token_ids:
+            raise RuntimeError(
+                f"{case_id}: slot encoding mismatch for {needle.code!r} at offset "
+                f"{offset}: fix the encoder/template root cause; never switch "
+                "encoders silently"
+            )
+        occurrences = sum(
+            1
+            for i in range(len(prompt_list) - len(needle.token_ids) + 1)
+            if prompt_list[i : i + len(needle.token_ids)] == needle.token_ids
+        )
+        if occurrences != 1:
+            raise RuntimeError(
+                f"{case_id}: needle {needle.code!r} occurs {occurrences} times in "
+                "the rendered stream; must be exactly 1 (unique slot)"
+            )
+
+    return NiahCase(
+        case_id=case_id,
+        n_tokens=len(prompt_ids),
+        depths=tuple(depths),
+        needles=tuple(
+            Needle(code=n.code, text=n.text, token_ids=n.token_ids, start_offset=off)
+            for n, off in zip(needles, offsets)
+        ),
+        prompt_ids=tuple(prompt_ids),
+        rendered_text_sha256=hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        prompt_sha256=hashlib.sha256(json.dumps(list(prompt_ids)).encode("utf-8")).hexdigest(),
+    )
+
+
+def build_default_cases(tokenizer: TokenizerProtocol) -> List[NiahCase]:
+    """The nine frozen cases: 8 single-key + 1 full-window ordered multi-key."""
+    cases: List[NiahCase] = []
+    for ctx in (8_192, 32_768, 131_072):
+        cases.append(build_case(
+            tokenizer, case_id=f"single_{ctx}_d50",
+            n_prompt_tokens=ctx, depths=(0.50,), codes=(CODE_POOL[len(cases)],),
+            query=QUERY_TEMPLATE.format(n=1),
+        ))
+    for i, depth in enumerate((0.05, 0.25, 0.50, 0.75, 0.95)):
+        cases.append(build_case(
+            tokenizer, case_id=f"single_{MAX_PROMPT}_d{int(depth * 100)}",
+            n_prompt_tokens=MAX_PROMPT, depths=(depth,),
+            codes=(CODE_POOL[3 + i],),
+            query=QUERY_TEMPLATE.format(n=1),
+        ))
+    cases.append(build_case(
+        tokenizer, case_id=f"multi_{MAX_PROMPT}_d33_66",
+        n_prompt_tokens=MAX_PROMPT, depths=(0.33, 0.66),
+        codes=(CODE_POOL[8], CODE_POOL[9]),
+        query=QUERY_TEMPLATE.format(n=2),
+    ))
+    return cases
+
+
+# ---------------------------------------------------------------------------
+# Manifest freezing
+# ---------------------------------------------------------------------------
+
+
+def freeze_manifest(cases: Sequence[NiahCase], tokenizer: TokenizerProtocol) -> Dict[str, Any]:
+    """Freeze token arrays, hashes, offsets and codes BEFORE any traffic."""
+    return {
+        "kind": "qualification-niah-manifest",
+        "model_id": MODEL_ID,
+        "window": WINDOW,
+        "reserve": RESERVE,
+        "max_prompt_tokens": MAX_PROMPT,
+        "sampling": {"temperature": TEMPERATURE, "top_p": TOP_P, "max_tokens": MAX_TOKENS},
+        "timeout_s": TIMEOUT_S,
+        "tokenizer": getattr(tokenizer, "name", "unknown"),
+        "cases": [
+            {
+                "case_id": c.case_id,
+                "n_tokens": c.n_tokens,
+                "depths": list(c.depths),
+                "codes": [n.code for n in c.needles],
+                "needle_offsets": [n.start_offset for n in c.needles],
+                "needle_token_lens": [len(n.token_ids) for n in c.needles],
+                "prompt_sha256": c.prompt_sha256,
+                "rendered_text_sha256": c.rendered_text_sha256,
+            }
+            for c in cases
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Response checking (fail-closed)
+# ---------------------------------------------------------------------------
+
+
+def check_response(case: NiahCase, res: CompletionResult) -> Tuple[str, str]:
+    """Return (verdict, detail).
+
+    verdict is one of: pass / needle_miss / invalid_usage_echo /
+    invalid_finish / incomplete_thinking / empty_answer /
+    invalid_usage / infra_error.
+    """
+    if res.error is not None:
+        if res.error.startswith("http_status_") or res.error in ("transport", "timeout"):
+            return "infra_error", f"{res.error}: {res.error_detail[:300]}"
+        return "invalid_usage", f"{res.error}: {res.error_detail[:300]}"
+    if res.usage is None:
+        return "invalid_usage", "no usage object"
+    if res.usage["prompt_tokens"] != case.n_tokens:
+        return (
+            "invalid_usage_echo",
+            f"api prompt_tokens={res.usage['prompt_tokens']} != constructed {case.n_tokens}",
+        )
+    if res.finish_reason != "stop":
+        return "invalid_finish", f"finish_reason={res.finish_reason}"
+    text = res.text or ""
+    # incomplete thinking is not an answer
+    if "<think>" in text and "</think>" not in text:
+        return "incomplete_thinking", "unclosed <think> block"
+    final = text.split("</think>")[-1].strip() if "</think>" in text else text.strip()
+    if not final:
+        return "empty_answer", "no final text after thinking"
+    codes = [n.code for n in case.needles]
+    idx = 0
+    positions: List[int] = []
+    for code in codes:
+        pos = final.find(code, idx)
+        if pos < 0:
+            return "needle_miss", f"code {code!r} missing or out of order in final text"
+        positions.append(pos)
+        idx = pos + len(code)
+    return "pass", f"codes at positions {positions}"
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+
+def run_cases(
+    client: Any,
+    cases: Sequence[NiahCase],
+    out_path: Path,
+    *,
+    dry_run: bool = False,
+    on_row: Any = None,
+) -> Dict[str, Any]:
+    """Run (or dry-run) cases; persist every row; return a fail-closed summary."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    verdicts: Dict[str, str] = {}
+    ran = 0
+    with out_path.open("a", encoding="utf-8") as fout:
+        for case in cases:
+            if dry_run:
+                row = {
+                    "case_id": case.case_id, "dry_run": True,
+                    "n_tokens": case.n_tokens, "verdict": "not_run_dry",
+                    "prompt_sha256": case.prompt_sha256,
+                }
+                verdicts[case.case_id] = "not_run_dry"
+            else:
+                try:
+                    res = client.completions_tokens(
+                        list(case.prompt_ids),
+                        max_tokens=MAX_TOKENS,
+                        temperature=TEMPERATURE,
+                        top_p=TOP_P,
+                        timeout=TIMEOUT_S,
+                    )
+                except Exception as exc:  # infra: recorded, never a needle miss
+                    row = {
+                        "case_id": case.case_id,
+                        "n_tokens": case.n_tokens,
+                        "verdict": "infra_error",
+                        "detail": f"{type(exc).__name__}: {exc}"[:500],
+                        "finish_reason": None,
+                        "usage": None,
+                        "wall_s": None,
+                        "final_text": "",
+                        "raw_body": "",
+                        "prompt_sha256": case.prompt_sha256,
+                    }
+                    verdicts[case.case_id] = "infra_error"
+                    fout.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    fout.flush()
+                    if on_row:
+                        on_row(row)
+                    continue
+                verdict, detail = check_response(case, res)
+                verdicts[case.case_id] = verdict
+                ran += 1
+                row = {
+                    "case_id": case.case_id,
+                    "n_tokens": case.n_tokens,
+                    "verdict": verdict,
+                    "detail": detail,
+                    "finish_reason": res.finish_reason,
+                    "usage": res.usage,
+                    "wall_s": res.wall_s,
+                    "final_text": (res.text or "")[-4000:],
+                    "raw_body": res.raw_body[:8000],  # raw evidence preserved
+                    "prompt_sha256": case.prompt_sha256,
+                }
+            fout.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fout.flush()
+            if on_row:
+                on_row(row)
+    passed = [k for k, v in verdicts.items() if v == "pass"]
+    partial = len(verdicts) < len(cases) or any(v == "not_run_dry" for v in verdicts.values())
+    return {
+        "total_cases": len(cases),
+        "ran": ran,
+        "passed": len(passed),
+        "partial": partial or ran != len(cases),
+        "verdicts": verdicts,
+        "ok": (not partial) and len(passed) == len(cases),
+    }
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(description="exact-token NIAH (262144 window)")
+    p.add_argument("--base", help="explicit endpoint base URL (required unless --dry-run)")
+    p.add_argument("--tokenizer-dir", default=os.environ.get("QUAL_HARNESS_TOKENIZER_DIR", ""))
+    p.add_argument("--manifest", required=True, help="frozen manifest output path")
+    p.add_argument("--output", required=True, help="JSONL rows (exclusive, no overwrite)")
+    p.add_argument("--only", action="append", help="run only these case_ids (repeatable)")
+    p.add_argument("--dry-run", action="store_true", help="construct+freeze+validate, no traffic")
+    args = p.parse_args(argv)
+
+    if args.dry_run:
+        if not args.tokenizer_dir:
+            print("--dry-run still needs --tokenizer-dir to freeze real arrays", file=sys.stderr)
+            return 2
+        tokenizer = load_real_tokenizer(args.tokenizer_dir)
+    else:
+        if not args.base:
+            print("--base is required for real traffic", file=sys.stderr)
+            return 2
+        if not args.tokenizer_dir:
+            print(
+                "--tokenizer-dir (or QUAL_HARNESS_TOKENIZER_DIR) is required: the same "
+                "actual tokenizer/template must render NIAH traffic",
+                file=sys.stderr,
+            )
+            return 2
+        tokenizer = load_real_tokenizer(args.tokenizer_dir)
+
+    cases = build_default_cases(tokenizer)
+    if args.only:
+        want = set(args.only)
+        cases = [c for c in cases if c.case_id in want]
+        if not cases:
+            print("no cases matched --only", file=sys.stderr)
+            return 2
+
+    manifest = freeze_manifest(cases, tokenizer)
+    manifest["partial_selection"] = bool(args.only)
+    manifest_path = Path(args.manifest)
+    if manifest_path.exists():
+        print(f"refusing to overwrite existing manifest: {manifest_path}", file=sys.stderr)
+        return 2
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    out = Path(args.output)
+    if out.exists():
+        print(f"refusing to overwrite existing output: {out}", file=sys.stderr)
+        return 2
+
+    summary = run_cases(None, cases, out, dry_run=args.dry_run)
+    if not args.dry_run:
+        client = OpenAICompatClient(args.base)
+        client.verify_model()  # exact identity before heavy traffic
+        out.unlink(missing_ok=True)  # rewrite rows for real (dry rows not persisted)
+        summary = run_cases(client, cases, out)
+
+    print(json.dumps(summary, indent=2))
+    return 0 if summary["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
