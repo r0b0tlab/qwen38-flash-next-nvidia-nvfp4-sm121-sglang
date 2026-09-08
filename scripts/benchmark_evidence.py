@@ -4,7 +4,10 @@ import hashlib
 import json
 from pathlib import Path
 
-import compare
+if __package__:
+    from . import compare
+else:
+    import compare
 
 
 def input_hash(payload):
