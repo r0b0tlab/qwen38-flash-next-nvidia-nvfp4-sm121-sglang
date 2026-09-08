@@ -17,10 +17,10 @@
   ],
   "schema": "r0b0tlab.qwen38fn.runtime.v1",
   "sglang": {
-    "commit": "85ce7c16afac3d701e9edcff36aed599ff437870",
+    "commit": "84cf99860e3086ee0a458a71178343a8ac04fdab",
     "main": "20ca564bf77518604b89dc9f7fdba640daabd88b",
-    "package_version": "0.5.19+sm121.g85ce7c16afac",
-    "patch_sha256": "045ad1b37db978424ce351cda08d474542985b6ee3ff2b9e7f6c1af178b7798b",
+    "package_version": "0.5.19+sm121.g84cf99860e30",
+    "patch_sha256": "4ed1ffec644791f672f1584bf6322b964d2caf66d41a523d8bca4a621e769584",
     "python_files": {
       "__init__.py": "0c6bd1b5bc75da013d49d26f7799ca36d682779293405dce1adc193b97a0e6bd",
       "_platform_stubs.py": "79315697f34c57d0809973e32fa68fa89b4260d3d3271a2e0fcfdaa516a339e2",
@@ -3152,7 +3152,7 @@
       "srt/models/qwen3_vl_moe.py": "1bd9245b10257fd7f3ab2191fe035e325b829f1b1bcee13babf68d7916c323ea",
       "srt/models/qwen4_exp.py": "825742592b01be15c74e36c48da215df2be1e94154dc425f30d9a76f33a2259e",
       "srt/models/qwen4_exp_mtp.py": "243531fbb3d256fff68db299a2f902ba3cc38227735f2ab0a90fb5be311f9f60",
-      "srt/models/qwen4_exp_ple_cache.py": "cb63c6c2b7efdb0fa0c7c93c7d70f113adcf20ef9948240343b76d2036f7ee2b",
+      "srt/models/qwen4_exp_ple_cache.py": "ff244be5b48c8f3f53d6debfc0fe3dd7c2a592f47742ba6bd7ca944b352e0f3c",
       "srt/models/qwen4_exp_ple_table.py": "dcd7a75f58aee119d05f6efc468a4fd30fdabd104a3ddfa9a325d17909f14b86",
       "srt/models/radio.py": "a9b433efe68b8450101ccd0ed4439fb212f61539de8afb9c466aaf3a5da3c9c9",
       "srt/models/registry.py": "b3e87b0135e8326c63bb2cf8dbfd851b777e4321b9f87058a62177b0fa5231b6",
@@ -3652,7 +3652,7 @@
       "kernels/aot/",
       "_version.py"
     ],
-    "tree": "00308123bae99bc25f2f9d679869e3ef968d9d97",
+    "tree": "4957f519e185bfa0388299d8fec3792f4f96102d",
     "wheel_omissions": [
       "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py",
       "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py"

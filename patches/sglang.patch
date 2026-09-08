@@ -15032,16 +15032,17 @@ index 0000000000..31a8730141
 +EntryClass = [Qwen4ExpForCausalLMMTP]
 diff --git a/python/sglang/srt/models/qwen4_exp_ple_cache.py b/python/sglang/srt/models/qwen4_exp_ple_cache.py
 new file mode 100644
-index 0000000000..4bff1419bc
+index 0000000000..00c224d86f
 --- /dev/null
 +++ b/python/sglang/srt/models/qwen4_exp_ple_cache.py
-@@ -0,0 +1,1410 @@
+@@ -0,0 +1,1429 @@
 +"""Bounded, pure-stdlib PLE (precomputed lookup embedding) cache materializer.
 +
 +Materializes a contiguous FP8 lookup table from scattered per-shard tensors
 +inside a large safetensors source file, with a verified warm-reuse contract:
-+an existing table is reused only after a full SHA-256 check against the plan
-+plus an exact fd-stat match with the success receipt.
++an existing table is reused only after a full SHA-256 check against the plan.
++Timestamp-only drift on the same inode gets a freshly bound receipt after
++verification; the native opener still requires its exact current fd-stat.
 +
 +Bounded I/O properties (fixed byte budgets, not measured speed claims):
 +- sequential ``os.pread`` from the source, ``os.pwrite`` into a private
@@ -15948,18 +15949,36 @@ index 0000000000..4bff1419bc
 +                    st = os.fstat(existing)
 +                    _require_regular_single_link(st, "cached table")
 +                    _require_owned_mode(st, "cached table")
++                    table_baseline = _stat_snapshot(st)
 +                    valid = (
 +                        receipt is not None
-+                        and _stats_equal(_stat_snapshot(st), receipt["table_stat"])
++                        and all(
++                            table_baseline[key] == receipt["table_stat"][key]
++                            for key in ("dev", "ino", "size")
++                        )
 +                        and _stats_equal(src_baseline, receipt["source_stat"])
 +                        and _verify_table_content(existing, plan["table"])
 +                    )
-+                    if valid:
++                    if valid and receipt is not None:
 +                        if not _stats_equal(
 +                            _stat_snapshot(os.fstat(src_fd)), src_baseline
 +                        ):
 +                            raise PleCacheError(
 +                                "source changed during warm verification"
++                            )
++                        if not _stats_equal(
++                            _stat_snapshot(os.fstat(existing)), table_baseline
++                        ):
++                            raise PleCacheError(
++                                "table changed during warm verification"
++                            )
++                        if not _stats_equal(table_baseline, receipt["table_stat"]):
++                            # CUDA/HMM reads of a shared writable file mapping can
++                            # dirty its timestamps without changing payload bytes.
++                            # Full source/table hashes above remain mandatory;
++                            # renew only metadata for the same verified inode.
++                            receipt_raw = _finalize_receipt(
++                                cache_fd, plan, src_baseline, st
 +                            )
 +                        return _result(
 +                            receipt_path, _sha256_hex(receipt_raw), "reuse", 0, started
@@ -20682,10 +20701,10 @@ index 0000000000..0910f01150
 +        method.create_moe_runner(SimpleNamespace(), MoeRunnerConfig())
 diff --git a/test/registered/unit/models/test_qwen4_exp_ple_cache.py b/test/registered/unit/models/test_qwen4_exp_ple_cache.py
 new file mode 100644
-index 0000000000..f845f36e24
+index 0000000000..4556282e4e
 --- /dev/null
 +++ b/test/registered/unit/models/test_qwen4_exp_ple_cache.py
-@@ -0,0 +1,860 @@
+@@ -0,0 +1,912 @@
 +"""Unit tests for the bounded pure-stdlib PLE cache materializer.
 +
 +These tests run under a plain stdlib pytest (no SGLang / torch import needed).
@@ -21093,14 +21112,66 @@ index 0000000000..f845f36e24
 +    assert table.read_bytes() == b"".join(src.payloads[i] for i in range(src.n))
 +
 +
-+def test_touched_table_mtime_forces_rebuild(ple, tmp_path):
++def test_touched_table_mtime_revalidates_content_and_refreshes_receipt(
++    ple, tmp_path, monkeypatch
++):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    old = ple.prepare_cache(str(model_root), str(cache), plan)
++    table = cache / plan["table"]["name"]
++    os.utime(table, ns=(10**18, 10**18))
++    touched = table.stat()
++    checked = []
++    verify = ple._verify_table_content
++
++    def observed_verify(fd, expected):
++        checked.append(expected["sha256"])
++        return verify(fd, expected)
++
++    def forbidden_copy(*args, **kwargs):
++        raise AssertionError("verified timestamp-only drift must not copy table")
++
++    monkeypatch.setattr(ple, "_verify_table_content", observed_verify)
++    monkeypatch.setattr(ple, "_materialize", forbidden_copy)
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert checked == [plan["table"]["sha256"]]
++    assert r["mode"] == "reuse" and r["copied_bytes"] == 0
++    current = table.stat()
++    assert all(
++        getattr(current, key) == getattr(touched, key)
++        for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
++    )
++    assert r["receipt_sha256"] != old["receipt_sha256"]
++    with pytest.raises(ple.PleCacheError):
++        ple.open_prepared_table(
++            old["receipt_path"],
++            old["receipt_sha256"],
++            **_open_args(ple, old, src, cache),
++        )
++    fd = ple.open_prepared_table(
++        r["receipt_path"], r["receipt_sha256"], **_open_args(ple, r, src, cache)
++    )
++    os.close(fd)
++
++
++def test_timestamp_refresh_rejects_change_after_content_verification(
++    ple, tmp_path, monkeypatch
++):
 +    src, plan, model_root, cache = prepare_env(ple, tmp_path)
 +    ple.prepare_cache(str(model_root), str(cache), plan)
 +    table = cache / plan["table"]["name"]
++    receipt = (cache / "prepared.json").read_bytes()
 +    os.utime(table, ns=(10**18, 10**18))
-+    r = ple.prepare_cache(str(model_root), str(cache), plan)
-+    assert r["mode"] == "materialized"
-+    assert r["copied_bytes"] == plan["table"]["size"]
++    verify = ple._verify_table_content
++
++    def concurrent_touch(fd, expected):
++        good = verify(fd, expected)
++        os.utime(table, ns=(10**18 + 1, 10**18 + 1))
++        return good
++
++    monkeypatch.setattr(ple, "_verify_table_content", concurrent_touch)
++    with pytest.raises(ple.PleCacheError, match="changed during warm verification"):
++        ple.prepare_cache(str(model_root), str(cache), plan)
++    assert (cache / "prepared.json").read_bytes() == receipt
 +
 +
 +def test_invalid_and_tampered_receipts_rebuild(ple, tmp_path):
@@ -23023,10 +23094,10 @@ index 0000000000..307bd403b8
 +    unittest.main()
 diff --git a/test/registered/unit/models/test_qwen4_prepared_interop.py b/test/registered/unit/models/test_qwen4_prepared_interop.py
 new file mode 100644
-index 0000000000..d690ec414f
+index 0000000000..a3d7a19beb
 --- /dev/null
 +++ b/test/registered/unit/models/test_qwen4_prepared_interop.py
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,177 @@
 +"""Real PLE core -> verified descriptor -> native allocator/gather interoperability.
 +
 +Tiny deterministic FP8 fixtures only; this is not full-model qualification.
@@ -23154,6 +23225,8 @@ index 0000000000..d690ec414f
 +def test_real_prepared_file_native_gather_and_graph_replay(tmp_path, monkeypatch):
 +    check_file_backend_supported(torch.cuda.current_device())
 +    cache, plan, receipt, values = prepare_fixture(tmp_path)
++    table_path = cache / plan["table"]["name"]
++    original_inode = table_path.stat().st_ino
 +    handoff(monkeypatch, receipt)
 +    source = source_embedding()
 +    embedding = Qwen4ExpPinnedHostEmbedding(
@@ -23191,6 +23264,17 @@ index 0000000000..d690ec414f
 +            embedding._file_prefetcher.close()
 +        if embedding._file_rss_trimmer is not None:
 +            embedding._file_rss_trimmer.close()
++
++    # A real GPU access can change shared-file timestamps despite read-only
++    # kernel semantics. A whole-content-verified restart must retain the table.
++    del graph, output, embedding
++    repeated = core.prepare_cache(str(tmp_path / "model"), str(cache), plan)
++    assert repeated["mode"] == "reuse"
++    assert repeated["copied_bytes"] == 0
++    assert table_path.stat().st_ino == original_inode
++    assert (
++        hashlib.sha256(table_path.read_bytes()).hexdigest() == plan["table"]["sha256"]
++    )
 diff --git a/test/registered/unit/models/test_shared_experts_fusion_gates.py b/test/registered/unit/models/test_shared_experts_fusion_gates.py
 index e94dc1bf52..4fe72f120d 100644
 --- a/test/registered/unit/models/test_shared_experts_fusion_gates.py

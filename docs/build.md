@@ -82,6 +82,13 @@ synchronization and atomic publication. It does not overwrite the table via
 an inference-oriented random-access mmap or disable the memory guard. Numeric
 shard order is distinct from physical checkpoint order and must be preserved.
 
+Native CUDA/HMM reads can update a shared table's modification/change times
+without altering its bytes. For timestamp-only drift on the same device,
+inode and size, preparation still verifies the full source and table contents
+and requires unchanged source identity, then publishes a fresh receipt without
+copying the table. Concurrent mutation fails closed. The native opener still
+requires the exact fresh receipt-byte digest and current descriptor stat.
+
 The fresh `receipt_path` and `receipt_sha256` returned by the core overwrite
 both internal `R0B0TLAB_PLE_PREPARED_*` environment values before exec. Malformed
 plans, source mismatches, preparation errors, stale caller-supplied handoffs,
@@ -97,6 +104,15 @@ The earlier AR attempt remains failed on its multi-image semantic case; its
 results cannot qualify a changed source tree or image. Real core/entrypoint
 interoperability, cold/warm startup measurements, corrected ViT graph/cache
 semantics and full model requalification are required before release.
+
+## Initial matched memory profiles
+
+The 32K/C1 AR and NEXTN profiles use `mem_fraction_static=0.83`, retaining
+BF16 KV, FP32 recurrent state, Mamba16 capacity, native precision, graphs and
+all host guards. The earlier NEXTN 0.80 epoch loaded target and FP8 draft but
+failed KV sizing after reserving persistent and speculative recurrent state.
+The 0.83 value is a candidate derived from that budget, not proof of readiness
+or final-context capacity; require fresh live allocation and semantic gates.
 
 ## Native build, only after review/resource admission
 
