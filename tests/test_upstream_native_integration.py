@@ -120,7 +120,9 @@ def test_actual_upstream_parser_accepts_usage_only_events(tmp_path, monkeypatch)
         },
     )
     try:
-        output = asyncio.run(upstream.ASYNC_REQUEST_FUNCS["sglang-oai"](request))
+        output = asyncio.run(
+            upstream.ASYNC_REQUEST_FUNCS["sglang-oai"](request_func_input=request)
+        )
         assert (
             output.success is True and output.output_len == 2 and output.prompt_len == 3
         )

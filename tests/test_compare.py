@@ -236,6 +236,19 @@ def _upstream(rate: float, rounds: int = 5, completed: int = 8) -> str:
                     "random_output_len": 256,
                     "input_lens": [512] * 8,
                     "output_lens": [256] * 8,
+                    "usage_source": "observed_oai_sse",
+                    "finish_source": "observed_oai_sse",
+                    "finish_reasons": ["length"] * 8,
+                    "observed_usage": [
+                        {
+                            "prompt_tokens": 512,
+                            "completion_tokens": 256,
+                            "total_tokens": 768,
+                        }
+                        for _ in range(8)
+                    ],
+                    "cached_tokens": [0] * 8,
+                    "request_hashes": [f"{i:064x}" for i in range(8)],
                     "errors": [""] * 8,
                     "generated_texts": ["test-only synthetic fixture"] * 8,
                     "ttfts": [0.1] * 8,

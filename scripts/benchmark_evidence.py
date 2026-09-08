@@ -47,6 +47,17 @@ def bind_requests(manifest, lane, requests):
     }
 
 
+def verify_bound_epoch(manifest, base):
+    if manifest is None or "runtime_context" not in manifest:
+        return False  # diagnostic rows have no promotion epoch proof
+    from scripts.runtime_context import verify_http_epoch
+
+    if base.rstrip("/") != manifest["runtime_context"]["endpoint"]:
+        raise ValueError("producer endpoint differs from the captured runtime")
+    verify_http_epoch(manifest)
+    return True
+
+
 def load_manifest(path):
     if path is None:
         return None

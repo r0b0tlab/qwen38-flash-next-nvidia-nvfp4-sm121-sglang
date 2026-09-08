@@ -10,6 +10,8 @@ import json
 from pathlib import Path
 import pytest
 from scripts import compare as c
+from scripts.freeze_benchmark import upstream_payload
+from scripts.benchmark_evidence import input_hash
 
 spec = importlib.util.spec_from_file_location(
     "promotion_helpers", Path(__file__).with_name("test_compare.py")
@@ -24,10 +26,14 @@ def sha(text):
 
 
 def full_side(rate, lever):
+    requests = {
+        "short": [upstream_payload([i + 2] * 512, 256) for i in range(8)],
+        "medium": [upstream_payload([i + 2] * 2048, 512) for i in range(8)],
+    }
     inputs = {
         "prose": {case: sha(case) for case in h.CASES},
-        "short": {"batch": sha("short")},
-        "medium": {"batch": sha("medium")},
+        "short": {"batch": input_hash(requests["short"])},
+        "medium": {"batch": input_hash(requests["medium"])},
         "vision": {f"image-{i}": sha(str(i)) for i in range(43)},
     }
     manifest = h._manifest(
@@ -41,10 +47,16 @@ def full_side(rate, lever):
         concurrency=1,
         total_pool=262144,
         inputs=inputs,
+        requests=requests,
     )
     manifest["manifest_sha256"] = c.manifest_fingerprint(manifest)
 
     def bind(row, lane, key):
+        row["epoch_verified"] = (
+            True  # explicit reducer unit fixture, not runtime evidence
+        )
+        if lane in requests:
+            row["request_hashes"] = [input_hash(p) for p in requests[lane]]
         row["_evidence"] = {
             "manifest_sha256": manifest["manifest_sha256"],
             "lane": lane,
@@ -66,6 +78,10 @@ def full_side(rate, lever):
             random_output_len=512,
             input_lens=[2048] * 8,
             output_lens=[512] * 8,
+            observed_usage=[
+                {"prompt_tokens": 2048, "completion_tokens": 512, "total_tokens": 2560}
+                for _ in range(8)
+            ],
             total_input_tokens=16384,
             total_output_tokens=4096,
             duration=4096 / rate,
@@ -117,7 +133,28 @@ def test_complete_bound_all_lane_comparison_can_pass():
 
 
 def test_complete_cli_reaches_same_verdict(tmp_path):
+    import os
+    import subprocess
+    import sys
+
     data = pair()
+    for prefix, mode in (("base", "ar"), ("cand", "nextn")):
+        m = data[prefix + "_manifest"]
+        profile = {
+            "schema": 1,
+            "mode": mode,
+            "context_length": 32768,
+            "max_total_tokens": 32768,
+            "vision": {"backend": "triton_attn", "cuda_graph": True},
+        }
+        if mode == "nextn":
+            profile["speculative"] = {"steps": 1}
+        m["runtime_context"] = {"profile": profile}
+        m["manifest_sha256"] = c.manifest_fingerprint(m)
+        for lane in ("rows", "upstream", "medium", "vision"):
+            for item in data[prefix + "_" + lane]:
+                row = item["row"] if lane in ("upstream", "medium") else item
+                row["_evidence"]["manifest_sha256"] = m["manifest_sha256"]
     args = []
     for side, prefix in (("baseline", "base"), ("candidate", "cand")):
         manifest = tmp_path / (side + ".manifest.json")
@@ -136,6 +173,16 @@ def test_complete_cli_reaches_same_verdict(tmp_path):
             path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
             args += ["--" + side + suffix, str(path)]
     assert c.main(args) == 0
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, str(Path(c.__file__).resolve()), *args],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(

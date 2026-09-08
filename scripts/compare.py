@@ -32,6 +32,11 @@ import math
 import re
 import sys
 from pathlib import Path
+
+# The public script may be called from an evidence directory, not the repo root.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 from typing import Any, Dict, List, Optional, Sequence
 
 REQUIRED_UPSTREAM_KEYS = (
@@ -252,6 +257,45 @@ def _upstream_rate(row, variant, lane):
     if type(row["completed"]) is not int or row["completed"] != 8:
         raise Reject(f"{variant}: completed={row['completed']}, expected 8")
     inp, out = (512, 256) if lane == "short" else (2048, 512)
+    if (
+        row.get("usage_source") != "observed_oai_sse"
+        or row.get("finish_source") != "observed_oai_sse"
+    ):
+        raise Reject("upstream rows require observed wire usage and finish evidence")
+    if row.get("finish_reasons") != ["length"] * 8:
+        raise Reject("upstream fixed-output finish reasons are not all length")
+    usage = row.get("observed_usage")
+    if not isinstance(usage, list) or len(usage) != 8:
+        raise Reject("upstream observed usage is missing")
+    for item in usage:
+        if not isinstance(item, dict) or any(
+            type(item.get(key)) is not int or item[key] != value
+            for key, value in (
+                ("prompt_tokens", inp),
+                ("completion_tokens", out),
+                ("total_tokens", inp + out),
+            )
+        ):
+            raise Reject(
+                "upstream observed usage differs from the exact input/output protocol"
+            )
+    cached = row.get("cached_tokens")
+    if (
+        not isinstance(cached, list)
+        or len(cached) != 8
+        or any(type(x) is not int or x != 0 for x in cached)
+    ):
+        raise Reject("upstream cold-cache observations are missing or nonzero")
+    hashes = row.get("request_hashes")
+    if (
+        not isinstance(hashes, list)
+        or len(hashes) != 8
+        or any(
+            not isinstance(x, str) or not re.fullmatch(r"[0-9a-f]{64}", x)
+            for x in hashes
+        )
+    ):
+        raise Reject("upstream observed request hashes are missing")
     for field, expected in (
         ("random_input_len", inp),
         ("random_output_len", out),
@@ -385,6 +429,39 @@ def check_parity(base_m: Dict[str, Any], cand_m: Dict[str, Any]) -> Dict[str, An
         )
     if mixed := _mixed_epoch_guard(lever_b, lever_c):
         raise Reject(mixed)
+    contexts = [m.get("runtime_context") for m in (base_m, cand_m)]
+    if any(value is not None for value in contexts):
+        import dataclasses
+        from runtime import profile_from_dict
+
+        profiles = []
+        for value in contexts:
+            if not isinstance(value, dict) or "profile" not in value:
+                raise Reject("runtime profile snapshot missing on one side")
+            profiles.append(dataclasses.asdict(profile_from_dict(value["profile"])))
+        for profile in profiles:
+            profile.pop("raw")
+        if lever_c == "nextn":
+            if profiles[0]["mode"] != "ar" or profiles[1]["mode"] != "nextn":
+                raise Reject("declared NEXTN comparison does not change AR to NEXTN")
+            allowed = {"mode", "speculative_steps"}
+        else:
+            field = {
+                "vision.backend": "vision_backend",
+                "vision.cuda_graph": "vision_cuda_graph",
+            }.get(lever_c, lever_c)
+            allowed = {field}
+            if field not in profiles[0] or profiles[0][field] == profiles[1][field]:
+                raise Reject("declared profile lever is absent or unchanged")
+        changed = {key for key in profiles[0] if profiles[0][key] != profiles[1][key]}
+        if not changed <= allowed:
+            raise Reject(
+                "undeclared runtime profile changes: " + str(sorted(changed - allowed))
+            )
+    for key in ("inputs", "benchmark_module_sha256", "capture_adapter_sha256"):
+        if key in base_m or key in cand_m:
+            if base_m.get(key) != cand_m.get(key):
+                raise Reject("frozen comparison provenance differs: " + key)
     return {"lever": {"baseline": lever_b or "none", "candidate": lever_c}}
 
 
@@ -445,6 +522,8 @@ def check_evidence_binding(manifest, rows, lane):
     if set(inputs) != observed_cases or (lane == "vision" and len(inputs) != 43):
         raise Reject("frozen input set is incomplete or differs from measured rows")
     for row in measured:
+        if row.get("epoch_verified") is not True:
+            raise Reject("row has no verified runtime epoch")
         binding = row.get("_evidence")
         case = row.get("case_id", row.get("case", "batch"))
         if (
@@ -465,6 +544,24 @@ def check_evidence_binding(manifest, rows, lane):
             or binding.get("input_sha256") != expected
         ):
             raise Reject("row input differs from frozen manifest")
+        if "input_sha256" in row and row["input_sha256"] != expected:
+            raise Reject("row input hash disagrees with its bound evidence")
+        if lane in ("short", "medium"):
+            payloads = manifest.get("requests", {}).get(lane)
+            if not isinstance(payloads, list) or len(payloads) != 8:
+                raise Reject("upstream promotion requires the frozen request values")
+            hashes = [
+                hashlib.sha256(
+                    json.dumps(
+                        p, sort_keys=True, separators=(",", ":"), allow_nan=False
+                    ).encode()
+                ).hexdigest()
+                for p in payloads
+            ]
+            if row.get("request_hashes") != hashes:
+                raise Reject(
+                    "actual upstream request sequence differs from the frozen corpus"
+                )
 
 
 def _norm_lever(v: Any) -> Optional[str]:

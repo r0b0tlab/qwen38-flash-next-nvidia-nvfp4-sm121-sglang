@@ -45,7 +45,12 @@ from http_client import (  # noqa: E402
 )
 
 import make_vision_fixtures as mvf  # noqa: E402
-from benchmark_evidence import bind_requests, input_hash, load_manifest  # noqa: E402
+from benchmark_evidence import (
+    bind_requests,
+    input_hash,
+    load_manifest,
+    verify_bound_epoch,
+)  # noqa: E402
 
 ENV_ENABLE = "QUAL_HARNESS_VISION_ENABLED"
 THINKING = thinking_request_fields(True, "low")
@@ -280,6 +285,11 @@ def run_vision_benchmark(
     requests = json.loads(
         json.dumps({case["case_id"]: case_payload(case) for case in cases})
     )
+    if promotion_manifest is not None and "runtime_context" in promotion_manifest:
+        if repeats != 1 or warmup != 1:
+            raise ValueError(
+                "bound vision requires one warmup per case and one measured envelope"
+            )
     bindings = bind_requests(promotion_manifest, "vision", requests)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with inputs_path.open("x", encoding="utf-8") as stream:
@@ -318,6 +328,7 @@ def run_vision_benchmark(
                 for key in ("chat_template_kwargs", "reasoning_effort")
                 if key in payload
             }
+            verify_bound_epoch(promotion_manifest, base)
             with gate.slot():
                 res = client.chat_stream(
                     payload["messages"],
@@ -360,6 +371,7 @@ def run_vision_benchmark(
                 json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
             )
             raw_output.flush()
+            row["epoch_verified"] = verify_bound_epoch(promotion_manifest, base)
             valid, reason = row_validity(res)
             if res.model_reported != MODEL_ID:
                 valid, reason = False, "wrong_reported_model"

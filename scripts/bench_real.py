@@ -42,7 +42,12 @@ from http_client import (  # noqa: E402
     thinking_request_fields,
     build_chat_payload,
 )
-from benchmark_evidence import bind_requests, input_hash, load_manifest
+from benchmark_evidence import (
+    bind_requests,
+    input_hash,
+    load_manifest,
+    verify_bound_epoch,
+)
 
 # ---------------------------------------------------------------------------
 # Frozen prose corpus (written before any traffic; sha256 in every run manifest)
@@ -234,9 +239,15 @@ def run_bench(
     corpus_path = out_path.with_suffix(out_path.suffix + ".corpus.json")
     if any(path.exists() for path in (out_path, raw_path, corpus_path)):
         raise FileExistsError("prose output and sidecars must all be fresh")
+    if promotion_manifest is not None and "runtime_context" in promotion_manifest:
+        if repeats != 5 or warmup != 1 or flush_cold:
+            raise ValueError(
+                "bound prose requires five repeats, one warmup, and warm-prefix policy"
+            )
     thinking = thinking if thinking is not None else thinking_request_fields(False)
     requests = json.loads(json.dumps(prose_payloads(thinking)))
     bindings = bind_requests(promotion_manifest, "prose", requests)
+    verify_bound_epoch(promotion_manifest, base)
     write_corpus_lock(
         corpus_path, base=base, thinking=thinking, repeats=repeats, warmup=warmup
     )
@@ -279,6 +290,7 @@ def run_bench(
         client.verify_model()
         for case in PROSE_CASES:
             if flush_cold:
+                verify_bound_epoch(promotion_manifest, base)
                 status, body = client.flush_cache(admitted=True, timeout=30.0)
                 flush_log.append(
                     {
@@ -300,6 +312,7 @@ def run_bench(
                 if key in request
             }
             for w in range(warmup):  # separately marked warmup, never measured
+                verify_bound_epoch(promotion_manifest, base)
                 with gate.slot():
                     res = client.chat_stream(
                         messages,
@@ -333,6 +346,7 @@ def run_bench(
                     }
                 )
             for rep in range(repeats):
+                verify_bound_epoch(promotion_manifest, base)
                 with gate.slot():  # admission strictly precedes the clock
                     res = client.chat_stream(
                         messages,
@@ -343,6 +357,7 @@ def run_bench(
                         timeout=timeout_s,
                     )
                 emit_raw(case["case_id"], rep, res, False)
+                epoch_verified = verify_bound_epoch(promotion_manifest, base)
                 valid, reason = row_validity(
                     res,
                     require_finish="stop",
@@ -356,6 +371,7 @@ def run_bench(
                     "repeat": rep,
                     "warmup": False,
                     "model_reported": res.model_reported,
+                    "epoch_verified": epoch_verified,
                     "valid": valid,
                     "reason": reason,
                     "ok": res.ok,
