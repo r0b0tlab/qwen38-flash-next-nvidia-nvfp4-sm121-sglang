@@ -119,7 +119,13 @@ rejects additional failures. It does NOT claim a clean zero-exception
 The runtime account is UID/GID 1001, matching the admitted host. Its default
 user must read the host's private control snapshots and write the dedicated
 cache; do not solve a permission error with `--privileged`, broad chmod, or a
-root override. The final build stage checks package version, source hashes,
+root override. `TMPDIR=/cache/tmp` is owned by the image/entrypoint and created
+as a private runtime-owned directory before server exec. The general `/tmp`
+tmpfs stays non-executable; TileLang/TVM and other native JITs use `/cache/tmp`
+for generated libraries that must be executable-mapped. The runtime audit
+compiles and loads a tiny shared library there rather than checking writability
+alone. Exclude process-specific temp files from any reusable JIT cache seed.
+The final build stage checks package version, source hashes,
 all native Rust imports and writable cache locations as that default user.
 
 After build: inspect exact image ID/labels; run native SM121 GPU microtests,

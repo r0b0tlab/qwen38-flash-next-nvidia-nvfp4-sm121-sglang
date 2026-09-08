@@ -46,9 +46,11 @@ COPY docker/q200_sandbox_driver.py /opt/r0b0tlab/q200_sandbox_driver.py
 COPY scripts/audit_checkpoint.py /opt/r0b0tlab/audit_checkpoint.py
 RUN groupadd --gid 1001 runtime && \
     useradd --uid 1001 --gid 1001 --no-create-home --home-dir /cache/home --shell /usr/sbin/nologin runtime && \
-    mkdir -p /cache/home /cache/hf /cache/jit /cache/xdg /cache/triton /cache/torch /cache/flashinfer && \
+    mkdir -p /cache/home /cache/hf /cache/jit /cache/xdg /cache/triton /cache/torch /cache/flashinfer /cache/tmp && \
+    chmod 0700 /cache/tmp && \
     chown -R 1001:1001 /cache
 ENV HOME=/cache/home \
+    TMPDIR=/cache/tmp \
     XDG_CACHE_HOME=/cache/xdg \
     HF_HOME=/cache/hf \
     SGLANG_CACHE_DIR=/cache/jit \

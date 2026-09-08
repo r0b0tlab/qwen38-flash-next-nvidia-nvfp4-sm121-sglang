@@ -34,6 +34,7 @@ ENV_VARS_OWNED = (
     "SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED",
     "SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB",
     "SGLANG_QWEN4_PLE_FILE_PREFETCH",
+    "TMPDIR",
 )
 
 
@@ -59,8 +60,11 @@ def _checked_profile(profile: Profile) -> Profile:
     if not isinstance(profile, Profile):
         raise ProfileError("validated Profile required")
     checked = profile_from_dict(profile.raw)
-    if any(getattr(profile, field.name) != getattr(checked, field.name)
-           for field in dataclasses.fields(Profile) if field.name != "raw"):
+    if any(
+        getattr(profile, field.name) != getattr(checked, field.name)
+        for field in dataclasses.fields(Profile)
+        if field.name != "raw"
+    ):
         raise ProfileError("profile fields differ from its validated source")
     return checked
 
@@ -75,12 +79,11 @@ def build_env(profile: Profile, sources: Dict[str, Any]) -> Dict[str, str]:
     _checked_sources(sources)
     env = {
         "HOME": "/cache/home",
+        "TMPDIR": "/cache/tmp",
         "XDG_CACHE_HOME": "/cache/xdg",
         "HF_HOME": "/cache/hf",
         "SGLANG_CACHE_DIR": "/cache/jit",
-        "SGLANG_VIT_ENABLE_CUDA_GRAPH": (
-            "1" if profile.vision_cuda_graph else "0"
-        ),
+        "SGLANG_VIT_ENABLE_CUDA_GRAPH": ("1" if profile.vision_cuda_graph else "0"),
         "SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED": "1",
         "SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB": str(profile.ple_rss_gib),
         "SGLANG_QWEN4_PLE_FILE_PREFETCH": "1",
@@ -93,6 +96,20 @@ def build_env(profile: Profile, sources: Dict[str, Any]) -> Dict[str, str]:
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     return env
+
+
+def prepare_jit_temp(path: str) -> None:
+    """Create a private compiler scratch directory; refuse link/mode drift."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise PermissionError(
+                "JIT temporary directory must be private and runtime-owned"
+            )
+    finally:
+        os.close(fd)
 
 
 def _kv_cache_flag(dtype: str) -> str:
@@ -108,54 +125,95 @@ def build_argv(profile: Profile, sources: Dict[str, Any]) -> List[str]:
     argv: List[str] = [
         "sglang",
         "serve",
-        "--model-path", MODEL_PATH,
-        "--served-model-name", MODEL_ID,
-        "--tp-size", "1",
-        "--nnodes", "1",
-        "--node-rank", "0",
-        "--host", SERVE_HOST,
-        "--port", str(SERVE_PORT),
-        "--dtype", "bfloat16",
-        "--quantization", QUANTIZATION,
-        "--load-format", "safetensors",
+        "--model-path",
+        MODEL_PATH,
+        "--served-model-name",
+        MODEL_ID,
+        "--tp-size",
+        "1",
+        "--nnodes",
+        "1",
+        "--node-rank",
+        "0",
+        "--host",
+        SERVE_HOST,
+        "--port",
+        str(SERVE_PORT),
+        "--dtype",
+        "bfloat16",
+        "--quantization",
+        QUANTIZATION,
+        "--load-format",
+        "safetensors",
         "--ple-offload-embedding",
-        "--ple-offload-backend", "file",
-        "--ple-offload-dir", ple_dir(model_sha),
-        "--fp4-gemm-backend", "flashinfer_cutlass",
-        "--moe-runner-backend", "flashinfer_cutlass",
-        "--attention-backend", "triton",
-        "--mamba-ssm-dtype", "float32",
-        "--linear-attn-prefill-backend", "triton",
-        "--linear-attn-decode-backend", "triton",
-        "--linear-attn-verify-backend", "triton",
-        "--reasoning-parser", "auto",
-        "--tool-call-parser", "auto",
-        "--cuda-graph-backend-decode", "full",
-        "--cuda-graph-backend-prefill", "disabled",
+        "--ple-offload-backend",
+        "file",
+        "--ple-offload-dir",
+        ple_dir(model_sha),
+        "--fp4-gemm-backend",
+        "flashinfer_cutlass",
+        "--moe-runner-backend",
+        "flashinfer_cutlass",
+        "--attention-backend",
+        "triton",
+        "--mamba-ssm-dtype",
+        "float32",
+        "--linear-attn-prefill-backend",
+        "triton",
+        "--linear-attn-decode-backend",
+        "triton",
+        "--linear-attn-verify-backend",
+        "triton",
+        "--reasoning-parser",
+        "auto",
+        "--tool-call-parser",
+        "auto",
+        "--cuda-graph-backend-decode",
+        "full",
+        "--cuda-graph-backend-prefill",
+        "disabled",
         "--cuda-graph-bs-decode",
         *[str(n) for n in (1, 2, 4, 8) if n <= profile.max_running_requests],
-        "--page-size", "64",
+        "--page-size",
+        "64",
         "--enable-metrics",
-        "--watchdog-timeout", "1800",
-        "--context-length", str(profile.context_length),
-        "--max-total-tokens", str(profile.max_total_tokens),
-        "--max-running-requests", str(profile.max_running_requests),
-        "--chunked-prefill-size", str(profile.chunked_prefill_size),
-        "--max-prefill-tokens", str(profile.chunked_prefill_size),
-        "--mem-fraction-static", str(profile.mem_fraction_static),
-        "--kv-cache-dtype", _kv_cache_flag(profile.kv_cache_dtype),
-        "--max-mamba-cache-size", str(profile.max_mamba_cache_size),
-        "--mm-attention-backend", profile.vision_backend,
-        "--mm-processor-worker-num", str(profile.mm_processor_worker_num),
+        "--watchdog-timeout",
+        "1800",
+        "--context-length",
+        str(profile.context_length),
+        "--max-total-tokens",
+        str(profile.max_total_tokens),
+        "--max-running-requests",
+        str(profile.max_running_requests),
+        "--chunked-prefill-size",
+        str(profile.chunked_prefill_size),
+        "--max-prefill-tokens",
+        str(profile.chunked_prefill_size),
+        "--mem-fraction-static",
+        str(profile.mem_fraction_static),
+        "--kv-cache-dtype",
+        _kv_cache_flag(profile.kv_cache_dtype),
+        "--max-mamba-cache-size",
+        str(profile.max_mamba_cache_size),
+        "--mm-attention-backend",
+        profile.vision_backend,
+        "--mm-processor-worker-num",
+        str(profile.mm_processor_worker_num),
     ]
     if profile.mode == "nextn":
         argv += [
-            "--speculative-algorithm", "NEXTN",
-            "--speculative-num-steps", str(profile.speculative_steps),
-            "--speculative-eagle-topk", "1",
-            "--speculative-num-draft-tokens", str(profile.speculative_steps + 1),
-            "--speculative-draft-model-quantization", QUANTIZATION,
-            "--speculative-moe-runner-backend", "triton",
+            "--speculative-algorithm",
+            "NEXTN",
+            "--speculative-num-steps",
+            str(profile.speculative_steps),
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            str(profile.speculative_steps + 1),
+            "--speculative-draft-model-quantization",
+            QUANTIZATION,
+            "--speculative-moe-runner-backend",
+            "triton",
             "--speculative-draft-kv-cache-dtype",
             _kv_cache_flag(profile.kv_cache_dtype),
         ]
@@ -183,7 +241,9 @@ def _source_constant(value):
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Single-GB10 SGLang container entrypoint")
+    parser = argparse.ArgumentParser(
+        description="Single-GB10 SGLang container entrypoint"
+    )
     parser.add_argument("--profile", required=True)
     parser.add_argument("--sources", default="/opt/r0b0tlab/locks/sources.json")
     parser.add_argument("--print", action="store_true", dest="print_only")
@@ -194,7 +254,9 @@ def main(argv=None) -> int:
             raw = handle.read(4 * 1024 * 1024 + 1)
         if len(raw) > 4 * 1024 * 1024:
             raise ProfileError("source lock exceeds 4 MiB")
-        sources = json.loads(raw, object_pairs_hook=_source_pairs, parse_constant=_source_constant)
+        sources = json.loads(
+            raw, object_pairs_hook=_source_pairs, parse_constant=_source_constant
+        )
         launch = build_all(profile, sources)
         if args.print_only:
             print(json.dumps(launch, sort_keys=True, allow_nan=False))
@@ -203,9 +265,18 @@ def main(argv=None) -> int:
         # Libraries create their own subdirectories; no host path is mutated here.
         environment = dict(os.environ)
         environment.update(launch["env"])
-        print(json.dumps({"model_sha": sources["model"]["sha"],
-                          "profile_sha256": profile.digest(), "argv": launch["argv"]},
-                         sort_keys=True), flush=True)
+        prepare_jit_temp(environment["TMPDIR"])
+        print(
+            json.dumps(
+                {
+                    "model_sha": sources["model"]["sha"],
+                    "profile_sha256": profile.digest(),
+                    "argv": launch["argv"],
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         os.execvpe(launch["argv"][0], launch["argv"], environment)
     except (OSError, ValueError, TypeError) as error:
         print("ENTRYPOINT REFUSED: " + str(error), file=sys.stderr)
