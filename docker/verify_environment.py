@@ -72,6 +72,44 @@ def verify_jit_temporary_directory(root):
     return "PASS"
 
 
+def verify_ple_plan(root, runtime, core):
+    """Attest image-owned plan bytes and validate them with the installed core."""
+    with (root / "locks/ple.json").open("rb") as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    digest = hashlib.sha256(raw).hexdigest()
+    if len(raw) > 1024 * 1024 or digest != runtime.get("ple_plan_sha256"):
+        raise ValueError("image PLE plan differs from its runtime lock")
+    plan = core.validate_plan(core._load_strict_json(raw, "image PLE plan"))
+    with (root / "locks/sources.json").open("rb") as stream:
+        source_raw = stream.read(4 * 1024 * 1024 + 1)
+    if len(source_raw) > 4 * 1024 * 1024:
+        raise ValueError("image source lock exceeds its size bound")
+    sources = core._load_strict_json(source_raw, "image sources")
+    model = sources.get("model") if isinstance(sources, dict) else None
+    if (
+        not isinstance(model, dict)
+        or model.get("id") != plan["model"]["id"]
+        or model.get("sha") != plan["model"]["revision"]
+    ):
+        raise ValueError("image PLE model binding mismatch")
+    files = model.get("files")
+    if not isinstance(files, list) or any(not isinstance(row, dict) for row in files):
+        raise ValueError("image model inventory must be a list of objects")
+    rows = [row for row in files if row.get("path") == plan["source"]["name"]]
+    if (
+        len(rows) != 1
+        or type(rows[0].get("size")) is not int
+        or rows[0]["size"] != plan["source"]["size"]
+        or rows[0].get("sha256") != plan["source"]["sha256"]
+    ):
+        raise ValueError("image PLE source-file binding mismatch")
+    return {
+        "file_sha256": digest,
+        "canonical_plan_sha256": core.plan_sha256(plan),
+        "table_sha256": plan["table"]["sha256"],
+    }
+
+
 def verify(root, phase):
     dependencies = json.loads((root / "locks/dependencies.json").read_text())
     runtime = json.loads((root / "locks/runtime.json").read_text())
@@ -117,6 +155,7 @@ def verify(root, phase):
     assert libraries, "no native library for SBSA attestation"
     version = None
     modules = []
+    ple_plan = None
     if phase == "runtime":
         assert (
             os.getuid() == runtime["runtime_uid"]
@@ -167,6 +206,8 @@ def verify(root, phase):
             probe.unlink()
         assert os.environ["TMPDIR"] == "/cache/tmp"
         verify_jit_temporary_directory(Path(os.environ["TMPDIR"]))
+        core = importlib.import_module("sglang.srt.models.qwen4_exp_ple_cache")
+        ple_plan = verify_ple_plan(root, runtime, core)
     return {
         "status": "ENVIRONMENT_CHECK_PASS",
         "phase": phase,
@@ -176,6 +217,7 @@ def verify(root, phase):
         "metadata_exceptions": violations,
         "sbsa_libraries": libraries,
         "modules": modules,
+        "ple_plan": ple_plan,
         "gpu_qualification": "NOT_RUN",
     }
 

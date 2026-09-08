@@ -12563,13 +12563,14 @@ index 5d2faac6f5..46075999bd 100644
              self.num_deepstack_embeddings = 0
 diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
 new file mode 100644
-index 0000000000..8275c3fbb2
+index 0000000000..db4349a1c8
 --- /dev/null
 +++ b/python/sglang/srt/models/qwen4_exp.py
-@@ -0,0 +1,2181 @@
+@@ -0,0 +1,2227 @@
 +"""Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 +
 +import math
++import re
 +from contextlib import nullcontext
 +from typing import Any, Iterable, Optional, Set, Tuple
 +
@@ -13399,6 +13400,10 @@ index 0000000000..8275c3fbb2
 +                f"-{self.shard_indices.org_vocab_end_index}"
 +            ),
 +        )
++        # Capture before Parameter wrapping: nn.Parameter drops custom tensor
++        # attributes, so the loader asks the embedding object, not the tensor,
++        # whether the table arrived pre-verified (copy elision is allowed).
++        self._ple_prepared = bool(getattr(host_table, "_sglang_ple_prepared", False))
 +        # Only the file backend has anything to prefetch (rows live on storage).
 +        self._file_prefetcher = make_ple_file_prefetcher(host_table)
 +        # ... and only it needs its resident set bounded: a fault maps a whole
@@ -13474,6 +13479,42 @@ index 0000000000..8275c3fbb2
 +
 +    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
 +        return self.reduce(self.gather(input_ids))
++
++
++def _load_prepared_ple_shard(
++    name: str,
++    loaded_weight: torch.Tensor,
++    *,
++    emb,
++    num_shards: int,
++    loaded_shard_params: Set[str],
++) -> bool:
++    """Validate and mark already-prepared rows; leave legacy loading unchanged."""
++    if not getattr(emb, "_ple_prepared", False) or ".ngram_embedding.shard_" not in name:
++        return False
++    match = re.fullmatch(r"(.+)\.ngram_embedding\.shard_(0|[1-9][0-9]*)\.weight", name)
++    if match is None:
++        raise ValueError("prepared PLE requires a literal canonical shard name")
++    if type(num_shards) is not int or num_shards <= 0:
++        raise ValueError("prepared PLE requires a positive shard count")
++    shard_idx = int(match.group(2))
++    if not 0 <= shard_idx < num_shards:
++        raise ValueError("prepared PLE shard index outside configured range")
++    if (emb.weight.dtype != torch.float8_e4m3fn
++            or loaded_weight.dtype != torch.float8_e4m3fn):
++        raise ValueError("prepared PLE requires unchanged FP8 table and checkpoint shards")
++    if len(emb.weight.shape) != 2 or len(loaded_weight.shape) != 2:
++        raise ValueError("prepared PLE table and shards must be matrices")
++    total_rows = emb.org_vocab_size
++    if type(total_rows) is not int or total_rows <= 0:
++        raise ValueError("prepared PLE requires a positive vocabulary size")
++    shard_size = (total_rows + num_shards - 1) // num_shards
++    start = shard_idx * shard_size
++    expected_rows = min(shard_size, total_rows - start)
++    if expected_rows <= 0 or tuple(loaded_weight.shape) != (expected_rows, emb.weight.shape[1]):
++        raise ValueError("prepared PLE shard shape differs from its complete configured row range")
++    loaded_shard_params.add(match.group(1) + ".ngram_embedding.weight")
++    return True
 +
 +
 +class Qwen4ExpPLELayer(nn.Module):
@@ -14486,6 +14527,11 @@ index 0000000000..8275c3fbb2
 +            if ple_mod is None:
 +                return False
 +            emb = ple_mod.ngram_embedding
++            if _load_prepared_ple_shard(
++                name, loaded_weight, emb=emb, num_shards=ple_num_sync_shards,
++                loaded_shard_params=loaded_shard_params,
++            ):
++                return True
 +            if (
 +                loaded_weight.dtype == torch.float8_e4m3fn
 +                and emb.weight.dtype != torch.float8_e4m3fn
@@ -14984,12 +15030,1428 @@ index 0000000000..31a8730141
 +
 +
 +EntryClass = [Qwen4ExpForCausalLMMTP]
+diff --git a/python/sglang/srt/models/qwen4_exp_ple_cache.py b/python/sglang/srt/models/qwen4_exp_ple_cache.py
+new file mode 100644
+index 0000000000..4bff1419bc
+--- /dev/null
++++ b/python/sglang/srt/models/qwen4_exp_ple_cache.py
+@@ -0,0 +1,1410 @@
++"""Bounded, pure-stdlib PLE (precomputed lookup embedding) cache materializer.
++
++Materializes a contiguous FP8 lookup table from scattered per-shard tensors
++inside a large safetensors source file, with a verified warm-reuse contract:
++an existing table is reused only after a full SHA-256 check against the plan
++plus an exact fd-stat match with the success receipt.
++
++Bounded I/O properties (fixed byte budgets, not measured speed claims):
++- sequential ``os.pread`` from the source, ``os.pwrite`` into a private
++  exclusive temp file, buffers capped at ``_IO_BUFFER_BYTES`` (8 MiB),
++- periodic ``os.fdatasync`` plus scoped ``posix_fadvise(DONTNEED)`` every
++  ``_FADVISE_INTERVAL_BYTES`` (64 MiB) to bound dirty page-cache growth,
++- header reads capped at 16 MiB, metadata/receipt reads at 1 MiB.
++
++Safety posture: any integrity or filesystem-safety failure raises
++``PleCacheError`` and aborts. There is no silent cold fallback past a safety
++refusal, no mmap, and no torch / third-party imports (safe to load via
++importlib from a file path).
++"""
++
++from __future__ import annotations
++
++import contextlib
++import errno
++import fcntl
++import hashlib
++import json
++import math
++import os
++import stat
++import time
++
++__all__ = [
++    "PleCacheError",
++    "CacheBusyError",
++    "build_plan",
++    "validate_plan",
++    "plan_sha256",
++    "prepare_cache",
++    "open_prepared_table",
++]
++
++_PLAN_SCHEMA = "qwen38fn.ple-plan.v1"
++_PREPARED_SCHEMA = "qwen38fn.ple-prepared.v1"
++_DTYPE = "F8_E4M3"
++_DTYPE_ITEMBYTES = {"F8_E4M3": 1, "F8_E5M2": 1, "BF16": 2, "F16": 2, "F32": 4, "F64": 8}
++_SCALE_DTYPE = "BF16"
++_MODEL_ID = "nvidia/Qwen3.8-Flash-Next-NVFP4"
++_REVISION_LEN = 40
++_NAME_CHARS = frozenset(
++    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-+"
++)
++_HEX = frozenset("0123456789abcdef")
++
++_MAX_HEADER_BYTES = 16 * 1024 * 1024
++_MAX_META_BYTES = 1024 * 1024
++_IO_BUFFER_BYTES = 8 * 1024 * 1024
++_FADVISE_INTERVAL_BYTES = 64 * 1024 * 1024
++_SPACE_RESERVE_BYTES = 4 * 1024 * 1024 * 1024
++_NAME_MAX = 255
++_MAX_SHARDS = 4096
++_MAX_ROWS_PER_SHARD = 1 << 40
++_MAX_WIDTH = 1 << 24
++_MAX_TABLE_BYTES = (1 << 63) - 1
++_RECEIPT_NAME = "prepared.json"
++_STAT_KEYS = ("dev", "ino", "size", "mtime_ns", "ctime_ns")
++
++
++class PleCacheError(Exception):
++    """Safety or integrity failure: abort, never silently fall back."""
++
++
++class CacheBusyError(PleCacheError):
++    """Another process holds the exclusive cache lock."""
++
++
++# ---------------------------------------------------------------------------
++# strict scalar predicates
++
++
++def _is_int(v) -> bool:
++    return isinstance(v, int) and not isinstance(v, bool)
++
++
++def _is_hash(v) -> bool:
++    return isinstance(v, str) and len(v) == 64 and all(c in _HEX for c in v)
++
++
++def _is_revision(v) -> bool:
++    return isinstance(v, str) and len(v) == _REVISION_LEN and all(c in _HEX for c in v)
++
++
++def _check_index(value, what: str) -> int:
++    if not _is_int(value):
++        raise PleCacheError(f"{what} must be an integer (no bools)")
++    if value < 0:
++        raise PleCacheError(f"{what} must be non-negative")
++    return value
++
++
++def _check_hash(value, what: str) -> str:
++    if not _is_hash(value):
++        raise PleCacheError(f"{what} must be lower 64-hex sha256")
++    return value
++
++
++def _check_name(value, what: str) -> str:
++    if not isinstance(value, str):
++        raise PleCacheError(f"{what} must be a string")
++    if not value or len(value) > _NAME_MAX or "/" in value or value in (".", ".."):
++        raise PleCacheError(f"unsafe {what} name: {value!r}")
++    if any(c not in _NAME_CHARS for c in value):
++        raise PleCacheError(f"unsafe characters in {what} name: {value!r}")
++    return value
++
++
++def _require_keys(obj, keys, what: str) -> None:
++    if not isinstance(obj, dict) or set(obj) != set(keys):
++        got = (
++            sorted(str(key) for key in obj)
++            if isinstance(obj, dict)
++            else type(obj).__name__
++        )
++        raise PleCacheError(f"{what} keys must be exactly {sorted(keys)}, got {got}")
++
++
++def _canonical_json_bytes(obj) -> bytes:
++    return json.dumps(
++        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
++    ).encode("ascii")
++
++
++def _sha256_hex(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++
++
++# ---------------------------------------------------------------------------
++# strict JSON
++
++
++def _load_strict_json(raw: bytes, what: str):
++    def _dup_check(pairs):
++        seen = set()
++        out = {}
++        for k, v in pairs:
++            if k in seen:
++                raise PleCacheError(f"{what}: duplicate JSON key {k!r}")
++            seen.add(k)
++            out[k] = v
++        return out
++
++    def _reject_constant(name):
++        raise PleCacheError(f"{what}: non-finite JSON constant {name}")
++
++    try:
++        obj = json.loads(
++            raw.decode("utf-8"),
++            object_pairs_hook=_dup_check,
++            parse_constant=_reject_constant,
++        )
++    except (ValueError, RecursionError) as exc:
++        raise PleCacheError(f"{what}: invalid JSON ({exc})") from None
++    _reject_nonfinite(obj, what)
++    return obj
++
++
++def _reject_nonfinite(obj, what: str) -> None:
++    pending = [(obj, 0)]
++    while pending:
++        value, depth = pending.pop()
++        if depth > 64:
++            raise PleCacheError(f"{what}: JSON nesting exceeds 64 levels")
++        if isinstance(value, dict):
++            if any(not isinstance(key, str) for key in value):
++                raise PleCacheError(f"{what}: non-string JSON key")
++            pending.extend((item, depth + 1) for item in value.values())
++        elif isinstance(value, list):
++            pending.extend((item, depth + 1) for item in value)
++        elif isinstance(value, float) and not math.isfinite(value):
++            raise PleCacheError(f"{what}: non-finite float in JSON")
++
++
++# ---------------------------------------------------------------------------
++# descriptor / path safety
++
++
++def _path_components(path_str: str, what: str) -> list[str]:
++    if (
++        not isinstance(path_str, str)
++        or not path_str.startswith("/")
++        or "\x00" in path_str
++    ):
++        raise PleCacheError(f"{what} must be an absolute path without NUL")
++    parts = [] if path_str == "/" else path_str.split("/")[1:]
++    if any(part in ("", ".", "..") for part in parts):
++        raise PleCacheError(f"{what} contains traversal or an empty component")
++    return parts
++
++
++def _open_dir(path_str: str, what: str, *, create: bool = False) -> int:
++    """Walk each component using directory fds; never follow ancestor links."""
++    parts = _path_components(path_str, what)
++    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
++    current = os.open("/", flags)
++    try:
++        for part in parts:
++            try:
++                child = os.open(part, flags, dir_fd=current)
++            except FileNotFoundError:
++                if not create:
++                    raise
++                try:
++                    os.mkdir(part, 0o700, dir_fd=current)
++                    os.fsync(current)
++                except FileExistsError:
++                    pass
++                child = os.open(part, flags, dir_fd=current)
++            os.close(current)
++            current = child
++        result = current
++        current = -1
++        return result
++    except OSError as exc:
++        raise PleCacheError(f"cannot open directory {what}: {exc}") from None
++    finally:
++        if current >= 0:
++            os.close(current)
++
++
++def _resolve_anchored(path_str: str, what: str) -> str:
++    parts = _path_components(path_str, what)
++    if not parts:
++        return path_str
++    parent = _open_dir(os.path.dirname(path_str), what + " parent")
++    try:
++        value = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
++        if stat.S_ISLNK(value.st_mode):
++            raise PleCacheError(f"{what} is a symlink")
++    except OSError as exc:
++        raise PleCacheError(f"cannot resolve {what}: {exc}") from None
++    finally:
++        os.close(parent)
++    return path_str
++
++
++def _ensure_dir_anchored(path_str: str, what: str) -> str:
++    fd = _open_dir(path_str, what, create=True)
++    os.close(fd)
++    return path_str
++
++
++def _open_leaf(dir_fd: int, name: str, what: str, flags: int = os.O_RDONLY) -> int:
++    """Open a final path component relative to dir_fd, never following symlinks."""
++    try:
++        return os.open(
++            name,
++            flags | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
++            0o600,
++            dir_fd=dir_fd,
++        )
++    except OSError as exc:
++        raise PleCacheError(f"cannot open {what}: {exc}") from None
++
++
++def _require_regular_single_link(st: os.stat_result, what: str) -> None:
++    if stat.S_ISLNK(st.st_mode):
++        raise PleCacheError(f"{what} is a symlink")
++    if not stat.S_ISREG(st.st_mode):
++        raise PleCacheError(f"{what} is not a regular file")
++    if st.st_nlink != 1:
++        raise PleCacheError(
++            f"{what} must have exactly one hard link (got {st.st_nlink})"
++        )
++
++
++def _require_owned_mode(st: os.stat_result, what: str) -> None:
++    """Cache artifacts must be owner-held and not group/other writable."""
++    if st.st_uid != os.geteuid():
++        raise PleCacheError(f"{what} is owned by uid {st.st_uid}, not current user")
++    if st.st_mode & 0o022:
++        raise PleCacheError(
++            f"{what} is group/other writable (mode {oct(st.st_mode & 0o777)})"
++        )
++
++
++def _stat_snapshot(st: os.stat_result) -> dict:
++    return {
++        "dev": int(st.st_dev),
++        "ino": int(st.st_ino),
++        "size": int(st.st_size),
++        "mtime_ns": int(st.st_mtime_ns),
++        "ctime_ns": int(st.st_ctime_ns),
++    }
++
++
++def _stats_equal(a, b) -> bool:
++    return (
++        isinstance(a, dict)
++        and isinstance(b, dict)
++        and all(_is_int(a.get(k)) and a.get(k) == b.get(k) for k in _STAT_KEYS)
++    )
++
++
++def _validate_stat_snapshot(obj, what: str) -> None:
++    _require_keys(obj, _STAT_KEYS, what)
++    for k in _STAT_KEYS:
++        _check_index(obj[k], f"{what}.{k}")
++
++
++# ---------------------------------------------------------------------------
++# bounded byte-level primitives
++
++
++def _read_exact(fd: int, length: int, offset: int, what: str) -> bytes:
++    out = bytearray()
++    got = 0
++    while got < length:
++        chunk = os.pread(fd, min(_IO_BUFFER_BYTES, length - got), offset + got)
++        if not chunk:
++            raise PleCacheError(f"{what}: short read at {got}/{length} (eof)")
++        out += chunk
++        got += len(chunk)
++    return bytes(out)
++
++
++def _pwrite_all(fd: int, data: bytes, offset: int, what: str) -> None:
++    view = memoryview(data)
++    off = offset
++    while view.nbytes:
++        try:
++            n = os.pwrite(fd, view, off)
++        except OSError as exc:
++            raise PleCacheError(f"{what}: write failed: {exc}") from None
++        if not n:
++            raise PleCacheError(f"{what}: short write at offset {off}")
++        view = view[n:]
++        off += n
++
++
++def _hash_fd_range(fd: int, length: int, offset: int, what: str, logical=None) -> str:
++    """Hash bounded chunks and release consumed clean cache pages."""
++    digest = hashlib.sha256()
++    got = advised = 0
++    while got < length:
++        try:
++            chunk = os.pread(fd, min(_IO_BUFFER_BYTES, length - got), offset + got)
++        except OSError as exc:
++            raise PleCacheError(f"{what}: hash read failed: {exc}") from None
++        if not chunk:
++            raise PleCacheError(f"{what}: short read while hashing at {got}/{length}")
++        digest.update(chunk)
++        if logical is not None:
++            logical.update(chunk)
++        got += len(chunk)
++        if got - advised >= _FADVISE_INTERVAL_BYTES:
++            _fadvise_dontneed(fd, offset + advised, got - advised)
++            advised = got
++    if got > advised:
++        _fadvise_dontneed(fd, offset + advised, got - advised)
++    return digest.hexdigest()
++
++
++def _hash_whole_file(fd: int, size: int, what: str) -> str:
++    return _hash_fd_range(fd, size, 0, what)
++
++
++def _fadvise_dontneed(fd: int, offset: int, length: int) -> None:
++    if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
++        with contextlib.suppress(OSError):
++            os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
++
++
++def _copy_range(
++    src_fd: int,
++    dst_fd: int,
++    src_offset: int,
++    dst_offset: int,
++    length: int,
++    what: str,
++) -> None:
++    """Copy [src_offset, src_offset+length) to dst_offset via bounded pread/pwrite.
++
++    Issues fdatasync + scoped fadvise(DONTNEED) every _FADVISE_INTERVAL_BYTES
++    on the destination and DONTNEED on the source span already consumed.
++    """
++    remaining = length
++    since_sync = 0
++    while remaining > 0:
++        want = min(_IO_BUFFER_BYTES, remaining)
++        done_so_far = length - remaining
++        chunk = os.pread(src_fd, want, src_offset + done_so_far)
++        if not chunk:
++            raise PleCacheError(
++                f"{what}: short read from source at {done_so_far}/{length}"
++            )
++        _pwrite_all(dst_fd, chunk, dst_offset + done_so_far, what)
++        remaining -= len(chunk)
++        since_sync += len(chunk)
++        if since_sync >= _FADVISE_INTERVAL_BYTES:
++            os.fdatasync(dst_fd)
++            consumed = length - remaining
++            _fadvise_dontneed(src_fd, src_offset, consumed)
++            _fadvise_dontneed(dst_fd, dst_offset, consumed)
++            since_sync = 0
++    # Flush the tail too: many sub-interval shards must not accumulate dirty pages.
++    os.fdatasync(dst_fd)
++    _fadvise_dontneed(src_fd, src_offset, length)
++    _fadvise_dontneed(dst_fd, dst_offset, length)
++
++
++def _read_safetensors_header(fd: int, file_size: int, what: str):
++    if file_size < 8:
++        raise PleCacheError(f"{what}: too small for safetensors")
++    (hlen,) = (
++        int.from_bytes(_read_exact(fd, 8, 0, f"{what} header length"), "little"),
++    )
++    if hlen == 0 or hlen > _MAX_HEADER_BYTES:
++        raise PleCacheError(f"{what}: header length out of bounds: {hlen}")
++    if 8 + hlen > file_size:
++        raise PleCacheError(f"{what}: header extends past end of file")
++    header_bytes = _read_exact(fd, hlen, 8, f"{what} header")
++    header = _load_strict_json(header_bytes, f"{what} header JSON")
++    if not isinstance(header, dict):
++        raise PleCacheError(f"{what}: header must be a JSON object")
++    return header, header_bytes, 8 + hlen
++
++
++def _dtype_item_bytes(dtype: str):
++    return _DTYPE_ITEMBYTES.get(dtype)
++
++
++def _check_header_entry(name: str, spec, data_start: int, file_size: int) -> None:
++    if not isinstance(spec, dict):
++        raise PleCacheError(f"{what_name(name)}: header entry malformed")
++    dtype = spec.get("dtype")
++    shape = spec.get("shape")
++    offs = spec.get("data_offsets")
++    if not isinstance(dtype, str):
++        raise PleCacheError(f"{what_name(name)}: dtype malformed")
++    if not isinstance(shape, list) or not all(_is_int(x) and x >= 0 for x in shape):
++        raise PleCacheError(f"{what_name(name)}: shape malformed")
++    if (
++        not isinstance(offs, list)
++        or len(offs) != 2
++        or not all(_is_int(x) and x >= 0 for x in offs)
++        or offs[0] > offs[1]
++    ):
++        raise PleCacheError(f"{what_name(name)}: data_offsets malformed")
++    begin, end = data_start + offs[0], data_start + offs[1]
++    if offs[0] < 0:
++        raise PleCacheError(f"{what_name(name)}: negative offset")
++    if begin < data_start or end > file_size:
++        raise PleCacheError(f"{what_name(name)}: range outside file data region")
++    item = _dtype_item_bytes(dtype)
++    if item is not None:
++        expected = item
++        for dim in shape:
++            expected *= dim
++        if end - begin != expected:
++            raise PleCacheError(
++                f"{what_name(name)}: byte length disagrees with shape/dtype"
++            )
++
++
++def what_name(name: str) -> str:
++    return f"source tensor {name!r}"
++
++
++def _check_header_global(header: dict, data_start: int, file_size: int) -> None:
++    """All tensor ranges in-bounds and pairwise non-overlapping."""
++    spans = []
++    for name, spec in header.items():
++        if name == "__metadata__":
++            if not isinstance(spec, dict):
++                raise PleCacheError("source header __metadata__ must be an object")
++            continue
++        _check_header_entry(name, spec, data_start, file_size)
++        begin = data_start + spec["data_offsets"][0]
++        end = data_start + spec["data_offsets"][1]
++        spans.append((begin, end, name))
++    spans.sort()
++    for (b1, e1, n1), (b2, e2, n2) in zip(spans, spans[1:]):
++        if e1 > b2:
++            raise PleCacheError(f"source header: tensors {n1!r} and {n2!r} overlap")
++
++
++def _shard_tensor_name(prefix: str, i: int) -> str:
++    return f"{prefix}.shard_{i}.weight"
++
++
++# ---------------------------------------------------------------------------
++# plan construction
++
++
++def build_plan(
++    source_path: str,
++    *,
++    model_id: str,
++    model_revision: str,
++    tensor_prefix: str,
++    shard_count,
++    rows_per_shard,
++    row_width,
++    source_sha256: str,
++) -> dict:
++    """Build a validated ``qwen38fn.ple-plan.v1`` plan from a real safetensors file.
++
++    Verifies the whole source file SHA-256 against the independently supplied
++    ``source_sha256``, validates the header and every PLE tensor, derives
++    per-shard / scale hashes and the logical table SHA in NUMERIC row order.
++    Rejects symlinks, traversal, and hard-linked sources.
++    """
++    if not isinstance(model_id, str) or model_id != _MODEL_ID:
++        raise PleCacheError(f"model_id must be {_MODEL_ID!r}")
++    if not _is_revision(model_revision):
++        raise PleCacheError("model_revision must be 40 lowercase hex chars")
++    if not isinstance(tensor_prefix, str) or not tensor_prefix:
++        raise PleCacheError("tensor_prefix must be a non-empty string")
++    for part in tensor_prefix.split("."):
++        _check_name(part, "tensor_prefix component")
++    _check_hash(source_sha256, "source_sha256")
++    shard_count = _check_index(shard_count, "shard_count")
++    rows_per_shard = _check_index(rows_per_shard, "rows_per_shard")
++    row_width = _check_index(row_width, "row_width")
++    if not 1 <= shard_count <= _MAX_SHARDS:
++        raise PleCacheError(f"shard_count out of range: {shard_count}")
++    if not 1 <= rows_per_shard <= _MAX_ROWS_PER_SHARD:
++        raise PleCacheError(f"rows_per_shard out of range: {rows_per_shard}")
++    if not 1 <= row_width <= _MAX_WIDTH:
++        raise PleCacheError(f"row_width out of range: {row_width}")
++    table_rows = shard_count * rows_per_shard
++    if table_rows > _MAX_TABLE_BYTES // row_width:
++        raise PleCacheError("table geometry overflows size bounds")
++
++    source_path = _resolve_anchored(source_path, "source")
++    dir_fd = _open_dir(os.path.dirname(source_path) or "/", "source directory")
++    try:
++        fd = _open_leaf(dir_fd, os.path.basename(source_path), "source")
++        try:
++            plan = _build_plan_from_fd(
++                fd,
++                source_name=os.path.basename(source_path),
++                model_id=model_id,
++                model_revision=model_revision,
++                tensor_prefix=tensor_prefix,
++                shard_count=shard_count,
++                rows_per_shard=rows_per_shard,
++                row_width=row_width,
++                expected_sha=source_sha256,
++            )
++        finally:
++            os.close(fd)
++    finally:
++        os.close(dir_fd)
++    validate_plan(plan)
++    return plan
++
++
++def _build_plan_from_fd(
++    fd: int,
++    *,
++    source_name: str,
++    model_id: str,
++    model_revision: str,
++    tensor_prefix: str,
++    shard_count: int,
++    rows_per_shard: int,
++    row_width: int,
++    expected_sha: str,
++) -> dict:
++    st = os.fstat(fd)
++    _require_regular_single_link(st, "source")
++    file_size = st.st_size
++    st_before = _stat_snapshot(st)
++
++    actual_sha = _hash_whole_file(fd, file_size, "source")
++    st_after = _stat_snapshot(os.fstat(fd))
++    if not _stats_equal(st_before, st_after):
++        raise PleCacheError("source changed while hashing")
++    if actual_sha != expected_sha:
++        raise PleCacheError(
++            "source sha256 mismatch: pinned hash does not match file content"
++        )
++
++    header, header_bytes, data_start = _read_safetensors_header(fd, file_size, "source")
++    _check_header_global(header, data_start, file_size)
++
++    scale_name = f"{tensor_prefix}.weight_scale"
++    scale_spec = header.get(scale_name)
++    if not isinstance(scale_spec, dict):
++        raise PleCacheError(f"missing scale tensor {scale_name!r} in source header")
++    if scale_spec["dtype"] != _SCALE_DTYPE or scale_spec["shape"] != [1]:
++        raise PleCacheError("scale tensor must be BF16 with shape [1]")
++    scale_off = data_start + scale_spec["data_offsets"][0]
++    scale_len = scale_spec["data_offsets"][1] - scale_spec["data_offsets"][0]
++    if scale_len != 2:
++        raise PleCacheError("scale tensor must be exactly 2 bytes")
++
++    expected_names = {_shard_tensor_name(tensor_prefix, i) for i in range(shard_count)}
++    present_names = {
++        name for name in header if name.startswith(tensor_prefix + ".shard_")
++    }
++    if present_names != expected_names:
++        raise PleCacheError("source PLE shard inventory is not the exact literal set")
++    shard_bytes = rows_per_shard * row_width
++    segments = []
++    for i in range(shard_count):
++        name = _shard_tensor_name(tensor_prefix, i)
++        spec = header.get(name)
++        if not isinstance(spec, dict):
++            raise PleCacheError(f"missing shard tensor {name!r} in source header")
++        if spec["dtype"] != _DTYPE:
++            raise PleCacheError(f"shard tensor {name!r} dtype must be {_DTYPE}")
++        if spec["shape"] != [rows_per_shard, row_width]:
++            raise PleCacheError(
++                f"shard tensor {name!r} shape must be [{rows_per_shard}, {row_width}]"
++            )
++        begin = data_start + spec["data_offsets"][0]
++        end = data_start + spec["data_offsets"][1]
++        if end - begin != shard_bytes:
++            raise PleCacheError(f"shard tensor {name!r} byte length mismatch")
++        segments.append({"id": i, "name": name, "offset": begin, "size": shard_bytes})
++
++    # Hash each shard once in logical row order. Physical checkpoint order can
++    # differ; buffering an entire shard or hashing the payload twice is unnecessary.
++    logical = hashlib.sha256()
++    shard_digests = {
++        seg["id"]: _hash_fd_range(
++            fd, seg["size"], seg["offset"], f"shard {seg['id']}", logical
++        )
++        for seg in segments
++    }
++    scale_sha = _hash_fd_range(fd, scale_len, scale_off, "scale")
++
++    st_final = _stat_snapshot(os.fstat(fd))
++    if not _stats_equal(st_before, st_final):
++        raise PleCacheError("source changed while planning")
++
++    table_rows = shard_count * rows_per_shard
++    table_size = table_rows * row_width
++    shards = [
++        {
++            "id": seg["id"],
++            "name": seg["name"],
++            "offset": seg["offset"],
++            "size": seg["size"],
++            "sha256": shard_digests[seg["id"]],
++        }
++        for seg in sorted(segments, key=lambda s: s["id"])
++    ]
++    plan = {
++        "schema": _PLAN_SCHEMA,
++        "model": {"id": model_id, "revision": model_revision},
++        "source": {
++            "name": _check_name(source_name, "source name"),
++            "size": file_size,
++            "sha256": actual_sha,
++            "header_sha256": _sha256_hex(header_bytes),
++            "data_start": data_start,
++        },
++        "tensor_prefix": tensor_prefix,
++        "dtype": _DTYPE,
++        "shard_count": shard_count,
++        "rows_per_shard": rows_per_shard,
++        "row_width": row_width,
++        "table": {
++            "name": _table_filename(table_rows, row_width, table_size),
++            "shape": [table_rows, row_width],
++            "size": table_size,
++            "sha256": logical.hexdigest(),
++        },
++        "scale": {
++            "name": scale_name,
++            "offset": scale_off,
++            "size": scale_len,
++            "sha256": scale_sha,
++        },
++        "shards": shards,
++    }
++    return plan
++
++
++def _table_filename(total_rows: int, row_width: int, size: int) -> str:
++    return f"ple_table_{total_rows}x{row_width}_float8_e4m3fn_{size}B_rows0-{total_rows}.bin"
++
++
++# ---------------------------------------------------------------------------
++# plan validation
++
++
++def validate_plan(plan) -> dict:
++    """Strictly validate a plan dict (exact keys/types/bounds); returns it."""
++    if not isinstance(plan, dict):
++        raise PleCacheError("plan must be a JSON object")
++    _require_keys(
++        plan,
++        [
++            "schema",
++            "model",
++            "source",
++            "tensor_prefix",
++            "dtype",
++            "shard_count",
++            "rows_per_shard",
++            "row_width",
++            "table",
++            "scale",
++            "shards",
++        ],
++        "plan",
++    )
++    if plan["schema"] != _PLAN_SCHEMA:
++        raise PleCacheError(f"plan schema must be {_PLAN_SCHEMA!r}")
++    _require_keys(plan["model"], ["id", "revision"], "plan.model")
++    if plan["model"]["id"] != _MODEL_ID:
++        raise PleCacheError("plan.model.id mismatch")
++    if not _is_revision(plan["model"]["revision"]):
++        raise PleCacheError("plan.model.revision must be 40 lowercase hex chars")
++
++    _require_keys(
++        plan["source"],
++        ["name", "size", "sha256", "header_sha256", "data_start"],
++        "plan.source",
++    )
++    src = plan["source"]
++    _check_name(src["name"], "plan.source.name")
++    _check_index(src["size"], "plan.source.size")
++    _check_hash(src["sha256"], "plan.source.sha256")
++    _check_hash(src["header_sha256"], "plan.source.header_sha256")
++    data_start = _check_index(src["data_start"], "plan.source.data_start")
++    if (
++        data_start < 8
++        or data_start > 8 + _MAX_HEADER_BYTES
++        or not data_start < src["size"] <= _MAX_TABLE_BYTES
++    ):
++        raise PleCacheError("plan.source.data_start/size incoherent")
++
++    if not isinstance(plan["tensor_prefix"], str) or not plan["tensor_prefix"]:
++        raise PleCacheError("plan.tensor_prefix must be a non-empty string")
++    for part in plan["tensor_prefix"].split("."):
++        _check_name(part, "plan.tensor_prefix component")
++    prefix = plan["tensor_prefix"]
++
++    if plan["dtype"] != _DTYPE:
++        raise PleCacheError(f"plan.dtype must be {_DTYPE!r}")
++
++    sc = _check_index(plan["shard_count"], "plan.shard_count")
++    rps = _check_index(plan["rows_per_shard"], "plan.rows_per_shard")
++    rw = _check_index(plan["row_width"], "plan.row_width")
++    if not 1 <= sc <= _MAX_SHARDS:
++        raise PleCacheError("plan.shard_count out of range")
++    if not 1 <= rps <= _MAX_ROWS_PER_SHARD:
++        raise PleCacheError("plan.rows_per_shard out of range")
++    if not 1 <= rw <= _MAX_WIDTH:
++        raise PleCacheError("plan.row_width out of range")
++    total_rows = sc * rps
++    if total_rows > _MAX_TABLE_BYTES // rw:
++        raise PleCacheError("plan table geometry overflow")
++    shard_bytes = rps * rw
++
++    _require_keys(plan["table"], ["name", "shape", "size", "sha256"], "plan.table")
++    tbl = plan["table"]
++    if not _is_int(tbl["size"]) or tbl["size"] != total_rows * rw:
++        raise PleCacheError("plan.table.size must equal total_rows * row_width")
++    if tbl["name"] != _table_filename(total_rows, rw, tbl["size"]):
++        raise PleCacheError("plan.table.name must be the geometry-derived filename")
++    if (
++        not isinstance(tbl["shape"], list)
++        or len(tbl["shape"]) != 2
++        or not _is_int(tbl["shape"][0])
++        or not _is_int(tbl["shape"][1])
++        or tbl["shape"] != [total_rows, rw]
++    ):
++        raise PleCacheError("plan.table.shape must be [total_rows, row_width]")
++    _check_hash(tbl["sha256"], "plan.table.sha256")
++
++    _require_keys(plan["scale"], ["name", "offset", "size", "sha256"], "plan.scale")
++    scale = plan["scale"]
++    if scale["name"] != f"{prefix}.weight_scale":
++        raise PleCacheError("plan.scale.name mismatch")
++    if not _is_int(scale["size"]) or scale["size"] != 2:
++        raise PleCacheError("plan.scale.size must be 2 (BF16 [1])")
++    _check_index(scale["offset"], "plan.scale.offset")
++    _check_hash(scale["sha256"], "plan.scale.sha256")
++    if scale["offset"] < data_start or scale["offset"] + scale["size"] > src["size"]:
++        raise PleCacheError("plan.scale range outside source file")
++
++    shards = plan["shards"]
++    if not isinstance(shards, list) or len(shards) != sc:
++        raise PleCacheError("plan.shards must be a list of exactly shard_count entries")
++    spans = []
++    for i, sh in enumerate(shards):
++        _require_keys(
++            sh, ["id", "name", "offset", "size", "sha256"], f"plan.shards[{i}]"
++        )
++        if not _is_int(sh["id"]) or sh["id"] != i:
++            raise PleCacheError(
++                f"plan.shards must be numeric-id ordered; shards[{i}].id={sh['id']!r}"
++            )
++        if sh["name"] != _shard_tensor_name(prefix, i):
++            raise PleCacheError(f"plan.shards[{i}].name is aliased or not canonical")
++        if not _is_int(sh["size"]) or sh["size"] != shard_bytes:
++            raise PleCacheError(
++                f"plan.shards[{i}].size must equal rows_per_shard*row_width"
++            )
++        off = _check_index(sh["offset"], f"plan.shards[{i}].offset")
++        if off < data_start or off + sh["size"] > src["size"]:
++            raise PleCacheError(f"plan.shards[{i}] range outside source file")
++        _check_hash(sh["sha256"], f"plan.shards[{i}].sha256")
++        spans.append((off, off + sh["size"]))
++    spans.append((scale["offset"], scale["offset"] + scale["size"]))
++    spans.sort()
++    for (b1, e1), (b2, e2) in zip(spans, spans[1:]):
++        if e1 > b2:
++            raise PleCacheError("plan.shards ranges overlap")
++    return plan
++
++
++def plan_sha256(plan: dict) -> str:
++    """Canonical-JSON SHA-256 of a validated plan (stable under key order)."""
++    return _sha256_hex(_canonical_json_bytes(validate_plan(plan)))
++
++
++# ---------------------------------------------------------------------------
++# cache preparation
++
++
++def prepare_cache(model_root: str, cache_dir: str, plan: dict) -> dict:
++    """Materialize the PLE table or verify-and-reuse an existing one.
++
++    Returns ``{receipt_path, receipt_sha256, mode, copied_bytes,
++    elapsed_seconds}`` where mode is exactly ``'materialized'`` (full copy,
++    ``copied_bytes`` = table size) or ``'reuse'`` (verified warm / adopted
++    legacy table, ``copied_bytes`` = 0). Raises on any safety/integrity
++    failure; never publishes a success receipt after a failed rename/fsync.
++    """
++    started = time.monotonic()
++    plan = validate_plan(plan)
++    _path_components(model_root, "model_root")
++    _path_components(cache_dir, "cache_dir")
++    if os.path.commonpath([model_root, cache_dir]) in (model_root, cache_dir):
++        raise PleCacheError("model_root and cache_dir must be disjoint")
++    model_root = _resolve_anchored(model_root, "model_root")
++    cache_dir = _ensure_dir_anchored(cache_dir, "cache_dir")
++    source_path = f"{model_root.rstrip('/')}/{plan['source']['name']}"
++
++    cache_fd = _open_dir(cache_dir, "cache_dir")
++    try:
++        _check_cache_root(cache_fd, cache_dir)
++        lock_fd = _acquire_lock(cache_fd, plan)
++        try:
++            return _prepare_locked(cache_fd, cache_dir, source_path, plan, started)
++        finally:
++            os.close(lock_fd)
++    finally:
++        os.close(cache_fd)
++
++
++def _check_cache_root(cache_fd: int, cache_dir: str) -> None:
++    st = os.fstat(cache_fd)
++    if st.st_uid != os.geteuid():
++        raise PleCacheError(f"cache_dir {cache_dir} is owned by uid {st.st_uid}")
++    if st.st_mode & 0o022:
++        raise PleCacheError(
++            f"cache_dir {cache_dir} is group/other writable (mode {oct(st.st_mode & 0o777)})"
++        )
++
++
++def _acquire_lock(cache_fd: int, plan: dict) -> int:
++    lock_name = f".{plan['table']['name']}.lock"
++    fd = _open_leaf(
++        cache_fd,
++        lock_name,
++        "cache lock",
++        flags=os.O_RDWR | os.O_CREAT,
++    )
++    try:
++        st = os.fstat(fd)
++        _require_regular_single_link(st, "cache lock")
++        _require_owned_mode(st, "cache lock")
++        try:
++            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except OSError as exc:
++            if exc.errno in (errno.EACCES, errno.EAGAIN):
++                raise CacheBusyError("cache is locked by another process") from None
++            raise PleCacheError(f"cannot lock cache: {exc}") from None
++    except BaseException:
++        with contextlib.suppress(OSError):
++            os.close(fd)
++        raise
++    return fd
++
++
++def _prepare_locked(
++    cache_fd: int, cache_dir: str, source_path: str, plan: dict, started: float
++) -> dict:
++    receipt_path = f"{cache_dir.rstrip('/')}/{_RECEIPT_NAME}"
++    table_name = plan["table"]["name"]
++
++    src_dir_fd = _open_dir(os.path.dirname(source_path) or "/", "source directory")
++    try:
++        src_fd = _open_leaf(src_dir_fd, os.path.basename(source_path), "source")
++        try:
++            src_baseline = _verify_source(src_fd, plan)
++            receipt_exists = _file_exists(cache_fd, _RECEIPT_NAME)
++            receipt_raw, receipt = _load_receipt(cache_fd, plan)
++            existing = _open_existing(cache_fd, table_name, "cached table")
++            if existing is not None:
++                try:
++                    st = os.fstat(existing)
++                    _require_regular_single_link(st, "cached table")
++                    _require_owned_mode(st, "cached table")
++                    valid = (
++                        receipt is not None
++                        and _stats_equal(_stat_snapshot(st), receipt["table_stat"])
++                        and _stats_equal(src_baseline, receipt["source_stat"])
++                        and _verify_table_content(existing, plan["table"])
++                    )
++                    if valid:
++                        if not _stats_equal(
++                            _stat_snapshot(os.fstat(src_fd)), src_baseline
++                        ):
++                            raise PleCacheError(
++                                "source changed during warm verification"
++                            )
++                        return _result(
++                            receipt_path, _sha256_hex(receipt_raw), "reuse", 0, started
++                        )
++                finally:
++                    os.close(existing)
++
++            # Only a receipt-less legacy file can be adopted; every adoption
++            # still hashes the whole table against the independently trusted plan.
++            table_fd = (
++                None
++                if receipt_exists
++                else _try_adopt_legacy(cache_fd, table_name, plan)
++            )
++            if table_fd is not None:
++                try:
++                    if not _stats_equal(_stat_snapshot(os.fstat(src_fd)), src_baseline):
++                        raise PleCacheError("source changed during legacy verification")
++                    receipt_bytes = _finalize_receipt(
++                        cache_fd, plan, src_baseline, os.fstat(table_fd)
++                    )
++                finally:
++                    os.close(table_fd)
++                return _result(
++                    receipt_path, _sha256_hex(receipt_bytes), "reuse", 0, started
++                )
++
++            copied = _materialize(cache_fd, src_fd, plan, src_baseline)
++            table_fd = _open_leaf(cache_fd, table_name, "published table")
++            try:
++                receipt_bytes = _finalize_receipt(
++                    cache_fd, plan, src_baseline, os.fstat(table_fd)
++                )
++            finally:
++                os.close(table_fd)
++            return _result(
++                receipt_path,
++                _sha256_hex(receipt_bytes),
++                "materialized",
++                copied,
++                started,
++            )
++        finally:
++            os.close(src_fd)
++    finally:
++        os.close(src_dir_fd)
++
++
++def _result(receipt_path, receipt_sha256, mode, copied_bytes, started) -> dict:
++    elapsed = time.monotonic() - started
++    return {
++        "receipt_path": receipt_path,
++        "receipt_sha256": receipt_sha256,
++        "mode": mode,
++        "copied_bytes": int(copied_bytes),
++        "elapsed_seconds": float(elapsed),
++    }
++
++
++def _file_exists(cache_fd: int, name: str) -> bool:
++    try:
++        os.lstat(name, dir_fd=cache_fd)
++        return True
++    except FileNotFoundError:
++        return False
++
++
++def _verify_source(src_fd: int, plan: dict) -> dict:
++    """Full always-on source verification: header, size, whole-file SHA."""
++    st = os.fstat(src_fd)
++    _require_regular_single_link(st, "source")
++    if st.st_size != plan["source"]["size"]:
++        raise PleCacheError(
++            f"source size changed: plan {plan['source']['size']}, file {st.st_size}"
++        )
++    header, header_bytes, data_start = _read_safetensors_header(
++        src_fd, st.st_size, "source"
++    )
++    if _sha256_hex(header_bytes) != plan["source"]["header_sha256"]:
++        raise PleCacheError("source header sha256 mismatch")
++    if data_start != plan["source"]["data_start"]:
++        raise PleCacheError("source data_start mismatch")
++    _check_header_global(header, data_start, st.st_size)
++    expected_names = {shard["name"] for shard in plan["shards"]}
++    observed_names = {
++        name for name in header if name.startswith(plan["tensor_prefix"] + ".shard_")
++    }
++    if observed_names != expected_names:
++        raise PleCacheError("source PLE names disagree with the plan")
++    for segment in [*plan["shards"], plan["scale"]]:
++        spec = header.get(segment["name"])
++        is_scale = segment is plan["scale"]
++        expected_dtype = "BF16" if is_scale else _DTYPE
++        expected_shape = (
++            [1] if is_scale else [plan["rows_per_shard"], plan["row_width"]]
++        )
++        if (
++            not isinstance(spec, dict)
++            or spec["dtype"] != expected_dtype
++            or spec["shape"] != expected_shape
++            or data_start + spec["data_offsets"][0] != segment["offset"]
++            or spec["data_offsets"][1] - spec["data_offsets"][0] != segment["size"]
++        ):
++            raise PleCacheError("source tensor metadata disagrees with the plan")
++    actual = _hash_whole_file(src_fd, st.st_size, "source")
++    st_after = _stat_snapshot(os.fstat(src_fd))
++    if not _stats_equal(_stat_snapshot(st), st_after):
++        raise PleCacheError("source changed while hashing")
++    if actual != plan["source"]["sha256"]:
++        raise PleCacheError("source sha256 mismatch")
++    return st_after
++
++
++def _open_existing(cache_fd: int, name: str, what: str):
++    """Open an existing cache leaf safely; None when missing."""
++    try:
++        st = os.lstat(name, dir_fd=cache_fd)
++    except FileNotFoundError:
++        return None
++    if stat.S_ISLNK(st.st_mode):
++        raise PleCacheError(f"{what} is a symlink: {name}")
++    if not stat.S_ISREG(st.st_mode):
++        raise PleCacheError(f"{what} is not a regular file: {name}")
++    return _open_leaf(cache_fd, name, what)
++
++
++def _load_receipt(cache_fd: int, plan: dict):
++    """Load prepared.json and match it against the plan.
++
++    Returns ``(raw_bytes, receipt_or_None)``; corrupt/mismatched/oversized
++    receipts yield ``(raw, None)`` so the caller falls through to the full
++    legacy-adoption / rebuild path instead of aborting.
++    """
++    fd = _open_existing(cache_fd, _RECEIPT_NAME, "receipt")
++    if fd is None:
++        return b"", None
++    try:
++        st = os.fstat(fd)
++        _require_regular_single_link(st, "receipt")
++        _require_owned_mode(st, "receipt")
++        if st.st_size > _MAX_META_BYTES:
++            return b"", None  # oversized: unusable, fall through to rebuild
++        raw = _read_exact(fd, st.st_size, 0, "receipt")
++    finally:
++        os.close(fd)
++    try:
++        obj = _load_strict_json(raw, "receipt")
++    except PleCacheError:
++        return raw, None  # corrupt or malformed receipt: rebuild, not abort
++    if _receipt_matches_plan(obj, plan):
++        return raw, obj
++    return raw, None
++
++
++def _receipt_matches_plan(obj, plan: dict) -> bool:
++    try:
++        _validate_receipt_schema(obj)
++        expected = {
++            "plan_sha256": plan_sha256(plan),
++            "model": plan["model"],
++            "source": {
++                "name": plan["source"]["name"],
++                "size": plan["source"]["size"],
++                "sha256": plan["source"]["sha256"],
++            },
++            "table": _receipt_table(plan),
++        }
++    except PleCacheError:
++        return False
++    for key, want in expected.items():
++        if obj.get(key) != want:
++            return False
++    return True
++
++
++def _receipt_table(plan: dict) -> dict:
++    rows, width = plan["table"]["shape"]
++    return {
++        "name": plan["table"]["name"],
++        "shape": [rows, width],
++        "size": plan["table"]["size"],
++        "sha256": plan["table"]["sha256"],
++        "dtype": _DTYPE,
++        "tag": f"rows0-{rows}",
++    }
++
++
++def _validate_receipt_schema(obj) -> None:
++    _require_keys(
++        obj,
++        [
++            "schema",
++            "plan_sha256",
++            "model",
++            "source",
++            "table",
++            "source_stat",
++            "table_stat",
++        ],
++        "receipt",
++    )
++    if obj["schema"] != _PREPARED_SCHEMA:
++        raise PleCacheError("receipt schema mismatch")
++    _check_hash(obj["plan_sha256"], "receipt.plan_sha256")
++    _require_keys(obj["model"], ["id", "revision"], "receipt.model")
++    if obj["model"]["id"] != _MODEL_ID:
++        raise PleCacheError("receipt.model.id mismatch")
++    if not _is_revision(obj["model"]["revision"]):
++        raise PleCacheError("receipt.model.revision malformed")
++    _require_keys(obj["source"], ["name", "size", "sha256"], "receipt.source")
++    _check_name(obj["source"]["name"], "receipt.source.name")
++    _check_index(obj["source"]["size"], "receipt.source.size")
++    _check_hash(obj["source"]["sha256"], "receipt.source.sha256")
++    _require_keys(
++        obj["table"],
++        ["name", "shape", "size", "sha256", "dtype", "tag"],
++        "receipt.table",
++    )
++    tbl = obj["table"]
++    _check_name(tbl["name"], "receipt.table.name")
++    if (
++        not isinstance(tbl["shape"], list)
++        or len(tbl["shape"]) != 2
++        or not all(_is_int(x) and x > 0 for x in tbl["shape"])
++    ):
++        raise PleCacheError("receipt.table.shape malformed")
++    if not _is_int(tbl["size"]) or tbl["size"] != tbl["shape"][0] * tbl["shape"][1]:
++        raise PleCacheError("receipt.table.size incoherent")
++    _check_hash(tbl["sha256"], "receipt.table.sha256")
++    if tbl["dtype"] != _DTYPE:
++        raise PleCacheError("receipt.table.dtype must be F8_E4M3")
++    if tbl["tag"] != f"rows0-{tbl['shape'][0]}":
++        raise PleCacheError("receipt.table.tag mismatch")
++    _validate_stat_snapshot(obj["source_stat"], "receipt.source_stat")
++    _validate_stat_snapshot(obj["table_stat"], "receipt.table_stat")
++    if (
++        obj["source_stat"]["size"] != obj["source"]["size"]
++        or obj["table_stat"]["size"] != tbl["size"]
++    ):
++        raise PleCacheError("receipt stat sizes disagree with declared file sizes")
++    if tbl["size"] > _MAX_TABLE_BYTES or obj["source"]["size"] > _MAX_TABLE_BYTES:
++        raise PleCacheError("receipt sizes exceed supported bounds")
++
++
++def _verify_table_content(table_fd: int, table: dict) -> bool:
++    """Full content hash of an existing table; False when stale/mismatched."""
++    st = os.fstat(table_fd)
++    if st.st_size != table["size"]:
++        return False
++    actual = _hash_whole_file(table_fd, st.st_size, "cached table")
++    st_after = _stat_snapshot(os.fstat(table_fd))
++    if not _stats_equal(_stat_snapshot(st), st_after):
++        raise PleCacheError("cached table changed while hashing")
++    return actual == table["sha256"]
++
++
++def _try_adopt_legacy(cache_fd: int, table_name: str, plan: dict):
++    """Adopt a receipt-less table ONLY after a full content hash."""
++    fd = _open_existing(cache_fd, table_name, "legacy table")
++    if fd is None:
++        return None
++    try:
++        st = os.fstat(fd)
++        _require_regular_single_link(st, "legacy table")
++        _require_owned_mode(st, "legacy table")
++        valid = _verify_table_content(fd, plan["table"])
++    except BaseException:
++        with contextlib.suppress(OSError):
++            os.close(fd)
++        raise
++    if valid:
++        return fd
++    os.close(fd)
++    return None
++
++
++def _preflight_space(cache_fd: int, table_size: int) -> None:
++    st = os.statvfs(cache_fd)
++    available = st.f_bavail * st.f_frsize
++    if available < table_size + _SPACE_RESERVE_BYTES:
++        raise PleCacheError(
++            f"insufficient cache space: need {table_size + _SPACE_RESERVE_BYTES}, have {available}"
++        )
++
++
++def _materialize(cache_fd: int, src_fd: int, plan: dict, src_baseline: dict) -> int:
++    """Cold path: exclusive temp, bounded copy in physical order, verify, publish.
++
++    Returns the number of bytes copied. On any failure the temp file is
++    removed and the previously published table (if any) is untouched.
++    """
++    table_name = plan["table"]["name"]
++    table_size = plan["table"]["size"]
++    _preflight_space(cache_fd, table_size)
++
++    tmp_name = f".{table_name}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
++    tmp_fd = os.open(
++        tmp_name,
++        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
++        0o600,
++        dir_fd=cache_fd,
++    )
++    published = False
++    tmp_open = True
++    try:
++        os.ftruncate(tmp_fd, table_size)
++        for shard in sorted(plan["shards"], key=lambda s: s["offset"]):
++            _copy_range(
++                src_fd,
++                tmp_fd,
++                shard["offset"],
++                shard["id"] * shard["size"],
++                shard["size"],
++                f"shard {shard['id']}",
++            )
++        os.fdatasync(tmp_fd)
++        _fadvise_dontneed(tmp_fd, 0, table_size)
++        # Verify the staged temp in logical (numeric row) order = file order.
++        staged = _hash_fd_range(tmp_fd, table_size, 0, "staged table")
++        if staged != plan["table"]["sha256"]:
++            raise PleCacheError("staged table sha256 mismatch after copy")
++        if not _stats_equal(_stat_snapshot(os.fstat(src_fd)), src_baseline):
++            raise PleCacheError("source changed during copy")
++        os.fsync(tmp_fd)
++        os.close(tmp_fd)
++        tmp_open = False
++        os.replace(tmp_name, table_name, src_dir_fd=cache_fd, dst_dir_fd=cache_fd)
++        published = True
++        # After replace the new table is committed in the namespace. A failed
++        # directory fsync is a failure, not permission to delete the new table.
++        os.fsync(cache_fd)
++        return table_size
++    except OSError as exc:
++        raise PleCacheError(f"materialization failed: {exc}") from None
++    finally:
++        if tmp_open:
++            with contextlib.suppress(OSError):
++                os.close(tmp_fd)
++        if not published:
++            with contextlib.suppress(OSError):
++                os.unlink(tmp_name, dir_fd=cache_fd)
++
++
++def _finalize_receipt(
++    cache_fd: int, plan: dict, source_stat: dict, table_st: os.stat_result
++) -> bytes:
++    """Write prepared.json atomically (tmp + fsync + replace + dir fsync)."""
++    receipt = {
++        "schema": _PREPARED_SCHEMA,
++        "plan_sha256": plan_sha256(plan),
++        "model": plan["model"],
++        "source": {
++            "name": plan["source"]["name"],
++            "size": plan["source"]["size"],
++            "sha256": plan["source"]["sha256"],
++        },
++        "table": _receipt_table(plan),
++        "source_stat": source_stat,
++        "table_stat": _stat_snapshot(table_st),
++    }
++    _validate_receipt_schema(receipt)
++    payload = _canonical_json_bytes(receipt)
++    tmp_name = f".{_RECEIPT_NAME}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
++    tmp_fd = os.open(
++        tmp_name,
++        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
++        0o600,
++        dir_fd=cache_fd,
++    )
++    try:
++        _pwrite_all(tmp_fd, payload, 0, "receipt")
++        os.fsync(tmp_fd)
++        os.close(tmp_fd)
++        tmp_fd = -1
++        os.replace(tmp_name, _RECEIPT_NAME, src_dir_fd=cache_fd, dst_dir_fd=cache_fd)
++        os.fsync(cache_fd)
++        return payload
++    except OSError as exc:
++        raise PleCacheError(f"receipt finalization failed: {exc}") from None
++    finally:
++        if tmp_fd >= 0:
++            with contextlib.suppress(OSError):
++                os.close(tmp_fd)
++        # tmp no longer exists after a successful replace; suppress ENOENT.
++        with contextlib.suppress(OSError):
++            os.unlink(tmp_name, dir_fd=cache_fd)
++
++
++# ---------------------------------------------------------------------------
++# verified table open
++
++
++def open_prepared_table(
++    receipt_path: str,
++    expected_sha256: str,
++    *,
++    table_dir: str,
++    shape,
++    dtype: str,
++    tag: str,
++) -> int:
++    """Open the prepared table after full receipt verification; returns the fd.
++
++    The caller owns the returned read-only fd and must close it after mapping.
++    Verifies: receipt file SHA against ``expected_sha256``, strict schema and
++    types, model identity, table filename/shape/dtype/tag coherence, and an
++    exact current fd-stat match for the table. The table is opened read-only
++    relative to ``table_dir`` without following symlinks; the caller can map
++    ``/proc/self/fd/<fd>`` without re-hashing.
++    """
++    _check_hash(expected_sha256, "expected_sha256")
++    receipt_path = _resolve_anchored(receipt_path, "receipt_path")
++    table_dir = _resolve_anchored(table_dir, "table_dir")
++    if receipt_path != table_dir + "/" + _RECEIPT_NAME:
++        raise PleCacheError("receipt must be the fixed prepared.json in table_dir")
++    _validate_open_args(shape, dtype, tag)
++
++    receipt_dir_fd = _open_dir(
++        os.path.dirname(receipt_path) or "/", "receipt directory"
++    )
++    try:
++        fd = _open_leaf(receipt_dir_fd, os.path.basename(receipt_path), "receipt")
++        try:
++            st = os.fstat(fd)
++            _require_regular_single_link(st, "receipt")
++            _require_owned_mode(st, "receipt")
++            if st.st_size > _MAX_META_BYTES:
++                raise PleCacheError("receipt exceeds metadata size bound")
++            raw = _read_exact(fd, st.st_size, 0, "receipt")
++            if not _stats_equal(_stat_snapshot(st), _stat_snapshot(os.fstat(fd))):
++                raise PleCacheError("receipt changed while being read")
++        finally:
++            os.close(fd)
++    finally:
++        os.close(receipt_dir_fd)
++
++    if _sha256_hex(raw) != expected_sha256:
++        raise PleCacheError("receipt sha256 mismatch")
++    receipt = _load_strict_json(raw, "receipt")
++    _validate_receipt_schema(receipt)
++
++    rows, width = shape
++    if receipt["table"]["shape"] != [rows, width]:
++        raise PleCacheError("requested shape disagrees with receipt")
++    if receipt["model"]["id"] != _MODEL_ID:
++        raise PleCacheError("receipt model identity mismatch")
++    if receipt["table"]["dtype"] != dtype or receipt["table"]["tag"] != tag:
++        raise PleCacheError("receipt dtype/tag disagreement with request")
++    if receipt["table"]["name"] != _table_filename(rows, width, rows * width):
++        raise PleCacheError("receipt table filename is not geometry-derived")
++
++    table_dir_fd = _open_dir(table_dir, "table_dir")
++    try:
++        _check_cache_root(table_dir_fd, table_dir)
++        tfd = _open_existing(table_dir_fd, receipt["table"]["name"], "prepared table")
++        if tfd is None:
++            raise PleCacheError("prepared table file missing")
++        try:
++            st = os.fstat(tfd)
++            _require_regular_single_link(st, "prepared table")
++            _require_owned_mode(st, "prepared table")
++            if not _stats_equal(_stat_snapshot(st), receipt["table_stat"]):
++                raise PleCacheError(
++                    "prepared table stat does not match receipt (stale)"
++                )
++        except BaseException:
++            os.close(tfd)
++            raise
++    finally:
++        os.close(table_dir_fd)
++    return tfd
++
++
++def _validate_open_args(shape, dtype: str, tag: str) -> None:
++    if (
++        not isinstance(shape, (list, tuple))
++        or len(shape) != 2
++        or not all(_is_int(x) and x > 0 for x in shape)
++    ):
++        raise PleCacheError("shape must be a pair of positive integers")
++    if shape[0] > _MAX_TABLE_BYTES // shape[1]:
++        raise PleCacheError("requested table shape exceeds supported bounds")
++    if dtype != _DTYPE:
++        raise PleCacheError(f"dtype must be the literal {_DTYPE!r}")
++    if not isinstance(tag, str) or tag != f"rows0-{shape[0]}":
++        raise PleCacheError("tag must be rows0-<total_rows> matching shape")
 diff --git a/python/sglang/srt/models/qwen4_exp_ple_table.py b/python/sglang/srt/models/qwen4_exp_ple_table.py
 new file mode 100644
-index 0000000000..2e7a02c0ac
+index 0000000000..d7def638e8
 --- /dev/null
 +++ b/python/sglang/srt/models/qwen4_exp_ple_table.py
-@@ -0,0 +1,483 @@
+@@ -0,0 +1,610 @@
 +"""Host-side storage for the offloaded Qwen4-Exp PLE n-gram table.
 +
 +``--ple-offload-embedding`` keeps the PLE table (47.7 GiB in fp8 for
@@ -15015,6 +16477,18 @@ index 0000000000..2e7a02c0ac
 +    page-cache folios and the table would otherwise creep towards full
 +    residency (see ``PleFileRssTrimmer``).
 +
++``file`` + prepared (internal ``R0B0TLAB_PLE_PREPARED_*`` env)
++    The 47.7 GiB table is rewritten through the weight loader on every boot,
++    which is pure I/O: the bytes are already on storage and verified. When the
++    prepared-cache helper (``sglang.srt.models.qwen4_exp_ple_cache``, built in
++    isolation) has staged and validated the table, the env names its receipt
++    and the expected receipt digest; the allocator then maps the verified file
++    through an owned read-only fd (``/proc/self/fd/<fd>``, so the mapping is
++    anchored on the verified inode rather than a re-resolved pathname) and the
++    weight loader's copy is elided. This is fail-closed: a partial or
++    malformed prepared setup is a hard error, never a fallback to the legacy
++    rewrite.
++
 +This module has no Triton or CUDA-kernel imports so that its allocator and
 +prefetcher can be unit-tested on CPU.
 +"""
@@ -15026,6 +16500,7 @@ index 0000000000..2e7a02c0ac
 +import logging
 +import os
 +import re
++import stat
 +import threading
 +from concurrent.futures import ThreadPoolExecutor
 +from typing import Optional, Sequence
@@ -15041,6 +16516,12 @@ index 0000000000..2e7a02c0ac
 +_SMAPS_RSS = re.compile(r"^Rss:\s+(\d+) kB")
 +
 +PLE_OFFLOAD_BACKENDS = ("pinned", "file")
++
++# Internal prepared-table rendezvous (set by the prepared-cache builder, not
++# by users). Both must be present or both absent; presence of either switches
++# allocate_ple_host_table to the fail-closed prepared path.
++_PLE_PREPARED_PATH_ENV = "R0B0TLAB_PLE_PREPARED_PATH"
++_PLE_PREPARED_SHA256_ENV = "R0B0TLAB_PLE_PREPARED_SHA256"
 +
 +# cudaDeviceAttr enum values (cuda_runtime_api.h).
 +_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
@@ -15232,6 +16713,20 @@ index 0000000000..2e7a02c0ac
 +        raise ValueError(
 +            f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
 +        )
++    prepared_path = os.environ.get(_PLE_PREPARED_PATH_ENV)
++    prepared_sha256 = os.environ.get(_PLE_PREPARED_SHA256_ENV)
++    if prepared_path is not None or prepared_sha256 is not None:
++        # Fail closed: a prepared boot is all-or-nothing -- it requires the
++        # file backend and never falls back to the legacy paths below.
++        return _allocate_prepared_ple_host_table(
++            shape,
++            dtype,
++            backend=backend,
++            table_dir=table_dir,
++            tag=tag,
++            receipt_path=prepared_path,
++            expected_sha256=prepared_sha256,
++        )
 +    if backend == "pinned":
 +        return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
 +
@@ -15254,6 +16749,100 @@ index 0000000000..2e7a02c0ac
 +    table = storage.view(dtype).view(*[int(d) for d in shape])
 +    table._sglang_ple_file_path = path  # consumed by PleFilePrefetcher
 +    return table
++
++
++def _allocate_prepared_ple_host_table(
++    shape,
++    dtype,
++    *,
++    backend,
++    table_dir,
++    tag,
++    receipt_path,
++    expected_sha256,
++) -> torch.Tensor:
++    """Map the prepared table through the helper's verified fd. Fail-closed.
++
++    Every guard below raises before the helper is consulted and before the
++    table directory is touched; there is no fallback to the legacy rewrite.
++    """
++    if (not isinstance(shape, (tuple, list)) or len(shape) != 2
++            or any(type(d) is not int or d <= 0 for d in shape)):
++        raise ValueError("prepared PLE shape must be a pair of positive integers")
++    nbytes = shape[0] * shape[1]
++    if nbytes > (1 << 63) - 1:
++        raise ValueError("prepared PLE size exceeds the supported file range")
++    if not receipt_path or not expected_sha256:
++        raise ValueError(
++            "prepared PLE table requires both "
++            f"{_PLE_PREPARED_PATH_ENV} and {_PLE_PREPARED_SHA256_ENV}; "
++            "got only one (or an empty value)"
++        )
++    if backend != "file":
++        raise ValueError(
++            f"prepared PLE table requires the file backend, got {backend!r}"
++        )
++    if dtype is not torch.float8_e4m3fn:
++        raise ValueError(
++            f"prepared PLE table requires torch.float8_e4m3fn, got {dtype!r}"
++        )
++    if not table_dir:
++        raise ValueError(
++            "prepared PLE table requires an explicit table_dir "
++            "(--ple-offload-dir); the default directory is not prepared"
++        )
++    _validate_ple_prepared_tag(tag, shape)
++    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
++        raise ValueError(
++            f"{_PLE_PREPARED_SHA256_ENV} must be a 64-char lowercase hex "
++            f"sha256, got {expected_sha256[:8]!r}..."
++        )
++    # Lazy import: without the prepared env above the helper is never loaded.
++    from sglang.srt.models.qwen4_exp_ple_cache import open_prepared_table
++
++    fd = open_prepared_table(
++        receipt_path,
++        expected_sha256,
++        table_dir=table_dir,
++        shape=tuple(int(d) for d in shape),
++        # Literal expected by the prepared-cache validator for fp8 tables.
++        dtype="F8_E4M3",
++        tag=tag,
++    )
++    if type(fd) is not int or fd < 0:
++        raise ValueError("prepared PLE helper did not return an owned descriptor")
++    try:
++        info = os.fstat(fd)
++        if not stat.S_ISREG(info.st_mode) or info.st_size != nbytes:
++            raise ValueError("prepared PLE descriptor has the wrong file type or size")
++        # Anchor the shared mmap on the fd the helper verified (its own inode,
++        # not a pathname that could be re-resolved to something else) and drop
++        # the descriptor: the mapping outlives it.
++        storage = torch.from_file(
++            f"/proc/self/fd/{fd}", shared=True, size=nbytes, dtype=torch.uint8
++        )
++    finally:
++        os.close(fd)
++    _madvise_random(storage, nbytes)
++    table = storage.view(dtype).view(*[int(d) for d in shape])
++    # The canonical file name the prefetcher/RSS trimmer would see on the
++    # legacy path; the prepared file is expected to live at the same path.
++    table._sglang_ple_file_path = os.path.join(
++        table_dir, ple_table_file_name(shape, dtype, tag)
++    )
++    table._sglang_ple_prepared = True  # copy-elision marker for the loader
++    logger.info(
++        "PLE table: prepared mmap via verified fd (%.1f GiB, %s)",
++        nbytes / 2**30,
++        dtype,
++    )
++    return table
++
++
++def _validate_ple_prepared_tag(tag, shape) -> None:
++    """Require the literal full-table row range for this single-GPU path."""
++    if not isinstance(tag, str) or tag != f"rows0-{shape[0]}":
++        raise ValueError("prepared PLE requires the literal complete-table rows tag")
 +
 +
 +def make_ple_file_prefetcher(table: torch.Tensor) -> Optional[PleFilePrefetcher]:
@@ -15525,6 +17114,26 @@ index 44795b027d..eba7238275 100644
              "intern_s2_preview",
              "interns2_mobius",
              "cosmos3_omni",
+diff --git a/python/sglang/srt/multimodal/vit_cuda_graph_runner.py b/python/sglang/srt/multimodal/vit_cuda_graph_runner.py
+index 7a40a45ed0..89923ae0eb 100644
+--- a/python/sglang/srt/multimodal/vit_cuda_graph_runner.py
++++ b/python/sglang/srt/multimodal/vit_cuda_graph_runner.py
+@@ -423,9 +423,14 @@ class ViTCudaGraphRunner:
+ 
+         out = self.block_output[graph_key]
+ 
+-        # Optional output reordering (Qwen2.5-VL window permutation inverse)
++        # Return caller-owned storage: the multimodal embedding cache retains
++        # these tensors across requests, while a later replay overwrites the
++        # graph's output buffer. index_select already makes an independent copy.
++        # Optional output reordering (Qwen2.5-VL window permutation inverse).
+         if output_indices is not None:
+             out = out.index_select(0, output_indices)
++        else:
++            out = out.clone()
+ 
+         return out
+ 
 diff --git a/python/sglang/srt/speculative/draft_utils.py b/python/sglang/srt/speculative/draft_utils.py
 index 13de33ad6e..f93f2f6480 100644
 --- a/python/sglang/srt/speculative/draft_utils.py
@@ -19071,6 +20680,872 @@ index 0000000000..0910f01150
 +    )
 +    with pytest.raises(NotImplementedError, match="Unsupported FP8 MoE"):
 +        method.create_moe_runner(SimpleNamespace(), MoeRunnerConfig())
+diff --git a/test/registered/unit/models/test_qwen4_exp_ple_cache.py b/test/registered/unit/models/test_qwen4_exp_ple_cache.py
+new file mode 100644
+index 0000000000..f845f36e24
+--- /dev/null
++++ b/test/registered/unit/models/test_qwen4_exp_ple_cache.py
+@@ -0,0 +1,860 @@
++"""Unit tests for the bounded pure-stdlib PLE cache materializer.
++
++These tests run under a plain stdlib pytest (no SGLang / torch import needed).
++The module under test is loaded by file path via importlib inside a fixture,
++so collection succeeds even before the module exists (TDD RED state).
++"""
++
++import fcntl
++import hashlib
++import importlib.util
++import json
++import math
++import os
++import stat
++import struct
++import sys
++from pathlib import Path
++
++import pytest
++
++TEST_FILE = Path(__file__).resolve()
++WORKTREE = TEST_FILE.parents[4]
++MODULE_PATH = (
++    WORKTREE / "python" / "sglang" / "srt" / "models" / "qwen4_exp_ple_cache.py"
++)
++
++MODEL_ID = "nvidia/Qwen3.8-Flash-Next-NVFP4"
++REVISION = "fc694b54fb0174e0913e6adf86691ef85a4ead47"
++PREFIX = "model.layers.3.mlp.experts"
++ROWS = 4
++WIDTH = 8
++PERM = [5, 2, 0, 4, 1, 3]  # physical slot -> numeric shard id (non-identity)
++
++_IMPORTED_NEW = None
++_LOADED = None
++
++
++def _load_module():
++    global _LOADED, _IMPORTED_NEW
++    if _LOADED is None:
++        if not MODULE_PATH.exists():
++            pytest.fail(f"module under test not implemented yet: {MODULE_PATH}")
++        before = frozenset(sys.modules)
++        spec = importlib.util.spec_from_file_location(
++            "qwen4_exp_ple_cache", MODULE_PATH
++        )
++        assert spec is not None and spec.loader is not None
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)
++        _LOADED = mod
++        _IMPORTED_NEW = frozenset(sys.modules) - before
++    return _LOADED
++
++
++@pytest.fixture(scope="module")
++def ple():
++    return _load_module()
++
++
++# --------------------------------------------------------------------------
++# fixtures
++
++
++def _table_name(total_rows, width):
++    size = total_rows * width
++    return (
++        f"ple_table_{total_rows}x{width}_float8_e4m3fn_{size}B_rows0-{total_rows}.bin"
++    )
++
++
++def _shard_payload(sid, rows, width):
++    return bytes(
++        ((sid * 37 + r * 11 + c * 3) & 0xFF) for r in range(rows) for c in range(width)
++    )
++
++
++def _write_safetensors(path, tensors):
++    """tensors: list of (name, dtype, shape, payload) laid out in list order."""
++    header = {"__metadata__": {"format": "pt"}}
++    off = 0
++    body = b""
++    for name, dtype, shape, payload in tensors:
++        header[name] = {
++            "dtype": dtype,
++            "shape": list(shape),
++            "data_offsets": [off, off + len(payload)],
++        }
++        body += payload
++        off += len(payload)
++    hb = json.dumps(header, separators=(",", ":")).encode("ascii")
++    hb += b" " * ((8 - (len(hb) % 8)) % 8)
++    blob = struct.pack("<Q", len(hb)) + hb + body
++    path.write_bytes(blob)
++    return blob
++
++
++class _Src:
++    def __init__(self, path, blob, perm, rows, width, prefix, payloads, scale):
++        self.path = path
++        self.blob = blob
++        self.perm = perm
++        self.rows = rows
++        self.width = width
++        self.prefix = prefix
++        self.payloads = payloads
++        self.scale = scale
++        self.sha = hashlib.sha256(blob).hexdigest()
++
++    @property
++    def n(self):
++        return len(self.perm)
++
++    @property
++    def shard_bytes(self):
++        return self.rows * self.width
++
++    @property
++    def total_rows(self):
++        return self.n * self.rows
++
++
++def make_source(root, *, perm=PERM, rows=ROWS, width=WIDTH, prefix=PREFIX, extra=True):
++    root.mkdir(parents=True, exist_ok=True)
++    path = root / "ple_src.safetensors"
++    payloads = {sid: _shard_payload(sid, rows, width) for sid in range(len(perm))}
++    scale = b"\x3c\x40"
++    tensors = []
++    if extra:
++        tensors.append(
++            (
++                "model.embed_tokens.weight",
++                "BF16",
++                [2, 2],
++                b"\x01\x02\x03\x04\x05\x06\x07\x08",
++            )
++        )
++    for slot, sid in enumerate(perm):
++        tensors.append(
++            (f"{prefix}.shard_{sid}.weight", "F8_E4M3", [rows, width], payloads[sid])
++        )
++    tensors.append((f"{prefix}.weight_scale", "BF16", [1], scale))
++    blob = _write_safetensors(path, tensors)
++    return _Src(path, blob, perm, rows, width, prefix, payloads, scale)
++
++
++def make_plan(ple, src, **over):
++    kw = {
++        "model_id": MODEL_ID,
++        "model_revision": REVISION,
++        "tensor_prefix": src.prefix,
++        "shard_count": src.n,
++        "rows_per_shard": src.rows,
++        "row_width": src.width,
++        "source_sha256": src.sha,
++    }
++    kw.update(over)
++    return ple.build_plan(str(src.path), **kw)
++
++
++def prepare_env(ple, tmp_path, *, perm=PERM, rows=ROWS, width=WIDTH):
++    model_root = tmp_path / "model"
++    cache = tmp_path / "cache"
++    src = make_source(model_root, perm=perm, rows=rows, width=width)
++    plan = make_plan(ple, src)
++    return src, plan, model_root, cache
++
++
++def canonical_bytes(obj):
++    return json.dumps(
++        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True
++    ).encode("ascii")
++
++
++# --------------------------------------------------------------------------
++# module hygiene
++
++
++def test_module_is_pure_stdlib(ple):
++    assert _IMPORTED_NEW is not None
++    banned = ("torch", "numpy", "sglang", "transformers", "triton", "zlib_ng")
++    for name in _IMPORTED_NEW:
++        root = name.split(".", 1)[0]
++        assert root not in banned, f"module imported third-party package: {name}"
++    text = MODULE_PATH.read_text(encoding="utf-8")
++    assert "import torch" not in text
++    assert "from torch" not in text
++
++
++def test_module_compiles(ple):
++    compile(MODULE_PATH.read_text(encoding="utf-8"), str(MODULE_PATH), "exec")
++
++
++# --------------------------------------------------------------------------
++# build_plan / validate_plan
++
++
++def test_build_plan_schema_and_absolute_offsets(ple, tmp_path):
++    src = make_source(tmp_path / "m")
++    plan = make_plan(ple, src)
++    header_len = struct.unpack("<Q", src.blob[:8])[0]
++    data_start = 8 + header_len
++    assert plan["schema"] == "qwen38fn.ple-plan.v1"
++    assert plan["model"] == {"id": MODEL_ID, "revision": REVISION}
++    assert plan["dtype"] == "F8_E4M3"
++    assert plan["tensor_prefix"] == src.prefix
++    assert plan["source"]["name"] == "ple_src.safetensors"
++    assert plan["source"]["size"] == len(src.blob)
++    assert plan["source"]["sha256"] == src.sha
++    assert plan["source"]["data_start"] == data_start
++    assert plan["shard_count"] == src.n
++    assert plan["rows_per_shard"] == src.rows
++    assert plan["row_width"] == src.width
++
++
++def test_build_plan_shards_numeric_ordered_offsets_scattered(ple, tmp_path):
++    src = make_source(tmp_path / "m")
++    plan = make_plan(ple, src)
++    shards = plan["shards"]
++    assert [s["id"] for s in shards] == list(range(src.n))
++    assert [s["name"] for s in shards] == [
++        f"{src.prefix}.shard_{i}.weight" for i in range(src.n)
++    ]
++    header = json.loads(src.blob[8 : 8 + struct.unpack("<Q", src.blob[:8])[0]])
++    data_start = 8 + struct.unpack("<Q", src.blob[:8])[0]
++    for s in shards:
++        rel = header[s["name"]]["data_offsets"][0]
++        assert s["offset"] == data_start + rel
++        assert s["size"] == src.shard_bytes
++        assert s["sha256"] == hashlib.sha256(src.payloads[s["id"]]).hexdigest()
++    assert len({s["offset"] for s in shards}) == src.n
++
++
++def test_logical_table_sha_is_numeric_not_physical(ple, tmp_path):
++    src = make_source(tmp_path / "m")
++    plan = make_plan(ple, src)
++    numeric = b"".join(src.payloads[i] for i in range(src.n))
++    physical = b"".join(src.payloads[sid] for sid in src.perm)
++    assert physical != numeric
++    assert plan["table"]["sha256"] == hashlib.sha256(numeric).hexdigest()
++    total = src.total_rows
++    assert plan["table"]["name"] == _table_name(total, src.width)
++    assert plan["table"]["shape"] == [total, src.width]
++    assert plan["table"]["size"] == len(numeric)
++
++
++def test_scale_binding(ple, tmp_path):
++    src = make_source(tmp_path / "m")
++    plan = make_plan(ple, src)
++    header = json.loads(src.blob[8 : 8 + struct.unpack("<Q", src.blob[:8])[0]])
++    data_start = 8 + struct.unpack("<Q", src.blob[:8])[0]
++    scale = plan["scale"]
++    assert scale["name"] == f"{src.prefix}.weight_scale"
++    assert scale["size"] == 2
++    assert (
++        scale["offset"]
++        == data_start + header[f"{src.prefix}.weight_scale"]["data_offsets"][0]
++    )
++    assert scale["sha256"] == hashlib.sha256(src.scale).hexdigest()
++
++
++def test_plan_is_pure_json_roundtrip(ple, tmp_path):
++    src = make_source(tmp_path / "m")
++    plan = make_plan(ple, src)
++    revived = json.loads(json.dumps(plan))
++    assert ple.validate_plan(revived) == plan
++    a = hashlib.sha256(canonical_bytes(plan)).hexdigest()
++    reordered = json.loads(json.dumps({k: plan[k] for k in reversed(list(plan))}))
++    b = hashlib.sha256(canonical_bytes(reordered)).hexdigest()
++    assert a == b
++
++
++def test_validate_plan_rejects_mutations(ple, tmp_path):
++    src = make_source(tmp_path / "m")
++    plan = make_plan(ple, src)
++
++    def mutated(fn):
++        p = json.loads(json.dumps(plan))
++        fn(p)
++        return p
++
++    cases = [
++        lambda p: p.update(shard_count=True),
++        lambda p: p.update(shard_count=float(plan["shard_count"])),
++        lambda p: p.update(extra_key=1),
++        lambda p: p.pop("scale"),
++        lambda p: p["source"].update(size=-1),
++        lambda p: p["source"].update(sha256=plan["source"]["sha256"].upper()),
++        lambda p: p["source"].update(name="../escape.safetensors"),
++        lambda p: p["model"].update(revision="fc69"),
++        lambda p: p["model"].update(id="other/model"),
++        lambda p: p.update(dtype="BF16"),
++        lambda p: p["table"].update(name="table.bin"),
++        lambda p: p["table"].update(shape=[1, 1]),
++        lambda p: p["table"].update(size=plan["table"]["size"] + 1),
++        lambda p: p["shards"][0].update(offset=p["shards"][1]["offset"]),
++        lambda p: p["shards"][0].update(name=p["shards"][1]["name"]),
++        lambda p: p["shards"].reverse(),
++        lambda p: p["shards"][0].update(size=1),
++        lambda p: p["scale"].update(size=4),
++        lambda p: p.update(row_width=0),
++        lambda p: p.update(shard_count=0),
++        lambda p: p.update(tensor_prefix="../bad"),
++        lambda p: p["source"].update(data_start=3),
++        lambda p: p["scale"].update(offset=p["source"]["size"] - 1),
++    ]
++    for i, fn in enumerate(cases):
++        with pytest.raises(Exception) as exc:
++            ple.validate_plan(mutated(fn))
++        assert issubclass(exc.type, ple.PleCacheError), f"case {i} raised {exc.type}"
++
++
++def test_build_plan_rejects_wrong_source_sha(ple, tmp_path):
++    src = make_source(tmp_path / "m")
++    bad = "0" * 64
++    with pytest.raises(ple.PleCacheError):
++        make_plan(ple, src, source_sha256=bad)
++
++
++def test_build_plan_rejects_bad_geometry_and_prefix(ple, tmp_path):
++    src = make_source(tmp_path / "m")
++    with pytest.raises(ple.PleCacheError):
++        make_plan(ple, src, shard_count=src.n + 1)
++    with pytest.raises(ple.PleCacheError):
++        make_plan(ple, src, rows_per_shard=0)
++    with pytest.raises(ple.PleCacheError):
++        make_plan(ple, src, tensor_prefix="")
++    with pytest.raises(ple.PleCacheError):
++        make_plan(ple, src, model_revision="XYZ")
++    with pytest.raises(ple.PleCacheError):
++        make_plan(ple, src, model_id="nvidia/Other")
++
++
++# --------------------------------------------------------------------------
++# prepare_cache
++
++
++def test_prepare_cold_then_warm(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    table_size = plan["table"]["size"]
++    r1 = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert set(r1) == {
++        "receipt_path",
++        "receipt_sha256",
++        "mode",
++        "copied_bytes",
++        "elapsed_seconds",
++    }
++    assert r1["mode"] == "materialized"
++    assert r1["copied_bytes"] == table_size
++    assert isinstance(r1["elapsed_seconds"], float) and math.isfinite(
++        r1["elapsed_seconds"]
++    )
++    assert r1["receipt_path"] == str(cache / "prepared.json")
++    receipt_bytes = (cache / "prepared.json").read_bytes()
++    assert hashlib.sha256(receipt_bytes).hexdigest() == r1["receipt_sha256"]
++    table = cache / plan["table"]["name"]
++    assert table.read_bytes() == b"".join(src.payloads[i] for i in range(src.n))
++    r2 = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r2["mode"] == "reuse"
++    assert r2["copied_bytes"] == 0
++    assert r2["receipt_sha256"] == r1["receipt_sha256"]
++    mode = os.stat(cache).st_mode
++    assert mode & 0o077 == 0
++
++
++def test_prepare_adopts_legacy_table_without_receipt(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    r1 = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r1["mode"] == "materialized"
++    (cache / "prepared.json").unlink()
++    r2 = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r2["mode"] == "reuse"
++    assert r2["copied_bytes"] == 0
++    assert r2["receipt_sha256"] == r1["receipt_sha256"]
++
++
++def test_prepare_truncated_source_aborts(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    with open(src.path, "r+b") as f:
++        f.truncate(len(src.blob) - 4)
++    with pytest.raises(ple.PleCacheError):
++        ple.prepare_cache(str(model_root), str(cache), plan)
++    assert not (cache / "prepared.json").exists()
++
++
++def test_prepare_corrupt_scale_source_aborts(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    blob = bytearray(src.blob)
++    blob[-1] ^= 0xFF  # scale is the final tensor payload
++    src.path.write_bytes(bytes(blob))
++    with pytest.raises(ple.PleCacheError):
++        ple.prepare_cache(str(model_root), str(cache), plan)
++
++
++def test_cache_flip_triggers_atomic_rebuild(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    ple.prepare_cache(str(model_root), str(cache), plan)
++    table = cache / plan["table"]["name"]
++    data = bytearray(table.read_bytes())
++    data[0] ^= 0xFF
++    table.write_bytes(bytes(data))
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r["mode"] == "materialized"
++    assert r["copied_bytes"] == plan["table"]["size"]
++    assert table.read_bytes() == b"".join(src.payloads[i] for i in range(src.n))
++
++
++def test_touched_table_mtime_forces_rebuild(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    ple.prepare_cache(str(model_root), str(cache), plan)
++    table = cache / plan["table"]["name"]
++    os.utime(table, ns=(10**18, 10**18))
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r["mode"] == "materialized"
++    assert r["copied_bytes"] == plan["table"]["size"]
++
++
++def test_invalid_and_tampered_receipts_rebuild(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    ple.prepare_cache(str(model_root), str(cache), plan)
++    good = (cache / "prepared.json").read_bytes()
++
++    (cache / "prepared.json").write_bytes(b"{not json")
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r["mode"] == "materialized"
++
++    receipt = json.loads(good)
++    receipt["plan_sha256"] = "0" * 64
++    (cache / "prepared.json").write_bytes(canonical_bytes(receipt))
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r["mode"] == "materialized"
++
++    receipt = json.loads(good)
++    receipt["table_stat"]["size"] += 1
++    (cache / "prepared.json").write_bytes(canonical_bytes(receipt))
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r["mode"] == "materialized"
++    assert (cache / plan["table"]["name"]).read_bytes() == b"".join(
++        src.payloads[i] for i in range(src.n)
++    )
++
++
++def test_stale_receipt_from_other_plan_rebuilds(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    ple.prepare_cache(str(model_root), str(cache), plan)
++    src2 = make_source(tmp_path / "model2", perm=PERM, rows=ROWS + 1)
++    plan2 = make_plan(ple, src2)
++    with pytest.raises(ple.PleCacheError):
++        ple.prepare_cache(str(model_root), str(cache), plan2)
++    r = ple.prepare_cache(str(src2.path.parent), str(cache), plan2)
++    assert r["mode"] == "materialized"
++    assert (cache / plan2["table"]["name"]).exists()
++
++
++def test_receipt_binds_plan_identity(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    ple.prepare_cache(str(model_root), str(cache), plan)
++    receipt = json.loads((cache / "prepared.json").read_bytes())
++    assert receipt["schema"] == "qwen38fn.ple-prepared.v1"
++    assert set(receipt) == {
++        "schema",
++        "plan_sha256",
++        "model",
++        "source",
++        "table",
++        "source_stat",
++        "table_stat",
++    }
++    assert receipt["plan_sha256"] == hashlib.sha256(canonical_bytes(plan)).hexdigest()
++    assert receipt["model"] == plan["model"]
++    assert receipt["source"]["sha256"] == plan["source"]["sha256"]
++    assert receipt["table"]["name"] == plan["table"]["name"]
++    assert receipt["table"]["dtype"] == "F8_E4M3"
++    assert receipt["table"]["tag"] == f"rows0-{src.total_rows}"
++    for key in ("dev", "ino", "size", "mtime_ns", "ctime_ns"):
++        assert key in receipt["table_stat"]
++        assert key in receipt["source_stat"]
++
++
++def test_unsafe_cache_root_refused(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    cache.mkdir()
++    os.chmod(cache, 0o777)
++    with pytest.raises(ple.PleCacheError):
++        ple.prepare_cache(str(model_root), str(cache), plan)
++
++
++def test_group_writable_cache_table_refused(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    ple.prepare_cache(str(model_root), str(cache), plan)
++    (cache / "prepared.json").unlink()
++    table = cache / plan["table"]["name"]
++    os.chmod(table, 0o664)
++    with pytest.raises(ple.PleCacheError):
++        ple.prepare_cache(str(model_root), str(cache), plan)
++    os.chmod(table, 0o600)
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r["mode"] == "reuse"
++
++
++def test_symlink_leaf_source_refused(ple, tmp_path):
++    real = make_source(tmp_path / "real")
++    link_root = tmp_path / "m"
++    link_root.mkdir()
++    link = link_root / "ple_src.safetensors"
++    link.symlink_to(real.path)
++    with pytest.raises(ple.PleCacheError):
++        make_plan(
++            ple,
++            _Src(
++                link,
++                real.blob,
++                real.perm,
++                real.rows,
++                real.width,
++                real.prefix,
++                real.payloads,
++                real.scale,
++            ),
++        )
++
++
++def test_symlink_ancestor_cache_refused(ple, tmp_path):
++    src, plan, model_root, _ = prepare_env(ple, tmp_path)
++    real_dir = tmp_path / "real_cache"
++    real_dir.mkdir()
++    link = tmp_path / "cache_link"
++    link.symlink_to(real_dir, target_is_directory=True)
++    with pytest.raises(ple.PleCacheError):
++        ple.prepare_cache(str(model_root), str(link), plan)
++
++
++def test_hardlinked_source_refused(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    second = model_root / "ple_src_link.safetensors"
++    os.link(src.path, second)
++    with pytest.raises(ple.PleCacheError):
++        make_plan(ple, src)
++    with pytest.raises(ple.PleCacheError):
++        ple.prepare_cache(str(model_root), str(cache), plan)
++
++
++def test_lock_busy_refused(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    lock_path = cache / f".{plan['table']['name']}.lock"
++    lock_path.parent.mkdir(mode=0o700)
++    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
++    try:
++        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        with pytest.raises(ple.CacheBusyError):
++            ple.prepare_cache(str(model_root), str(cache), plan)
++        fcntl.flock(fd, fcntl.LOCK_UN)
++    finally:
++        os.close(fd)
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r["mode"] == "materialized"
++
++
++def test_short_read_and_short_write_tolerated(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    real_pread = os.pread
++    real_pwrite = os.pwrite
++
++    def short_pread(fd, n, off):
++        data = real_pread(fd, n, off)
++        return data[: len(data) // 2] if len(data) > 1 else data
++
++    def short_pwrite(fd, data, off):
++        return real_pwrite(fd, data[: max(1, len(data) // 2)], off)
++
++    os.pread = short_pread
++    try:
++        os.pwrite = short_pwrite
++        try:
++            r = ple.prepare_cache(str(model_root), str(cache), plan)
++        finally:
++            os.pwrite = real_pwrite
++    finally:
++        os.pread = real_pread
++    assert r["mode"] == "materialized"
++    table = cache / plan["table"]["name"]
++    assert table.read_bytes() == b"".join(src.payloads[i] for i in range(src.n))
++
++
++def test_source_changed_during_copy_aborts(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    real_pwrite = os.pwrite
++    state = {"done": False}
++
++    def meddling_pwrite(fd, data, off):
++        if not state["done"]:
++            state["done"] = True
++            fd2 = os.open(str(src.path), os.O_WRONLY)
++            try:
++                real_pwrite(fd2, b"\xff", len(src.blob) - 3)
++            finally:
++                os.close(fd2)
++            later = (10**18, 10**18)
++            os.utime(str(src.path), ns=later)
++        return real_pwrite(fd, data, off)
++
++    os.pwrite = meddling_pwrite
++    try:
++        with pytest.raises(ple.PleCacheError):
++            ple.prepare_cache(str(model_root), str(cache), plan)
++    finally:
++        os.pwrite = real_pwrite
++    leftovers = [p.name for p in cache.iterdir() if ".tmp-" in p.name]
++    assert leftovers == []
++    assert not (cache / "prepared.json").exists()
++
++
++def test_interrupted_copy_cleans_temp_then_recovers(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    real_pwrite = os.pwrite
++    state = {"calls": 0}
++
++    def failing_pwrite(fd, data, off):
++        state["calls"] += 1
++        if state["calls"] == 3:
++            raise OSError("simulated interrupted copy")
++        return real_pwrite(fd, data, off)
++
++    os.pwrite = failing_pwrite
++    try:
++        with pytest.raises(ple.PleCacheError):
++            ple.prepare_cache(str(model_root), str(cache), plan)
++    finally:
++        os.pwrite = real_pwrite
++    assert state["calls"] >= 3
++    assert not (cache / "prepared.json").exists()
++    assert not (cache / plan["table"]["name"]).exists()
++    assert [p.name for p in cache.iterdir() if ".tmp-" in p.name] == []
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r["mode"] == "materialized"
++
++
++def test_fsync_failure_preserves_state(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    real_fsync = os.fsync
++
++    def failing_fsync(fd):
++        raise OSError("simulated fsync failure")
++
++    os.fsync = failing_fsync
++    try:
++        with pytest.raises(ple.PleCacheError):
++            ple.prepare_cache(str(model_root), str(cache), plan)
++    finally:
++        os.fsync = real_fsync
++    assert not (cache / "prepared.json").exists()
++    assert not (cache / plan["table"]["name"]).exists()
++    assert [p.name for p in cache.iterdir() if ".tmp-" in p.name] == []
++
++
++def test_replace_failure_leaves_no_success(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    real_replace = os.replace
++
++    def failing_replace(src_p, dst_p, *a, **kw):
++        raise OSError("simulated replace failure")
++
++    os.replace = failing_replace
++    try:
++        with pytest.raises(ple.PleCacheError):
++            ple.prepare_cache(str(model_root), str(cache), plan)
++    finally:
++        os.replace = real_replace
++    assert not (cache / "prepared.json").exists()
++    assert [p.name for p in cache.iterdir() if ".tmp-" in p.name] == []
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r["mode"] == "materialized"
++
++
++def test_receipt_finalize_failure_raises_then_adopts(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    real_replace = os.replace
++
++    def failing_replace(src_p, dst_p, *a, **kw):
++        if str(dst_p).endswith("prepared.json"):
++            raise OSError("simulated receipt replace failure")
++        return real_replace(src_p, dst_p, *a, **kw)
++
++    os.replace = failing_replace
++    try:
++        with pytest.raises(ple.PleCacheError):
++            ple.prepare_cache(str(model_root), str(cache), plan)
++    finally:
++        os.replace = real_replace
++    table = cache / plan["table"]["name"]
++    assert table.read_bytes() == b"".join(src.payloads[i] for i in range(src.n))
++    assert not (cache / "prepared.json").exists()
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    assert r["mode"] == "reuse"
++    assert r["copied_bytes"] == 0
++
++
++def test_periodic_fdatasync_and_fadvise(ple, tmp_path, monkeypatch):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    monkeypatch.setattr(ple, "_IO_BUFFER_BYTES", 7)
++    monkeypatch.setattr(ple, "_FADVISE_INTERVAL_BYTES", 13)
++    if not hasattr(os, "posix_fadvise"):
++        pytest.skip("posix_fadvise unavailable")
++    real_fdatasync = os.fdatasync
++    real_fadvise = os.posix_fadvise
++    counts = {"sync": 0, "advise": 0}
++
++    def counting_fdatasync(fd):
++        counts["sync"] += 1
++        return real_fdatasync(fd)
++
++    def counting_fadvise(fd, off, ln, advice):
++        counts["advise"] += 1
++        return real_fadvise(fd, off, ln, advice)
++
++    os.fdatasync = counting_fdatasync
++    try:
++        os.posix_fadvise = counting_fadvise
++        try:
++            r = ple.prepare_cache(str(model_root), str(cache), plan)
++        finally:
++            os.posix_fadvise = real_fadvise
++    finally:
++        os.fdatasync = real_fdatasync
++    assert r["mode"] == "materialized"
++    assert counts["sync"] >= src.n * 3  # two interval flushes plus a tail per shard
++    assert counts["advise"] >= src.n * 2
++
++
++# --------------------------------------------------------------------------
++# open_prepared_table
++
++
++def test_open_prepared_table_returns_owned_fd(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    fd = ple.open_prepared_table(
++        r["receipt_path"],
++        r["receipt_sha256"],
++        table_dir=str(cache),
++        shape=plan["table"]["shape"],
++        dtype="F8_E4M3",
++        tag=f"rows0-{src.total_rows}",
++    )
++    try:
++        st = os.fstat(fd)
++        assert stat.S_ISREG(st.st_mode)
++        assert st.st_size == plan["table"]["size"]
++    finally:
++        os.close(fd)
++
++
++def _open_args(ple, r, src, cache, **over):
++    kw = {
++        "table_dir": str(cache),
++        "shape": [src.total_rows, src.width],
++        "dtype": "F8_E4M3",
++        "tag": f"rows0-{src.total_rows}",
++    }
++    kw.update(over)
++    return kw
++
++
++def test_open_prepared_table_rejects_bad_args(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    cases = [
++        _open_args(ple, r, src, cache, dtype="BF16"),
++        _open_args(ple, r, src, cache, tag="rows0-1"),
++        _open_args(ple, r, src, cache, shape=[1, 1]),
++        _open_args(ple, r, src, cache, shape=True),
++    ]
++    for i, kw in enumerate(cases):
++        with pytest.raises(ple.PleCacheError) as exc:
++            ple.open_prepared_table(r["receipt_path"], r["receipt_sha256"], **kw)
++        assert issubclass(exc.type, ple.PleCacheError), f"case {i}"
++
++
++def test_open_prepared_table_rejects_wrong_receipt_sha(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    with pytest.raises(ple.PleCacheError):
++        ple.open_prepared_table(
++            r["receipt_path"],
++            "0" * 64,
++            **_open_args(ple, r, src, cache),
++        )
++
++
++def test_open_prepared_table_rejects_tampered_but_rehashed(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    receipt = json.loads((cache / "prepared.json").read_bytes())
++
++    receipt["model"]["revision"] = "f" * 39
++    (cache / "prepared.json").write_bytes(canonical_bytes(receipt))
++    bad_sha = hashlib.sha256(canonical_bytes(receipt)).hexdigest()
++    with pytest.raises(ple.PleCacheError):
++        ple.open_prepared_table(
++            r["receipt_path"], bad_sha, **_open_args(ple, r, src, cache)
++        )
++
++    receipt["model"]["revision"] = REVISION
++    receipt["table_stat"]["ino"] += 1
++    (cache / "prepared.json").write_bytes(canonical_bytes(receipt))
++    bad_sha = hashlib.sha256(canonical_bytes(receipt)).hexdigest()
++    with pytest.raises(ple.PleCacheError):
++        ple.open_prepared_table(
++            r["receipt_path"], bad_sha, **_open_args(ple, r, src, cache)
++        )
++
++    receipt["table_stat"]["size"] = True
++    (cache / "prepared.json").write_bytes(canonical_bytes(receipt))
++    bad_sha = hashlib.sha256(canonical_bytes(receipt)).hexdigest()
++    with pytest.raises(ple.PleCacheError):
++        ple.open_prepared_table(
++            r["receipt_path"], bad_sha, **_open_args(ple, r, src, cache)
++        )
++
++
++def test_open_prepared_table_rejects_escaping_table_name(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    receipt = json.loads((cache / "prepared.json").read_bytes())
++    receipt["table"]["name"] = "../escape.bin"
++    (cache / "prepared.json").write_bytes(canonical_bytes(receipt))
++    bad_sha = hashlib.sha256(canonical_bytes(receipt)).hexdigest()
++    with pytest.raises(ple.PleCacheError):
++        ple.open_prepared_table(
++            r["receipt_path"], bad_sha, **_open_args(ple, r, src, cache)
++        )
++
++
++def test_open_prepared_table_rejects_stale_stat(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    os.utime(cache / plan["table"]["name"], ns=(10**18, 10**18))
++    with pytest.raises(ple.PleCacheError):
++        ple.open_prepared_table(
++            r["receipt_path"], r["receipt_sha256"], **_open_args(ple, r, src, cache)
++        )
++
++
++def test_open_prepared_table_rejects_symlinked_table(ple, tmp_path):
++    src, plan, model_root, cache = prepare_env(ple, tmp_path)
++    r = ple.prepare_cache(str(model_root), str(cache), plan)
++    table = cache / plan["table"]["name"]
++    saved = table.read_bytes()
++    table.unlink()
++    other = tmp_path / "elsewhere.bin"
++    other.write_bytes(saved)
++    table.symlink_to(other)
++    with pytest.raises(ple.PleCacheError):
++        ple.open_prepared_table(
++            r["receipt_path"], r["receipt_sha256"], **_open_args(ple, r, src, cache)
++        )
++
++
++if __name__ == "__main__":
++    raise SystemExit(pytest.main([__file__, "-v"]))
 diff --git a/test/registered/unit/models/test_qwen4_exp_ple_table.py b/test/registered/unit/models/test_qwen4_exp_ple_table.py
 new file mode 100644
 index 0000000000..6245578247
@@ -19382,6 +21857,275 @@ index 0000000000..6245578247
 +
 +if __name__ == "__main__":
 +    unittest.main()
+diff --git a/test/registered/unit/models/test_qwen4_ple_cache_closure.py b/test/registered/unit/models/test_qwen4_ple_cache_closure.py
+new file mode 100644
+index 0000000000..a14c1577d1
+--- /dev/null
++++ b/test/registered/unit/models/test_qwen4_ple_cache_closure.py
+@@ -0,0 +1,263 @@
++"""Independent controller probes of PLE cache integrity and filesystem safety."""
++
++import hashlib
++import importlib.util
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++
++_SPEC = importlib.util.spec_from_file_location(
++    "ple_core_test_fixtures", Path(__file__).with_name("test_qwen4_exp_ple_cache.py")
++)
++assert _SPEC is not None and _SPEC.loader is not None
++fixtures = importlib.util.module_from_spec(_SPEC)
++_SPEC.loader.exec_module(fixtures)
++
++
++@pytest.fixture
++def core():
++    return fixtures._load_module()
++
++
++def prepared(core, tmp_path):
++    src, plan, model_root, cache = fixtures.prepare_env(core, tmp_path)
++    result = core.prepare_cache(str(model_root), str(cache), plan)
++    return src, plan, model_root, cache, result
++
++
++def test_warm_hash_failure_is_not_ignored(core, tmp_path):
++    src, plan, model_root, cache, result = prepared(core, tmp_path)
++    table = cache / plan["table"]["name"]
++    raw = bytearray(table.read_bytes())
++    raw[0] ^= 1
++    table.write_bytes(raw)
++    receipt = json.loads((cache / "prepared.json").read_bytes())
++    st = table.stat()
++    receipt["table_stat"] = {
++        k: getattr(st, "st_" + k)
++        for k in ("dev", "ino", "size", "mtime_ns", "ctime_ns")
++    }
++    (cache / "prepared.json").write_bytes(fixtures.canonical_bytes(receipt))
++    recovered = core.prepare_cache(str(model_root), str(cache), plan)
++    assert recovered["mode"] == "materialized"
++    assert recovered["copied_bytes"] == plan["table"]["size"]
++    assert table.read_bytes() == b"".join(src.payloads[i] for i in range(src.n))
++
++
++def test_receipt_hash_binds_exact_bytes_not_recanonicalization(core, tmp_path):
++    src, plan, model_root, cache, result = prepared(core, tmp_path)
++    receipt = json.loads((cache / "prepared.json").read_bytes())
++    changed = json.dumps(receipt, indent=2).encode()
++    assert hashlib.sha256(changed).hexdigest() != result["receipt_sha256"]
++    (cache / "prepared.json").write_bytes(changed)
++    with pytest.raises(core.PleCacheError):
++        core.open_prepared_table(
++            result["receipt_path"],
++            result["receipt_sha256"],
++            **fixtures._open_args(core, result, src, cache),
++        )
++
++
++def test_intermediate_source_symlink_is_refused(core, tmp_path):
++    src = fixtures.make_source(tmp_path / "actual" / "model")
++    alias = tmp_path / "alias"
++    alias.symlink_to(tmp_path / "actual", target_is_directory=True)
++    with pytest.raises(core.PleCacheError):
++        core.build_plan(
++            str(alias / "model" / src.path.name),
++            model_id=fixtures.MODEL_ID,
++            model_revision=fixtures.REVISION,
++            tensor_prefix=src.prefix,
++            shard_count=src.n,
++            rows_per_shard=src.rows,
++            row_width=src.width,
++            source_sha256=src.sha,
++        )
++
++
++def test_intermediate_cache_symlink_cannot_create_outside(core, tmp_path):
++    src, plan, model_root, _ = fixtures.prepare_env(core, tmp_path)
++    target = tmp_path / "outside" / "parent"
++    target.mkdir(parents=True, mode=0o700)
++    alias = tmp_path / "alias"
++    alias.symlink_to(target.parent, target_is_directory=True)
++    with pytest.raises(core.PleCacheError):
++        core.prepare_cache(str(model_root), str(alias / "parent" / "new-cache"), plan)
++    assert not (target / "new-cache").exists()
++
++
++def test_cold_nested_private_cache_directories_are_created(core, tmp_path):
++    src, plan, model_root, _ = fixtures.prepare_env(core, tmp_path)
++    cache = tmp_path / "cache-root" / "ple" / fixtures.REVISION
++    result = core.prepare_cache(str(model_root), str(cache), plan)
++    assert result["mode"] == "materialized"
++    for directory in (cache, cache.parent, cache.parent.parent):
++        assert directory.stat().st_mode & 0o077 == 0
++
++
++def test_model_cache_overlap_refused_before_writes(core, tmp_path):
++    src, plan, model_root, _ = fixtures.prepare_env(core, tmp_path)
++    target = model_root / "cache"
++    with pytest.raises(core.PleCacheError):
++        core.prepare_cache(str(model_root), str(target), plan)
++    assert not target.exists()
++
++
++def test_scale_hash_and_overlap_are_validated(core, tmp_path):
++    src, plan, _, _ = fixtures.prepare_env(core, tmp_path)
++    bad = json.loads(json.dumps(plan))
++    bad["scale"]["sha256"] = None
++    with pytest.raises(core.PleCacheError):
++        core.validate_plan(bad)
++    bad = json.loads(json.dumps(plan))
++    bad["scale"]["offset"] = bad["shards"][0]["offset"]
++    with pytest.raises(core.PleCacheError):
++        core.validate_plan(bad)
++
++
++def test_cache_lock_is_private(core, tmp_path):
++    src, plan, model_root, cache, result = prepared(core, tmp_path)
++    lock = cache / ("." + plan["table"]["name"] + ".lock")
++    assert lock.stat().st_mode & 0o077 == 0
++
++
++def test_scalar_non_ple_tensor_is_valid_safetensors(core, tmp_path):
++    root = tmp_path / "model"
++    root.mkdir()
++    path = root / "source.safetensors"
++    blob = fixtures._write_safetensors(
++        path,
++        [
++            ("other.scalar", "F32", [], b"\0" * 4),
++            (fixtures.PREFIX + ".shard_0.weight", "F8_E4M3", [1, 2], b"ab"),
++            (fixtures.PREFIX + ".weight_scale", "BF16", [1], b"cd"),
++        ],
++    )
++    plan = core.build_plan(
++        str(path),
++        model_id=fixtures.MODEL_ID,
++        model_revision=fixtures.REVISION,
++        tensor_prefix=fixtures.PREFIX,
++        shard_count=1,
++        rows_per_shard=1,
++        row_width=2,
++        source_sha256=hashlib.sha256(blob).hexdigest(),
++    )
++    assert plan["table"]["size"] == 2
++
++
++def test_extra_aliased_ple_shard_in_source_is_rejected(core, tmp_path):
++    root = tmp_path / "model"
++    root.mkdir()
++    path = root / "source.safetensors"
++    blob = fixtures._write_safetensors(
++        path,
++        [
++            (fixtures.PREFIX + ".shard_0.weight", "F8_E4M3", [1, 2], b"ab"),
++            (fixtures.PREFIX + ".shard_00.weight", "F8_E4M3", [1, 2], b"ef"),
++            (fixtures.PREFIX + ".weight_scale", "BF16", [1], b"cd"),
++        ],
++    )
++    with pytest.raises(core.PleCacheError):
++        core.build_plan(
++            str(path),
++            model_id=fixtures.MODEL_ID,
++            model_revision=fixtures.REVISION,
++            tensor_prefix=fixtures.PREFIX,
++            shard_count=1,
++            rows_per_shard=1,
++            row_width=2,
++            source_sha256=hashlib.sha256(blob).hexdigest(),
++        )
++
++
++def test_warm_verification_drops_consumed_file_cache(core, tmp_path, monkeypatch):
++    src, plan, model_root, cache, result = prepared(core, tmp_path)
++    calls = []
++    original = os.posix_fadvise
++
++    def advise(fd, offset, length, advice):
++        calls.append((fd, offset, length, advice))
++        return original(fd, offset, length, advice)
++
++    monkeypatch.setattr(os, "posix_fadvise", advise)
++    reused = core.prepare_cache(str(model_root), str(cache), plan)
++    assert reused["mode"] == "reuse" and reused["copied_bytes"] == 0
++    assert len(calls) >= 2
++    assert all(call[3] == os.POSIX_FADV_DONTNEED for call in calls)
++
++
++def test_plan_offsets_must_match_the_actual_header(core, tmp_path):
++    src, plan, model_root, cache, result = prepared(core, tmp_path)
++    (
++        cache / "prepared.json"
++    ).unlink()  # full legacy-table verification is not layout validation
++    bad = json.loads(json.dumps(plan))
++    bad["shards"][0]["offset"], bad["shards"][1]["offset"] = (
++        bad["shards"][1]["offset"],
++        bad["shards"][0]["offset"],
++    )
++    # The ranges remain well formed/nonoverlapping, but names now bind wrong bytes.
++    with pytest.raises(core.PleCacheError):
++        core.prepare_cache(str(model_root), str(cache), bad)
++
++
++def test_post_publish_dir_sync_failure_keeps_valid_table_but_fails(
++    core, tmp_path, monkeypatch
++):
++    src, plan, model_root, cache = fixtures.prepare_env(core, tmp_path)
++    table = cache / plan["table"]["name"]
++    original = os.fsync
++
++    def fail_directory_after_publication(fd):
++        import stat
++
++        if table.exists() and stat.S_ISDIR(os.fstat(fd).st_mode):
++            raise OSError("directory durability failure after replace")
++        return original(fd)
++
++    with monkeypatch.context() as m:
++        m.setattr(os, "fsync", fail_directory_after_publication)
++        with pytest.raises(core.PleCacheError):
++            core.prepare_cache(str(model_root), str(cache), plan)
++    assert table.read_bytes() == b"".join(src.payloads[i] for i in range(src.n))
++    assert not (cache / "prepared.json").exists()
++    recovered = core.prepare_cache(str(model_root), str(cache), plan)
++    assert recovered["mode"] == "reuse" and recovered["copied_bytes"] == 0
++
++
++def test_source_fifo_is_refused_without_blocking(core, tmp_path):
++    src, plan, model_root, cache = fixtures.prepare_env(core, tmp_path)
++    plan_path = tmp_path / "plan.json"
++    plan_path.write_text(json.dumps(plan))
++    src.path.unlink()
++    os.mkfifo(src.path, 0o600)
++    script = (
++        "import importlib.util,json,sys;"
++        "s=importlib.util.spec_from_file_location('core',sys.argv[1]);"
++        "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
++        "p=json.load(open(sys.argv[2]));\n"
++        "try:m.prepare_cache(sys.argv[3],sys.argv[4],p)\n"
++        "except m.PleCacheError:sys.exit(0)\n"
++        "sys.exit(1)\n"
++    )
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-B",
++            "-c",
++            script,
++            str(fixtures.MODULE_PATH),
++            str(plan_path),
++            str(model_root),
++            str(cache),
++        ],
++        capture_output=True,
++        text=True,
++        timeout=4,
++    )
++    assert result.returncode == 0, result.stderr
 diff --git a/test/registered/unit/models/test_qwen4_ple_collection.py b/test/registered/unit/models/test_qwen4_ple_collection.py
 new file mode 100644
 index 0000000000..54047b9c18
@@ -19455,6 +22199,998 @@ index 0000000000..54047b9c18
 +    actual, calls = _probe(True, result)
 +    assert actual is (result is True)
 +    assert calls == ["device", 2]
+diff --git a/test/registered/unit/models/test_qwen4_ple_prepared.py b/test/registered/unit/models/test_qwen4_ple_prepared.py
+new file mode 100644
+index 0000000000..307bd403b8
+--- /dev/null
++++ b/test/registered/unit/models/test_qwen4_ple_prepared.py
+@@ -0,0 +1,816 @@
++"""Prepared-PLE mapping and copy-elision hooks.
++
++NOT a core-integrity proof: the prepared-cache helper module
++``sglang.srt.models.qwen4_exp_ple_cache`` is developed on a separate isolated
++branch and is NOT readable from this workspace. Every helper-dependent test
++here injects a protocol double for it through ``sys.modules`` (labelled
++below); the real helper's receipt/digest/fd-safety validation and the
++descriptor + CUDA gather interop are proven by the controller on the merged
++tree, not here.
++
++CPU part (real execution, no GPU):
++- ``allocate_ple_host_table`` without the internal prepared env keeps the
++  upstream file-backed behaviour (same file name, shared bytes, MADV_RANDOM,
++  prefetcher path attribute) and never imports the helper.
++- With only one of the two prepared env vars set, or with malformed values
++  (sha256, dtype, backend, table_dir, tag), it fails closed BEFORE mutating
++  the table directory and before importing/calling the helper -- it never
++  falls back to the legacy rewrite.
++- The happy path imports the helper lazily, maps ``torch.from_file`` through
++  the ``/proc/self/fd/<fd>`` anchor (not an unchecked pathname), closes the
++  helper fd even on failure, and never creates/rewrites/truncates the legacy
++  table file.
++- fd-anchored mapping proof: the mapping keeps working after the descriptor
++  is closed (mapping + bytes preserved; the parent's real test re-proves this
++  with the genuine helper).
++- A real ``Qwen4ExpPinnedHostEmbedding.__init__`` over a minimal fake source
++  embedding captures the prepared flag onto the embedding object (it survives
++  the Parameter wrapping, which drops tensor custom attributes) and keeps the
++  prefetcher/RSS-trimmer wiring unconditional.
++- The real ``Qwen4ExpForConditionalGeneration.load_weights`` on a minimal
++  fake model copy-elides a well-formed prepared shard (no row payload copied,
++  param still registered, BF16 ``weight_scale`` buffer path executed) and
++  fails closed on a wrong shape, dtype, name, or shard id.
++
++GPU/interop part: none. The controller owns the real checkpoint, image and
++CUDA gather/replay verification.
++"""
++
++import os
++import sys
++import tempfile
++import types
++import unittest
++import unittest.mock as mock
++
++import torch
++
++from sglang.srt.models import qwen4_exp_ple_table as ple_table_mod
++from sglang.srt.models.qwen4_exp import (
++    Qwen4ExpForConditionalGeneration,
++    Qwen4ExpNGramEmbedding,
++    Qwen4ExpPinnedHostEmbedding,
++    _load_prepared_ple_shard,
++)
++from sglang.srt.models.qwen4_exp_ple_table import (
++    allocate_ple_host_table,
++    ple_table_file_name,
++)
++
++_HELPER_MODULE = "sglang.srt.models.qwen4_exp_ple_cache"
++
++_PREPARED_PATH_ENV = "R0B0TLAB_PLE_PREPARED_PATH"
++_PREPARED_SHA_ENV = "R0B0TLAB_PLE_PREPARED_SHA256"
++_PREPARED_ENV = {_PREPARED_PATH_ENV: "/tmp/receipt.json", _PREPARED_SHA_ENV: "ab" * 32}
++
++
++class _FakePleCache(types.ModuleType):
++    """PROTOCOL DOUBLE, not a core-integrity proof.
++
++    Stands in for the isolated-branch helper ``open_prepared_table`` whose
++    real implementation this workspace must not read or reimplement. It only
++    records the call and returns a read-only fd of the path it was given; it
++    deliberately does none of the real helper's receipt/digest/fd validation.
++    """
++
++    last_call = None
++
++    @staticmethod
++    def open_prepared_table(
++        receipt_path,
++        expected_sha256,
++        *,
++        table_dir,
++        shape,
++        dtype,
++        tag,
++    ):
++        # In production receipt_path is a receipt file that pins the table;
++        # the double opens it directly to hand back a real read-only fd.
++        _FakePleCache.last_call = {
++            "receipt_path": receipt_path,
++            "expected_sha256": expected_sha256,
++            "table_dir": table_dir,
++            "shape": list(shape),
++            "dtype": dtype,
++            "tag": tag,
++        }
++        return os.open(receipt_path, os.O_RDONLY)
++
++
++def _install_fake_helper():
++    saved = sys.modules.get(_HELPER_MODULE)
++    sys.modules[_HELPER_MODULE] = _FakePleCache(_HELPER_MODULE)
++    return saved
++
++
++def _restore_helper(saved):
++    if saved is None:
++        sys.modules.pop(_HELPER_MODULE, None)
++    else:
++        sys.modules[_HELPER_MODULE] = saved
++    _FakePleCache.last_call = None
++
++
++class _HelperDoubleMixin:
++    """Install/restore the protocol double around each test."""
++
++    def setUp(self):
++        self._saved_helper = _install_fake_helper()
++
++    def tearDown(self):
++        _restore_helper(self._saved_helper)
++
++
++def _write_table(path: str, payload: bytes) -> int:
++    with open(path, "wb") as f:
++        f.write(payload)
++    return os.stat(path).st_ino
++
++
++class TestUnpreparedPathUnchanged(unittest.TestCase):
++    """No prepared env: upstream behaviour, helper never imported."""
++
++    def test_absent_env_uses_legacy_file_backend(self):
++        with tempfile.TemporaryDirectory() as d:
++            table = allocate_ple_host_table((128, 32), torch.float8_e4m3fn, "file", d)
++            path = os.path.join(d, ple_table_file_name((128, 32), torch.float8_e4m3fn))
++            self.assertTrue(os.path.exists(path))
++            self.assertEqual(os.path.getsize(path), 128 * 32)
++            self.assertEqual(table._sglang_ple_file_path, path)
++            self.assertFalse(getattr(table, "_sglang_ple_prepared", False))
++            table[3].view(torch.uint8).fill_(7)
++            self.assertEqual(os.stat(path).st_size, 128 * 32)
++
++    def test_lazy_helper_not_imported_without_env(self):
++        # Test the import boundary, not global module-cache contents: another
++        # interoperability test may already have imported the genuine core.
++        original = __import__
++
++        def checked(name, *args, **kwargs):
++            if name == _HELPER_MODULE:
++                raise AssertionError("unprepared allocation must not import the helper")
++            return original(name, *args, **kwargs)
++
++        with mock.patch("builtins.__import__", checked):
++            with tempfile.TemporaryDirectory() as d:
++                allocate_ple_host_table((8, 8), torch.bfloat16, "file", d)
++
++
++class TestPreparedPathGuards(_HelperDoubleMixin, unittest.TestCase):
++    """Malformed or partial prepared env fails closed before any mutation."""
++
++    def _legacy_target(self, d, tag="rows0-16"):
++        return os.path.join(d, ple_table_file_name((16, 16), torch.float8_e4m3fn, tag))
++
++    def _assert_refused(
++        self,
++        env,
++        *,
++        dtype=torch.float8_e4m3fn,
++        backend="file",
++        table_dir="use-private-test-dir",
++        tag="rows0-16",
++    ):
++        with tempfile.TemporaryDirectory() as d:
++            call_dir = d if table_dir == "use-private-test-dir" else table_dir
++            with mock.patch.dict(os.environ, env, clear=False):
++                with self.assertRaises((ValueError, RuntimeError)):
++                    allocate_ple_host_table((16, 16), dtype, backend, call_dir, tag=tag)
++            # No table file was created/mutated (the legacy target is what the
++            # unprepared path would have created for these arguments).
++            self.assertFalse(
++                os.path.exists(
++                    self._legacy_target(d if call_dir is None else call_dir, tag)
++                )
++            )
++            # The failure happened before the helper was consulted.
++            self.assertIsNone(_FakePleCache.last_call)
++
++    def test_path_without_sha_refused(self):
++        self._assert_refused({_PREPARED_PATH_ENV: "/tmp/r.json"})
++
++    def test_sha_without_path_refused(self):
++        self._assert_refused({_PREPARED_SHA_ENV: "cd" * 32})
++
++    def test_empty_value_refused(self):
++        self._assert_refused({_PREPARED_PATH_ENV: "", _PREPARED_SHA_ENV: "ab" * 32})
++
++    def test_bad_sha_hex_refused(self):
++        self._assert_refused(
++            {_PREPARED_PATH_ENV: "/tmp/r.json", _PREPARED_SHA_ENV: "zz" * 32}
++        )
++
++    def test_short_sha_refused(self):
++        self._assert_refused(
++            {_PREPARED_PATH_ENV: "/tmp/r.json", _PREPARED_SHA_ENV: "ab" * 31}
++        )
++
++    def test_pinned_backend_with_prepared_env_refused(self):
++        self._assert_refused(dict(_PREPARED_ENV), backend="pinned", tag=None)
++
++    def test_bf16_table_with_prepared_env_refused(self):
++        self._assert_refused(dict(_PREPARED_ENV), dtype=torch.bfloat16)
++
++    def test_missing_table_dir_refused(self):
++        # table_dir=None would default from envs on the legacy path; prepared
++        # requires it explicitly and must refuse before touching anything.
++        self._assert_refused(dict(_PREPARED_ENV), table_dir=None, tag="rows0-16")
++
++    def test_bad_tag_refused(self):
++        with tempfile.TemporaryDirectory() as d:
++            with mock.patch.dict(os.environ, dict(_PREPARED_ENV), clear=False):
++                for tag in ("", "shard0-16", "rows16-0", "rows0-"):
++                    with self.assertRaises((ValueError, RuntimeError)):
++                        allocate_ple_host_table(
++                            (16, 16), torch.float8_e4m3fn, "file", d, tag=tag
++                        )
++            self.assertIsNone(_FakePleCache.last_call)
++
++
++class TestPreparedPathHappy(_HelperDoubleMixin, unittest.TestCase):
++    def test_prepared_mapping_anchored_and_untouched(self):
++        with tempfile.TemporaryDirectory() as d:
++            payload = bytes(range(256)) * 4  # 1024 B = 256 fp8 rows of 4
++            table_path = os.path.join(d, "prepared_table.bin")
++            inode = _write_table(table_path, payload)
++            env = {
++                _PREPARED_PATH_ENV: table_path,
++                _PREPARED_SHA_ENV: "ef" * 32,
++            }
++            real_from_file = torch.from_file
++            seen = {}
++
++            def spy_from_file(path, *args, **kwargs):
++                seen["path"] = path
++                return real_from_file(path, *args, **kwargs)
++
++            with mock.patch.dict(os.environ, env, clear=False):
++                with mock.patch.object(torch, "from_file", spy_from_file):
++                    table = allocate_ple_host_table(
++                        (256, 4), torch.float8_e4m3fn, "file", d, tag="rows0-256"
++                    )
++            # The helper got the locked contract: string dtype literal, full
++            # plan identity, explicit table_dir and the rows tag.
++            call = _FakePleCache.last_call
++            self.assertIsNotNone(call)
++            self.assertEqual(call["receipt_path"], env[_PREPARED_PATH_ENV])
++            self.assertEqual(call["expected_sha256"], env[_PREPARED_SHA_ENV])
++            self.assertEqual(call["table_dir"], d)
++            self.assertEqual(call["shape"], [256, 4])
++            self.assertEqual(call["dtype"], "F8_E4M3")
++            self.assertEqual(call["tag"], "rows0-256")
++            # The map went through the fd anchor, not an unchecked pathname.
++            self.assertTrue(
++                seen["path"].startswith("/proc/self/fd/"),
++                f"mapping did not anchor on /proc/self/fd: {seen.get('path')!r}",
++            )
++            self.assertNotEqual(seen["path"], table_path)
++            # Bytes preserved from the verified file.
++            self.assertEqual(bytes(table.view(torch.uint8).flatten().tolist()), payload)
++            # Writes land on the verified inode (shared mapping) and the file
++            # was never rewritten or truncated by the allocator.
++            self.assertEqual(os.stat(table_path).st_ino, inode)
++            table.view(torch.uint8)[0] = 0xAA
++            with open(table_path, "rb") as f:
++                self.assertEqual(f.read(1), b"\xaa")
++            self.assertEqual(os.path.getsize(table_path), len(payload))
++            # No canonical legacy file was created (nothing was rewritten).
++            legacy = ple_table_file_name((256, 4), torch.float8_e4m3fn, "rows0-256")
++            self.assertFalse(os.path.exists(os.path.join(d, legacy)))
++            # Same flags the file backend sets, plus the prepared marker.
++            self.assertTrue(table._sglang_ple_prepared)
++            self.assertEqual(table._sglang_ple_file_path, os.path.join(d, legacy))
++            # MADV_RANDOM still applies to the prepared mapping (no warning).
++            with self.assertNoLogs(ple_table_mod.logger, level="WARNING"):
++                ple_table_mod._madvise_random(table, table.numel())
++
++    def test_prepared_mapping_survives_fd_close(self):
++        # Proof that torch.from_file on /proc/self/fd/N does not depend on the
++        # descriptor staying open after the map (mapping + bytes preserved).
++        with tempfile.TemporaryDirectory() as d:
++            payload = b"\x5a" * 512
++            table_path = os.path.join(d, "anchor.bin")
++            _write_table(table_path, payload)
++            fd = os.open(table_path, os.O_RDONLY)
++            try:
++                storage = torch.from_file(
++                    f"/proc/self/fd/{fd}", shared=True, size=512, dtype=torch.uint8
++                )
++            finally:
++                os.close(fd)
++            self.assertEqual(bytes(storage.flatten().tolist()), payload)
++            storage[10] = 0x33
++            with open(table_path, "rb") as f:
++                self.assertEqual(f.read(11), b"\x5a" * 10 + b"\x33")
++
++    @staticmethod
++    def _open_fds():
++        try:
++            return set(os.listdir("/proc/self/fd"))
++        except OSError:
++            return set()
++
++    def _prepared_env(self, table_path, sha="11" * 32):
++        return {_PREPARED_PATH_ENV: table_path, _PREPARED_SHA_ENV: sha}
++
++    def test_fd_closed_after_mapping(self):
++        with tempfile.TemporaryDirectory() as d:
++            table_path = os.path.join(d, "prepared_table.bin")
++            _write_table(table_path, b"\x00" * 64)
++            before = self._open_fds()
++            with mock.patch.dict(
++                os.environ, self._prepared_env(table_path), clear=False
++            ):
++                allocate_ple_host_table(
++                    (64, 1), torch.float8_e4m3fn, "file", d, tag="rows0-64"
++                )
++            leaks = self._open_fds() - before
++            self.assertEqual(leaks, set(), f"helper fd leaked: {leaks}")
++
++    def test_fd_closed_on_helper_exception(self):
++        with tempfile.TemporaryDirectory() as d:
++            table_path = os.path.join(d, "prepared_table.bin")
++            _write_table(table_path, b"\x00" * 64)
++
++            class Boom(_FakePleCache):
++                @staticmethod
++                def open_prepared_table(*args, **kwargs):
++                    # The helper owns cleanup until it returns an fd; this
++                    # caller-layer double therefore fails before transferring one.
++                    raise RuntimeError("helper refused before transferring fd")
++
++            sys.modules[_HELPER_MODULE] = Boom(_HELPER_MODULE)
++            before = self._open_fds()
++            with mock.patch.dict(
++                os.environ, self._prepared_env(table_path, "22" * 32), clear=False
++            ):
++                with self.assertRaises(RuntimeError):
++                    allocate_ple_host_table(
++                        (64, 1), torch.float8_e4m3fn, "file", d, tag="rows0-64"
++                    )
++            leaks = self._open_fds() - before
++            self.assertEqual(leaks, set(), f"fd leaked on failure: {leaks}")
++            # The legacy table was NOT created as a fallback.
++            legacy = ple_table_file_name((64, 1), torch.float8_e4m3fn, "rows0-64")
++            self.assertFalse(os.path.exists(os.path.join(d, legacy)))
++
++
++def _fake_source_embedding(rows=256, width=1, weight_scale_value=1.0):
++    """Minimal source for Qwen4ExpPinnedHostEmbedding.__init__ (real one)."""
++    src = types.SimpleNamespace()
++    src.quant_method = _unquantized_method()
++    src.quant_config = None
++    src.num_added_embeddings_per_partition = 0
++    src.weight = torch.nn.Parameter(
++        torch.zeros(rows, width, dtype=torch.float8_e4m3fn), requires_grad=False
++    )
++    src.num_added_embeddings = 0
++    src.embedding_dim = width
++    src.enable_tp = False
++    src.use_attn_tp_group = False
++    src.tp_size = 1
++    src.num_embeddings = rows
++    src.org_vocab_size = rows
++    src.padding_size = 0
++    src.use_presharded_weights = False
++    src.org_vocab_size_padded = rows
++    src.num_embeddings_padded = rows
++    src.num_embeddings_per_partition = rows
++    src.num_org_embeddings_per_partition = rows
++    src.shard_indices = types.SimpleNamespace(
++        org_vocab_start_index=0, org_vocab_end_index=rows
++    )
++    src.weight_scale = torch.full((1,), weight_scale_value, dtype=torch.bfloat16)
++    return src
++
++
++def _unquantized_method():
++    from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
++
++    return UnquantizedEmbeddingMethod()
++
++
++class TestPreparedFlagPropagation(unittest.TestCase):
++    """Real embedding __init__: the flag must move onto the module object."""
++
++    def _build(self, prepared):
++        with tempfile.TemporaryDirectory() as d:
++            table_path = os.path.join(d, "prepared_table.bin")
++            _write_table(table_path, b"\x07" * 256)
++            env = self._prepared_env(table_path) if prepared else None
++            src = _fake_source_embedding(rows=256, width=1)
++            # Keep the aux init deterministic: prefetch off, RSS budget off.
++            with (
++                mock.patch.object(
++                    ple_table_mod.envs.SGLANG_QWEN4_PLE_FILE_PREFETCH,
++                    "get",
++                    return_value=False,
++                ),
++                mock.patch.object(
++                    ple_table_mod.envs.SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB,
++                    "get",
++                    return_value=0.0,
++                ),
++            ):
++                if env is not None:
++                    saved = _install_fake_helper()
++                    try:
++                        with mock.patch.dict(os.environ, env, clear=False):
++                            emb = Qwen4ExpPinnedHostEmbedding(
++                                src, backend="file", table_dir=d
++                            )
++                    finally:
++                        _restore_helper(saved)
++                else:
++                    emb = Qwen4ExpPinnedHostEmbedding(src, backend="file", table_dir=d)
++            self.assertIs(emb.weight_scale, src.weight_scale)
++            return emb, d
++
++    @staticmethod
++    def _prepared_env(table_path):
++        return {_PREPARED_PATH_ENV: table_path, _PREPARED_SHA_ENV: "33" * 32}
++
++    def test_prepared_flag_captured_onto_embedding_object(self):
++        emb, d = self._build(prepared=True)
++        # Captured before the Parameter wrapping (which drops tensor custom
++        # attributes): the embedding object carries it, the wrapped tensor
++        # does not need to.
++        self.assertTrue(emb._ple_prepared)
++        self.assertFalse(getattr(emb.weight, "_sglang_ple_prepared", False))
++        # Prefetcher/RSS-trimmer wiring stayed unconditional (both consulted
++        # the table regardless of prepared; budget/env patched off here).
++        self.assertIsNone(emb._file_prefetcher)
++        self.assertIsNone(emb._file_rss_trimmer)
++        self.assertEqual(emb.weight_scale.dtype, torch.bfloat16)
++        self.assertEqual(tuple(emb.weight_scale.shape), (1,))
++
++    def test_unprepared_flag_is_false(self):
++        emb, d = self._build(prepared=False)
++        self.assertFalse(emb._ple_prepared)
++        self.assertIsNone(emb._file_prefetcher)
++        self.assertIsNone(emb._file_rss_trimmer)
++
++
++def _make_fake_embedding(rows, width, prepared):
++    """Minimal stand-in for the module Qwen4ExpPinnedHostEmbedding shape that
++    _load_prepared_ple_shard consumes. NOT a core-integrity proof of the real
++    embedding construction (that is the TestPreparedFlagPropagation /
++    load_weights harness above)."""
++    emb = types.SimpleNamespace()
++    emb.weight = torch.nn.Parameter(
++        torch.zeros(rows, width, dtype=torch.float8_e4m3fn), requires_grad=False
++    )
++    emb.org_vocab_size = rows
++    emb.shard_indices = types.SimpleNamespace(
++        org_vocab_start_index=0, org_vocab_end_index=rows
++    )
++    emb.weight_scale = torch.ones(1, dtype=torch.bfloat16)
++    emb._ple_prepared = prepared
++    return emb
++
++
++_SHARD_NAME = "model.layers.3.ple.ple_embedding.ngram_embedding.shard_{}.weight"
++_SHARD_PREFIX = "model.layers.3.ple.ple_embedding.ngram_embedding.weight"
++
++
++class _MetadataOnlyShard:
++    def __init__(self, shape):
++        self.shape = shape
++        self.dtype = torch.float8_e4m3fn
++
++    def to(self, *args, **kwargs):
++        raise AssertionError("prepared shard payload must not be read/copied")
++
++    @property
++    def data(self):
++        raise AssertionError("prepared shard payload must not be read/copied")
++
++
++class TestCopyElisionShardLoad(unittest.TestCase):
++    """_load_prepared_ple_shard directly: strict validation + elision."""
++
++    def setUp(self):
++        self.rows, self.width, self.num_shards = 64, 16, 2
++        self.shard_rows = self.rows // self.num_shards
++        self.emb = _make_fake_embedding(self.rows, self.width, prepared=True)
++        self.shard = torch.full(
++            (self.shard_rows, self.width), 1.25, dtype=torch.float8_e4m3fn
++        )
++
++    def test_good_shard_copy_elided_but_registered(self):
++        emb = self.emb
++        reg = set()
++        ok = _load_prepared_ple_shard(
++            _SHARD_NAME.format(0),
++            _MetadataOnlyShard(self.shard.shape),
++            emb=emb,
++            num_shards=self.num_shards,
++            loaded_shard_params=reg,
++        )
++        self.assertTrue(ok)
++        self.assertEqual(reg, {_SHARD_PREFIX})
++        # Metadata-only input traps payload access, and destination bytes stay intact.
++        self.assertTrue(
++            torch.equal(
++                emb.weight.data.view(torch.uint8),
++                torch.zeros_like(emb.weight.data.view(torch.uint8)),
++            )
++        )
++
++    def test_last_shard_expected_row_range_accepted(self):
++        reg = set()
++        ok = _load_prepared_ple_shard(
++            _SHARD_NAME.format(self.num_shards - 1),
++            self.shard,
++            emb=self.emb,
++            num_shards=self.num_shards,
++            loaded_shard_params=reg,
++        )
++        self.assertTrue(ok)
++        self.assertEqual(reg, {_SHARD_PREFIX})
++
++    def test_unprepared_still_copies(self):
++        emb = _make_fake_embedding(self.rows, self.width, prepared=False)
++        model = _FakeQwen4ExpModel(emb, num_shards=self.num_shards)
++        loaded = model.load_weights([(_SHARD_NAME.format(0), self.shard)])
++        self.assertIn(_SHARD_PREFIX, loaded)
++        self.assertTrue(
++            torch.equal(emb.weight[: self.shard_rows].float(), self.shard.float())
++        )
++
++    def test_bad_shape_fails_closed(self):
++        reg = set()
++        before = self.emb.weight.detach().view(torch.uint8).clone()
++        bad = torch.full(
++            (self.shard_rows, self.width + 8), 1.0, dtype=torch.float8_e4m3fn
++        )
++        with self.assertRaises(ValueError):
++            _load_prepared_ple_shard(
++                _SHARD_NAME.format(0),
++                bad,
++                emb=self.emb,
++                num_shards=self.num_shards,
++                loaded_shard_params=reg,
++            )
++        self.assertEqual(reg, set())
++        self.assertTrue(torch.equal(self.emb.weight.view(torch.uint8), before))
++
++    def test_bad_dtype_fails_closed(self):
++        reg = set()
++        with self.assertRaises(ValueError):
++            _load_prepared_ple_shard(
++                _SHARD_NAME.format(0),
++                self.shard.to(torch.bfloat16),
++                emb=self.emb,
++                num_shards=self.num_shards,
++                loaded_shard_params=reg,
++            )
++        self.assertEqual(reg, set())
++
++    def test_leading_zero_shard_name_fails_closed(self):
++        reg = set()
++        with self.assertRaises(ValueError):
++            _load_prepared_ple_shard(
++                _SHARD_NAME.format(0).replace("shard_0.", "shard_00."),
++                self.shard,
++                emb=self.emb,
++                num_shards=self.num_shards,
++                loaded_shard_params=reg,
++            )
++        self.assertEqual(reg, set())
++
++    def test_out_of_range_shard_id_fails_closed(self):
++        reg = set()
++        with self.assertRaises(ValueError):
++            _load_prepared_ple_shard(
++                _SHARD_NAME.format(self.num_shards),
++                self.shard,
++                emb=self.emb,
++                num_shards=self.num_shards,
++                loaded_shard_params=reg,
++            )
++        self.assertEqual(reg, set())
++
++    def test_wrong_row_count_for_shard_range_fails_closed(self):
++        reg = set()
++        short = torch.full(
++            (self.shard_rows - 1, self.width), 1.0, dtype=torch.float8_e4m3fn
++        )
++        with self.assertRaises(ValueError):
++            _load_prepared_ple_shard(
++                _SHARD_NAME.format(self.num_shards - 1),
++                short,
++                emb=self.emb,
++                num_shards=self.num_shards,
++                loaded_shard_params=reg,
++            )
++        self.assertEqual(reg, set())
++
++    def test_non_shard_name_return_false(self):
++        self.assertFalse(
++            _load_prepared_ple_shard(
++                "model.layers.3.ple.ple_embedding.layer_multipliers",
++                self.shard,
++                emb=self.emb,
++                num_shards=self.num_shards,
++                loaded_shard_params=set(),
++            )
++        )
++
++
++class _FakeQwen4ExpModel:
++    """Exposes exactly what Qwen4ExpForConditionalGeneration.load_weights
++    consumes for PLE shard + weight_scale weights. NOT a full model."""
++
++    _scale_name = "model.layers.3.ple.ple_embedding.ngram_embedding.weight_scale"
++    _mod_prefix = "model.layers.3.ple.ple_embedding"
++
++    def __init__(self, emb, num_shards=2):
++        self.config = types.SimpleNamespace(
++            text_config=types.SimpleNamespace(split_ngram_parts=num_shards),
++            tie_word_embeddings=False,
++            num_experts=None,
++            encoder_only=False,
++        )
++        self.language_model_only = False
++        self.start_layer = 0
++        self.end_layer = 100
++        self.pp_group = types.SimpleNamespace(is_last_rank=True)
++        self._scale_buffer = torch.ones(1, dtype=torch.bfloat16)
++        ple_mod = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
++        torch.nn.Module.__init__(ple_mod)
++        ple_mod.ngram_embedding = emb
++        self._ple_mod = ple_mod
++
++    load_weights = Qwen4ExpForConditionalGeneration.load_weights
++    _load_qwen4_exp_ple_buffer = (
++        Qwen4ExpForConditionalGeneration._load_qwen4_exp_ple_buffer
++    )
++
++    def named_parameters(self, remove_duplicate=False):
++        return []
++
++    def named_buffers(self):
++        return [(self._scale_name, self._scale_buffer)]
++
++    def named_modules(self):
++        return [(self._mod_prefix, self._ple_mod)]
++
++    def modules(self):
++        return [self]
++
++
++class TestLoadWeightsCopyElision(unittest.TestCase):
++    """Real load_weights on a minimal fake model (CPU, no CUDA imports)."""
++
++    def _shard_weight(self, value=1.25):
++        return torch.full((32, 16), value, dtype=torch.float8_e4m3fn)
++
++    def _scale_weight(self, value=2.5):
++        return torch.full((1,), value, dtype=torch.bfloat16)
++
++    def test_prepared_shard_elided_registered_and_scale_loaded(self):
++        emb = _make_fake_embedding(64, 16, prepared=True)
++        model = _FakeQwen4ExpModel(emb, num_shards=2)
++        loaded = model.load_weights(
++            [
++                (_SHARD_NAME.format(0), self._shard_weight()),
++                (model._scale_name, self._scale_weight()),
++            ]
++        )
++        # Shard registered (via loaded_shard_params) and scale buffer path ran.
++        self.assertIn(_SHARD_PREFIX, loaded)
++        self.assertIn(model._scale_name, loaded)
++        # The BF16 [1] scale buffer actually received the checkpoint value.
++        self.assertAlmostEqual(model._scale_buffer.item(), 2.5, places=6)
++        # Copy elided: the registered table payload was not touched.
++        self.assertTrue(
++            torch.equal(
++                emb.weight.data.view(torch.uint8),
++                torch.zeros_like(emb.weight.data.view(torch.uint8)),
++            )
++        )
++
++    def test_unprepared_shard_copies_normally(self):
++        emb = _make_fake_embedding(64, 16, prepared=False)
++        model = _FakeQwen4ExpModel(emb, num_shards=2)
++        shard = self._shard_weight()
++        loaded = model.load_weights(
++            [(_SHARD_NAME.format(0), shard), (model._scale_name, self._scale_weight())]
++        )
++        self.assertIn(_SHARD_PREFIX, loaded)
++        self.assertIn(model._scale_name, loaded)
++        self.assertTrue(torch.equal(emb.weight.data[:32].float(), shard.float()))
++
++    def test_prepared_bad_shape_aborts(self):
++        emb = _make_fake_embedding(64, 16, prepared=True)
++        model = _FakeQwen4ExpModel(emb, num_shards=2)
++        bad = torch.full((32, 24), 1.0, dtype=torch.float8_e4m3fn)
++        with self.assertRaises(ValueError):
++            model.load_weights([(_SHARD_NAME.format(0), bad)])
++
++    def test_prepared_bad_dtype_aborts(self):
++        emb = _make_fake_embedding(64, 16, prepared=True)
++        model = _FakeQwen4ExpModel(emb, num_shards=2)
++        with self.assertRaises(ValueError):
++            model.load_weights(
++                [(_SHARD_NAME.format(0), self._shard_weight().to(torch.bfloat16))]
++            )
++
++    def test_prepared_leading_zero_name_aborts(self):
++        emb = _make_fake_embedding(64, 16, prepared=True)
++        model = _FakeQwen4ExpModel(emb, num_shards=2)
++        bad_name = _SHARD_NAME.format(0).replace("shard_0.", "shard_00.")
++        with self.assertRaises(ValueError):
++            model.load_weights([(bad_name, self._shard_weight())])
++
++    def test_prepared_out_of_range_id_aborts(self):
++        emb = _make_fake_embedding(64, 16, prepared=True)
++        model = _FakeQwen4ExpModel(emb, num_shards=2)
++        with self.assertRaises(ValueError):
++            model.load_weights([(_SHARD_NAME.format(2), self._shard_weight())])
++
++
++class TestPreparedClosure(_HelperDoubleMixin, unittest.TestCase):
++    def test_shape_and_tag_are_literal_not_coerced(self):
++        with tempfile.TemporaryDirectory() as d:
++            with mock.patch.dict(os.environ, _PREPARED_ENV, clear=False):
++                for shape, tag in [
++                    ((True, 16), "rows0-1"),
++                    ((16.0, 16), "rows0-16"),
++                    ((16, 16, 1), "rows0-256"),
++                    ((0, 16), "rows0-0"),
++                    ((16, 16), "rows00-16"),
++                    ((16, 16), "rows0-016"),
++                ]:
++                    with self.assertRaises(ValueError):
++                        allocate_ple_host_table(
++                            shape, torch.float8_e4m3fn, "file", d, tag=tag
++                        )
++            self.assertIsNone(_FakePleCache.last_call)
++            self.assertEqual(os.listdir(d), [])
++
++    def test_bad_fd_size_cannot_truncate_or_extend_a_table(self):
++        with tempfile.TemporaryDirectory() as d:
++            table_path = os.path.join(d, "wrong-size.bin")
++            _write_table(table_path, b"original")
++            with mock.patch.dict(
++                os.environ,
++                {_PREPARED_PATH_ENV: table_path, _PREPARED_SHA_ENV: "a" * 64},
++            ):
++                with mock.patch.object(
++                    torch,
++                    "from_file",
++                    side_effect=AssertionError("must reject before mmap"),
++                ):
++                    with self.assertRaises(ValueError):
++                        allocate_ple_host_table(
++                            (64, 1), torch.float8_e4m3fn, "file", d, tag="rows0-64"
++                        )
++            with open(table_path, "rb") as stream:
++                self.assertEqual(stream.read(), b"original")
++
++    def test_returned_fd_closed_when_mapping_fails(self):
++        with tempfile.TemporaryDirectory() as d:
++            path = os.path.join(d, "table.bin")
++            _write_table(path, b"x" * 64)
++            owned = []
++            original = _FakePleCache.open_prepared_table
++
++            def opened(*args, **kwargs):
++                fd = original(*args, **kwargs)
++                owned.append(fd)
++                return fd
++
++            with mock.patch.dict(
++                os.environ, {_PREPARED_PATH_ENV: path, _PREPARED_SHA_ENV: "a" * 64}
++            ):
++                with mock.patch.object(
++                    _FakePleCache, "open_prepared_table", staticmethod(opened)
++                ):
++                    with mock.patch.object(
++                        torch, "from_file", side_effect=RuntimeError("mmap failed")
++                    ):
++                        with self.assertRaises(RuntimeError):
++                            allocate_ple_host_table(
++                                (64, 1), torch.float8_e4m3fn, "file", d, tag="rows0-64"
++                            )
++            self.assertEqual(len(owned), 1)
++            with self.assertRaises(OSError):
++                os.fstat(owned[0])
++
++    def test_unprepared_bf16_load_behavior_is_preserved(self):
++        emb = _make_fake_embedding(64, 16, prepared=False)
++        emb.weight = torch.nn.Parameter(
++            torch.zeros(64, 16, dtype=torch.bfloat16), requires_grad=False
++        )
++        model = _FakeQwen4ExpModel(emb, num_shards=2)
++        shard = torch.full((32, 16), 1.25, dtype=torch.bfloat16)
++        loaded = model.load_weights([(_SHARD_NAME.format(0), shard)])
++        self.assertIn(_SHARD_PREFIX, loaded)
++        self.assertTrue(torch.equal(emb.weight[:32], shard))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/models/test_qwen4_prepared_interop.py b/test/registered/unit/models/test_qwen4_prepared_interop.py
+new file mode 100644
+index 0000000000..d690ec414f
+--- /dev/null
++++ b/test/registered/unit/models/test_qwen4_prepared_interop.py
+@@ -0,0 +1,164 @@
++"""Real PLE core -> verified descriptor -> native allocator/gather interoperability.
++
++Tiny deterministic FP8 fixtures only; this is not full-model qualification.
++"""
++
++import hashlib
++import json
++import os
++import struct
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.srt.models import qwen4_exp_ple_cache as core
++from sglang.srt.models.qwen4_exp import Qwen4ExpPinnedHostEmbedding
++from sglang.srt.models.qwen4_exp_ple_table import (
++    allocate_ple_host_table,
++    check_file_backend_supported,
++)
++from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
++
++PREFIX = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
++REVISION = "fc694b54fb0174e0913e6adf86691ef85a4ead47"
++
++
++def prepare_fixture(tmp_path):
++    model_root = tmp_path / "model"
++    model_root.mkdir(mode=0o700)
++    cache = tmp_path / "cache" / "ple" / REVISION
++    values = (
++        (torch.arange(32 * 160, dtype=torch.float32).reshape(32, 160) % 31) / 16 - 1
++    ).to(torch.float8_e4m3fn)
++    raw_rows = values.view(torch.uint8).numpy().tobytes()
++    body = b""
++    header = {}
++    # Physical order intentionally differs from logical row order.
++    for i in (1, 0):
++        data = raw_rows[i * 16 * 160 : (i + 1) * 16 * 160]
++        header[f"{PREFIX}.shard_{i}.weight"] = {
++            "dtype": "F8_E4M3",
++            "shape": [16, 160],
++            "data_offsets": [len(body), len(body) + len(data)],
++        }
++        body += data
++    scale = (
++        torch.tensor([2.0], dtype=torch.bfloat16).view(torch.uint8).numpy().tobytes()
++    )
++    header[PREFIX + ".weight_scale"] = {
++        "dtype": "BF16",
++        "shape": [1],
++        "data_offsets": [len(body), len(body) + len(scale)],
++    }
++    body += scale
++    encoded = json.dumps(header).encode()
++    source = model_root / "tiny-ple.safetensors"
++    source.write_bytes(struct.pack("<Q", len(encoded)) + encoded + body)
++    plan = core.build_plan(
++        str(source),
++        model_id="nvidia/Qwen3.8-Flash-Next-NVFP4",
++        model_revision=REVISION,
++        tensor_prefix=PREFIX,
++        shard_count=2,
++        rows_per_shard=16,
++        row_width=160,
++        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
++    )
++    cold = core.prepare_cache(str(model_root), str(cache), plan)
++    warm = core.prepare_cache(str(model_root), str(cache), plan)
++    assert cold["mode"] == "materialized" and cold["copied_bytes"] == len(raw_rows)
++    assert warm["mode"] == "reuse" and warm["copied_bytes"] == 0
++    assert (cache / plan["table"]["name"]).read_bytes() == raw_rows
++    return cache, plan, warm, values
++
++
++def handoff(monkeypatch, receipt):
++    monkeypatch.setenv("R0B0TLAB_PLE_PREPARED_PATH", receipt["receipt_path"])
++    monkeypatch.setenv("R0B0TLAB_PLE_PREPARED_SHA256", receipt["receipt_sha256"])
++
++
++def source_embedding():
++    fields: dict[str, object] = {
++        name: 0 for name in Qwen4ExpPinnedHostEmbedding._COPIED_ATTRIBUTES
++    }
++    fields.update(
++        quant_config=None,
++        quant_method=UnquantizedEmbeddingMethod(),
++        enable_tp=False,
++        use_attn_tp_group=False,
++        tp_size=1,
++        num_embeddings=32,
++        org_vocab_size=32,
++        org_vocab_size_padded=32,
++        num_embeddings_padded=32,
++        num_embeddings_per_partition=32,
++        num_org_embeddings_per_partition=32,
++        embedding_dim=160,
++        shard_indices=SimpleNamespace(org_vocab_start_index=0, org_vocab_end_index=32),
++        weight=torch.nn.Parameter(
++            torch.empty(32, 160, dtype=torch.float8_e4m3fn), requires_grad=False
++        ),
++        weight_scale=torch.tensor([2.0], dtype=torch.bfloat16),
++    )
++    return SimpleNamespace(**fields)
++
++
++def test_real_core_handoff_preserves_fp8_bytes_and_rejects_drift(tmp_path, monkeypatch):
++    cache, plan, receipt, values = prepare_fixture(tmp_path)
++    handoff(monkeypatch, receipt)
++    table = allocate_ple_host_table(
++        (32, 160), torch.float8_e4m3fn, "file", str(cache), tag="rows0-32"
++    )
++    assert table._sglang_ple_prepared is True
++    assert torch.equal(table.view(torch.uint8), values.view(torch.uint8))
++    os.utime(cache / plan["table"]["name"], ns=(10**18, 10**18))
++    with pytest.raises(core.PleCacheError):
++        allocate_ple_host_table(
++            (32, 160), torch.float8_e4m3fn, "file", str(cache), tag="rows0-32"
++        )
++
++
++@pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="native CUDA/HMM gather required"
++)
++def test_real_prepared_file_native_gather_and_graph_replay(tmp_path, monkeypatch):
++    check_file_backend_supported(torch.cuda.current_device())
++    cache, plan, receipt, values = prepare_fixture(tmp_path)
++    handoff(monkeypatch, receipt)
++    source = source_embedding()
++    embedding = Qwen4ExpPinnedHostEmbedding(
++        source, backend="file", table_dir=str(cache)
++    )
++    try:
++        assert embedding._ple_prepared is True
++        assert embedding._file_rss_trimmer is not None
++        assert embedding._file_prefetcher is not None
++        assert embedding.weight_scale is source.weight_scale
++        ids = torch.tensor([0, 15, 16, 31], dtype=torch.int64, device="cuda")
++        expected = values.float()[[0, 15, 16, 31]].to(torch.bfloat16)
++        torch.testing.assert_close(
++            embedding.gather(ids).cpu(), expected, rtol=0, atol=0
++        )
++        torch.cuda.synchronize()
++        stream = torch.cuda.Stream()
++        stream.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(stream):
++            for _ in range(3):
++                embedding.gather(ids)
++        torch.cuda.current_stream().wait_stream(stream)
++        torch.cuda.synchronize()
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            output = embedding.gather(ids)
++        for order in ([31, 16, 15, 0], [1, 17, 2, 18]):
++            ids.copy_(torch.tensor(order, dtype=torch.int64, device="cuda"))
++            graph.replay()
++            torch.cuda.synchronize()
++            reference = values.float()[order].to(torch.bfloat16)
++            torch.testing.assert_close(output.cpu(), reference, rtol=0, atol=0)
++    finally:
++        if embedding._file_prefetcher is not None:
++            embedding._file_prefetcher.close()
++        if embedding._file_rss_trimmer is not None:
++            embedding._file_rss_trimmer.close()
 diff --git a/test/registered/unit/models/test_shared_experts_fusion_gates.py b/test/registered/unit/models/test_shared_experts_fusion_gates.py
 index e94dc1bf52..4fe72f120d 100644
 --- a/test/registered/unit/models/test_shared_experts_fusion_gates.py
@@ -19481,6 +23217,112 @@ index e94dc1bf52..4fe72f120d 100644
          serialized = SimpleNamespace(
              get_name=lambda: "modelopt_fp4", is_checkpoint_nvfp4_serialized=True
          )
+diff --git a/test/registered/unit/multimodal/test_vit_graph_output_ownership.py b/test/registered/unit/multimodal/test_vit_graph_output_ownership.py
+new file mode 100644
+index 0000000000..3402d6f98f
+--- /dev/null
++++ b/test/registered/unit/multimodal/test_vit_graph_output_ownership.py
+@@ -0,0 +1,100 @@
++"""ViT graph outputs must outlive later replays and cache hits."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
++from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++
++def replay_runner(device, dtype=torch.float32):
++    """Exercise the production replay boundary with fixed graph-owned buffers."""
++    runner = object.__new__(ViTCudaGraphRunner)
++    source = torch.zeros((4, 1, 3), device=device, dtype=dtype)
++    output = torch.empty((4, 3), device=device, dtype=dtype)
++    runner.block_input = {"shape": source}
++    runner.block_output = {"shape": output}
++
++    def forward():
++        torch.add(source.squeeze(1), 7, out=output)
++
++    if device == "cuda":
++        stream = torch.cuda.Stream()
++        stream.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(stream):
++            for _ in range(3):
++                forward()
++        torch.cuda.current_stream().wait_stream(stream)
++        torch.cuda.synchronize()
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            forward()
++    else:
++        graph = SimpleNamespace(replay=forward)
++    runner.block_graphs = {"shape": graph}
++    return runner
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++@pytest.mark.parametrize("reorder", [False, True])
++def test_replay_result_is_stable_after_same_shape_replay(dtype, reorder):
++    runner = replay_runner("cpu", dtype)
++    first_input = torch.arange(12, dtype=dtype).reshape(4, 1, 3)
++    indices = torch.tensor([3, 1, 2, 0]) if reorder else None
++    first = runner.replay("shape", first_input, output_indices=indices)
++    expected = first_input.squeeze(1) + 7
++    if indices is not None:
++        expected = expected.index_select(0, indices)
++    second = runner.replay("shape", first_input + 100, output_indices=indices)
++    torch.testing.assert_close(first, expected, rtol=0, atol=0)
++    torch.testing.assert_close(second, expected + 100, rtol=0, atol=0)
++    assert first.untyped_storage().data_ptr() != second.untyped_storage().data_ptr()
++    assert (
++        first.untyped_storage().data_ptr()
++        != runner.block_output["shape"].untyped_storage().data_ptr()
++    )
++
++
++def test_caller_mutation_cannot_modify_graph_output_buffer():
++    runner = replay_runner("cpu")
++    result = runner.replay("shape", torch.ones(4, 1, 3))
++    result.zero_()
++    torch.testing.assert_close(runner.block_output["shape"], torch.full((4, 3), 8.0))
++
++
++def assert_cache_retains_distinct_images(device):
++    runner = replay_runner(device)
++    cache = MultiModalStaticCache(max_size=4096)
++    for image_hash, value in [(101, 1.0), (202, 2.0)]:
++        result = runner.replay("shape", torch.full((4, 1, 3), value, device=device))
++        assert cache.set(image_hash, EmbeddingResult(embedding=result))
++    # Another same-resolution image must not overwrite either cached image.
++    runner.replay("shape", torch.full((4, 1, 3), 3.0, device=device))
++    first = cache.get_single(101).embedding
++    second = cache.get_single(202).embedding
++    pair = torch.cat([first, second])
++    expected = torch.cat(
++        [
++            torch.full((4, 3), 8.0, device=device),
++            torch.full((4, 3), 9.0, device=device),
++        ]
++    )
++    torch.testing.assert_close(pair, expected, rtol=0, atol=0)
++    # A consumer may slice or mutate an independent return, not the graph buffer.
++    assert first.untyped_storage().data_ptr() != second.untyped_storage().data_ptr()
++    assert cache.current_size == 2 * 4 * 3 * 4
++
++
++def test_cached_images_survive_later_graph_replays():
++    assert_cache_retains_distinct_images("cpu")
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA graph required")
++def test_real_cuda_graph_cache_owns_distinct_image_outputs():
++    assert_cache_retains_distinct_images("cuda")
++    torch.cuda.synchronize()
 diff --git a/test/registered/unit/server_args/test_server_args.py b/test/registered/unit/server_args/test_server_args.py
 index aa2230effa..e8db519fb5 100644
 --- a/test/registered/unit/server_args/test_server_args.py

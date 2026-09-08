@@ -39,10 +39,13 @@ Model weights are never part of the Docker context.
 
 ## Packaging-only retry from a retained native wheel
 
-The complete source inventory retains all 3,624 tracked Python files. The
-installed-wheel audit omits exactly two upstream `.claude` developer-skill
-helpers that setuptools does not distribute; neither is SRT/runtime code.
-The wheel contains all 3,622 required package source files byte-for-byte,
+The reconstructed source tree and patch retain all tracked source. The
+SGLang package-source audit covers 3,625 Python files; the existing
+`kernels/aot/` exclusion is the separately packaged sgl-kernel source subtree,
+not an omission from source reconstruction. The installed-wheel audit omits
+exactly two upstream `.claude` developer-skill helpers that setuptools does
+not distribute; neither is SRT/runtime code.
+The wheel contains all 3,623 required package source files byte-for-byte,
 plus generated `_version.py` checked through installed package metadata.
 Omitting any runtime source is still a hard failure.
 

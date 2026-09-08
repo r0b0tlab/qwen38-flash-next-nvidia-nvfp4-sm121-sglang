@@ -1,6 +1,7 @@
 {
   "base_image": "lmsysorg/sglang@sha256:c28dc8335134ad8142052f7463acdbe6a60ffe80cddc57fd5288787b88f4c6c2",
   "base_image_id": "sha256:d784d888c11c2370f752f4b32df93961b061b1755be4920adb5a28c087d78188",
+  "ple_plan_sha256": "f4bcbe3e5c5a8586129ff14f6993f17631b632168a7f7f178817969a238e13a2",
   "q200_driver": {
     "sha256": "cac0513ca9bfcf5bbaa8ef55b0b14f1bda86262faf3ab9557f7a90d49aa6bccf",
     "upstream_commit": "7bfacc510506e955a1392f94b87213b798e45e51",
@@ -16,10 +17,10 @@
   ],
   "schema": "r0b0tlab.qwen38fn.runtime.v1",
   "sglang": {
-    "commit": "f693018251d41ce915f674bd800ba41332988206",
+    "commit": "85ce7c16afac3d701e9edcff36aed599ff437870",
     "main": "20ca564bf77518604b89dc9f7fdba640daabd88b",
-    "package_version": "0.5.19+sm121.gf693018251d4",
-    "patch_sha256": "22885e974f11d17feb7e0bcfb94bf8fa341829cf96dd74925ee9274aa3e71ed8",
+    "package_version": "0.5.19+sm121.g85ce7c16afac",
+    "patch_sha256": "045ad1b37db978424ce351cda08d474542985b6ee3ff2b9e7f6c1af178b7798b",
     "python_files": {
       "__init__.py": "0c6bd1b5bc75da013d49d26f7799ca36d682779293405dce1adc193b97a0e6bd",
       "_platform_stubs.py": "79315697f34c57d0809973e32fa68fa89b4260d3d3271a2e0fcfdaa516a339e2",
@@ -3149,9 +3150,10 @@
       "srt/models/qwen3_rm.py": "07a12c16cdab6a97ed7896aee9dfbfe746591816aece1ab4181ed1d5891a1166",
       "srt/models/qwen3_vl.py": "7b03b47a768bf66faee43a8b0fccbfa3d1d0823a9178591836ad2361826dbc2c",
       "srt/models/qwen3_vl_moe.py": "1bd9245b10257fd7f3ab2191fe035e325b829f1b1bcee13babf68d7916c323ea",
-      "srt/models/qwen4_exp.py": "92b3e2e06e1190e390cd7c695b6d4ecd3ee42e4d030f6c894d69ae11df7b817a",
+      "srt/models/qwen4_exp.py": "825742592b01be15c74e36c48da215df2be1e94154dc425f30d9a76f33a2259e",
       "srt/models/qwen4_exp_mtp.py": "243531fbb3d256fff68db299a2f902ba3cc38227735f2ab0a90fb5be311f9f60",
-      "srt/models/qwen4_exp_ple_table.py": "6a9d5cb9cd13956dc0a2d39635542dee726c6060fe16db4c2b774955fca64756",
+      "srt/models/qwen4_exp_ple_cache.py": "cb63c6c2b7efdb0fa0c7c93c7d70f113adcf20ef9948240343b76d2036f7ee2b",
+      "srt/models/qwen4_exp_ple_table.py": "dcd7a75f58aee119d05f6efc468a4fd30fdabd104a3ddfa9a325d17909f14b86",
       "srt/models/radio.py": "a9b433efe68b8450101ccd0ed4439fb212f61539de8afb9c466aaf3a5da3c9c9",
       "srt/models/registry.py": "b3e87b0135e8326c63bb2cf8dbfd851b777e4321b9f87058a62177b0fa5231b6",
       "srt/models/roberta.py": "07798ca31580d2d440fe41a3dc14e0f6fa6bc858027f73f5c2751c25fcd55746",
@@ -3269,7 +3271,7 @@
       "srt/multimodal/transport/__init__.py": "5ada54db0cf95b53fc4452bb2f2bb1a08d7e9e3d51d8736bd0e1914ae453d65c",
       "srt/multimodal/transport/cuda_ipc.py": "664d87e201dfd9831de8d4f615dc6bcf6413d21f50a0c3c0b2b7bd7ab7a0e720",
       "srt/multimodal/transport/memory_pool.py": "56ffd932157fd0f9aeefb68e8b1b84bb0e1e2e696424e99b488b22e5f4e7347c",
-      "srt/multimodal/vit_cuda_graph_runner.py": "8090a3f1e8ded2f53d0f38288fd801035422f4a73442f50e76fc41dc03971c3c",
+      "srt/multimodal/vit_cuda_graph_runner.py": "9f5ce583d5b7c4e4e78078eb950019abd19db8dcce8853fddfd375536f62a99b",
       "srt/multiplex/multiplexing_mixin.py": "132be1bfc3595013c1f31d0275b0039a8a2c9fca7b948ef2c9f7cdea6f74d5e3",
       "srt/multiplex/pdmux_context.py": "1ce3a20c12c9bcca6108093e368cb9a40d631c3930c02384666ecd30341a2608",
       "srt/observability/cpu_monitor.py": "61ee5b561c432abe4e3a86dd0a09715c82d79dbab7781e0568615bf34d65aec1",
@@ -3646,15 +3648,15 @@
       "utils.py": "8e453ae5a32c045cc7f9ee842081e727fbede9ab9c88536ebb299eb122ad8ed8",
       "version.py": "b10f7d9ea276972352b1e9de0eb0bbb47d8ebe64c29469e15ea016a12019bb22"
     },
-    "wheel_omissions": [
-      "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py",
-      "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py"
-    ],
     "source_audit_exclusions": [
       "kernels/aot/",
       "_version.py"
     ],
-    "tree": "fe0c805f46b707bf2a73c1fcd35fa3c27f3c4c6d"
+    "tree": "00308123bae99bc25f2f9d679869e3ef968d9d97",
+    "wheel_omissions": [
+      "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py",
+      "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py"
+    ]
   },
   "status": "UNQUALIFIED_BUILD_INPUTS"
 }
