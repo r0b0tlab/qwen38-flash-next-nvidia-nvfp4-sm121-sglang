@@ -52,6 +52,26 @@ def dependency_violations(packages, environment):
     return errors
 
 
+def verify_jit_temporary_directory(root):
+    """Compile and dlopen a bounded native library in the runtime temp location."""
+    import ctypes
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="jit-exec-probe-", dir=root) as directory:
+        output = Path(directory) / "probe.so"
+        subprocess.run(
+            ["cc", "-shared", "-fPIC", "-x", "c", "-o", str(output), "-"],
+            input="int r0b0tlab_jit_probe(void) { return 121; }",
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        library = ctypes.CDLL(str(output))
+        assert library.r0b0tlab_jit_probe() == 121, "native JIT DSO execution failed"
+    return "PASS"
+
+
 def verify(root, phase):
     dependencies = json.loads((root / "locks/dependencies.json").read_text())
     runtime = json.loads((root / "locks/runtime.json").read_text())
@@ -131,6 +151,7 @@ def verify(root, phase):
             module = importlib.import_module(name)
             modules.append({"name": name, "path": getattr(module, "__file__", None)})
         for key in (
+            "TMPDIR",
             "HOME",
             "HF_HOME",
             "SGLANG_CACHE_DIR",
@@ -144,6 +165,8 @@ def verify(root, phase):
             with probe.open("xb") as stream:
                 stream.write(b"owned cache probe")
             probe.unlink()
+        assert os.environ["TMPDIR"] == "/cache/tmp"
+        verify_jit_temporary_directory(Path(os.environ["TMPDIR"]))
     return {
         "status": "ENVIRONMENT_CHECK_PASS",
         "phase": phase,
