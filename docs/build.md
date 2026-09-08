@@ -62,6 +62,39 @@ wrapper revision. Do not reuse a wheel after changing its source, toolchain,
 package version or native build inputs. The cold Dockerfile still rebuilds
 the native extensions for the final clean-rebuild gate.
 
+## Verified PLE startup
+
+`locks/ple.json` records the exact checkpoint-derived FP8 table layout and
+content hashes. The entrypoint binds it to `locks/sources.json` and the
+fixed model geometry, then calls the installed SGLang preparation core before
+starting the server. `--print` remains pure and neither imports the core nor
+reads the PLE plan.
+
+Preparation verifies the source and populated table with bounded reads.
+An existing table is eligible for reuse only after full-content verification;
+a reused filename or plausible size is insufficient. Cold population uses
+bounded ordinary file I/O into a private temporary table, with space admission
+for that complete temporary file and a reserve, followed by data/directory
+synchronization and atomic publication. It does not overwrite the table via
+an inference-oriented random-access mmap or disable the memory guard. Numeric
+shard order is distinct from physical checkpoint order and must be preserved.
+
+The fresh `receipt_path` and `receipt_sha256` returned by the core overwrite
+both internal `R0B0TLAB_PLE_PREPARED_*` environment values before exec. Malformed
+plans, source mismatches, preparation errors, stale caller-supplied handoffs,
+and invalid return values cannot reach server exec. The native consumer must
+verify that handoff and map the verified descriptor, retaining FP8 scale
+loading, host-page-table checks, random-gather advice and RSS trimming.
+
+The real legacy table was independently matched against all 128 canonical
+checkpoint shards (table SHA256
+`b070f9644adf93794d8a1030584ab705809387e64396a9327a68fa3a3a6666b3`).
+This is integrity evidence, not optimized startup or serving qualification.
+The earlier AR attempt remains failed on its multi-image semantic case; its
+results cannot qualify a changed source tree or image. Real core/entrypoint
+interoperability, cold/warm startup measurements, corrected ViT graph/cache
+semantics and full model requalification are required before release.
+
 ## Native build, only after review/resource admission
 
 Run under one durable build owner with a fresh log/evidence directory. The

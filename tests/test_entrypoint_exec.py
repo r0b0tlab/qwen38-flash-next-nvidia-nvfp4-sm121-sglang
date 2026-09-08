@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -64,55 +63,16 @@ def test_inconsistent_frozen_profile_is_rejected():
 
 
 def test_module_really_executes_server_with_safe_environment(tmp_path):
-    profile = tmp_path / "profile.json"
-    sources = tmp_path / "sources.json"
-    profile.write_text(json.dumps(BASE))
-    sources.write_text(json.dumps(SOURCES))
-    capture = tmp_path / "captured.json"
-    executable = tmp_path / "sglang"
-    executable.write_text(
-        "#!"
-        + sys.executable
-        + '\nimport json, os, sys\nfrom pathlib import Path\nPath(os.environ["CAPTURE_PATH"]).write_text(json.dumps({"argv":sys.argv[1:],"env":{k:os.environ.get(k) for k in ["TMPDIR","MAX_JOBS","FLASHINFER_NVCC_THREADS","SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK","SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH"]}}))\n'
-    )
-    executable.chmod(0o700)
-    # Model only the container's /cache/tmp filesystem boundary, never create
-    # /cache on the host. The real -m entrypoint still owns directory policy.
-    mapped = tmp_path / "jit-temp"
-    startup = tmp_path / "sitecustomize.py"
-    startup.write_text(
-        "import os\n_makedirs=os.makedirs\n_open=os.open\ndef mapped(p):\n return os.environ['TEST_JIT_TMP'] if str(p)=='/cache/tmp' else p\nos.makedirs=lambda p,*a,**k:_makedirs(mapped(p),*a,**k)\nos.open=lambda p,*a,**k:_open(mapped(p),*a,**k)\n"
-    )
-    env = {
-        **os.environ,
-        "PYTHONPATH": str(tmp_path)
-        + os.pathsep
-        + str(Path(__file__).resolve().parents[1]),
-        "TEST_JIT_TMP": str(mapped),
-        "TMPDIR": "/tmp/untrusted",
-        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
-        "CAPTURE_PATH": str(capture),
-        "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK": "1",
-    }
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "runtime.entrypoint",
-            "--profile",
-            str(profile),
-            "--sources",
-            str(sources),
-        ],
-        cwd=Path(__file__).resolve().parents[1],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
+    # Share the exact filesystem-mapped CLI fixture; the server is still a
+    # real executable reached through -m runtime.entrypoint and os.execvpe.
+    from tests.test_ple_entrypoint import TABLE_SHA, _run_real_exec, make_plan
+
+    result, capture, ple_mapped = _run_real_exec(tmp_path, make_plan())
     assert result.returncode == 0, result.stderr
     assert capture.exists(), "module returned without execing the server"
+    mapped = tmp_path / "jit-temp"
     assert mapped.is_dir() and mapped.stat().st_mode & 0o777 == 0o700
+    assert (ple_mapped / "calls.json").is_file()
     data = json.loads(capture.read_text())
     assert data["argv"][0] == "serve"
     assert data["argv"][data["argv"].index("--tp-size") + 1] == "1"
@@ -122,6 +82,8 @@ def test_module_really_executes_server_with_safe_environment(tmp_path):
         "FLASHINFER_NVCC_THREADS": "1",
         "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK": "0",
         "SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH": "0",
+        "R0B0TLAB_PLE_PREPARED_PATH": ep.ple_dir(SHA) + "/prepared.json",
+        "R0B0TLAB_PLE_PREPARED_SHA256": TABLE_SHA,
     }
 
 
