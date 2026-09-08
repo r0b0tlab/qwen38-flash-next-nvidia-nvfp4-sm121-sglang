@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 from scripts.benchmark_evidence import input_hash, load_manifest
 from scripts.runtime_context import verify_http_epoch
 from scripts.upstream_capture import MODEL_ID, install_capture
+from scripts.cache_reporting_contract import validate as validate_cache_contract
 
 
 def admit_tokenizer(manifest, tokenizer_dir):
@@ -94,6 +95,8 @@ def upstream_arguments(manifest, lane, repeat, tokenizer_dir, output):
 def run_round(manifest, lane, repeat, tokenizer_dir, output, *, allow_cold_flush=False):
     if not allow_cold_flush:
         raise ValueError("explicit allow_cold_flush required for this owned runtime")
+    cache_contract = manifest.get("cache_reporting_contract")
+    validate_cache_contract(cache_contract)
     raw_path = output.with_suffix(output.suffix + ".upstream.jsonl")
     capture_dir = output.with_suffix(output.suffix + ".capture")
     if output.exists() or raw_path.exists() or capture_dir.exists():
@@ -141,7 +144,11 @@ def run_round(manifest, lane, repeat, tokenizer_dir, output, *, allow_cold_flush
     output.parent.mkdir(parents=True, exist_ok=True)
     capture_dir.mkdir(exist_ok=False)
     records, patch_sha = install_capture(
-        upstream, payloads, capture_dir, manifest["benchmark_module_sha256"]
+        upstream,
+        payloads,
+        capture_dir,
+        manifest["benchmark_module_sha256"],
+        cache_contract=cache_contract,
     )
     old_argv = sys.argv
     old_get_tokenizer, old_check_template = (

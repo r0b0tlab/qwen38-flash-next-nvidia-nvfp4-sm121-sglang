@@ -13,13 +13,21 @@ import os
 from pathlib import Path
 
 from .benchmark_evidence import input_hash
+from . import cache_reporting_contract
 
 MODEL_ID = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 MAX_WIRE_BYTES = 4 * 1024 * 1024
 
 
 class CaptureRecord:
-    def __init__(self, expected, index, warmup, directory, sequence=0):
+    def __init__(
+        self, expected, index, warmup, directory, sequence=0, *, cache_contract=None
+    ):
+        self.zero_elision_verified = (
+            cache_reporting_contract.validate(cache_contract)
+            if cache_contract is not None
+            else False
+        )
         if (
             expected.get("model") != MODEL_ID
             or not isinstance(expected.get("prompt"), list)
@@ -35,6 +43,7 @@ class CaptureRecord:
         self.finish_reason = None
         self.models = set()
         self.cache_details = None
+        self.cache_details_seen = False
         self.saw_done = False
         self.errors = []
         self.bytes_received = 0
@@ -93,12 +102,16 @@ class CaptureRecord:
             and choices[0].get("finish_reason") is not None
         ):
             self.finish_reason = choices[0]["finish_reason"]
-        extension = data.get("sglext") or {}
-        if (
-            isinstance(extension, dict)
-            and extension.get("cached_tokens_details") is not None
-        ):
-            self.cache_details = extension["cached_tokens_details"]
+        extension = data.get("sglext")
+        if extension is not None:
+            if not isinstance(extension, dict):
+                self.errors.append("invalid_sglext")
+            elif "cached_tokens_details" in extension:
+                details = extension["cached_tokens_details"]
+                if self.cache_details_seen and details != self.cache_details:
+                    self.errors.append("changing_cache_details")
+                self.cache_details_seen = True
+                self.cache_details = details
 
     def done(self):
         self.saw_done = True
@@ -135,6 +148,7 @@ class CaptureRecord:
             ):
                 self.errors.append("usage_total_mismatch")
         cached = None
+        cache_source = None
         if isinstance(self.cache_details, dict) and all(
             type(self.cache_details.get(k)) is int and self.cache_details[k] >= 0
             for k in ("device", "host")
@@ -146,6 +160,25 @@ class CaptureRecord:
                     + self.cache_details["host"]
                     + (storage or 0)
                 )
+                cache_source = "explicit_sglext"
+        if (
+            cached is None
+            and not self.cache_details_seen
+            and self.zero_elision_verified
+            and self.expected.get("return_cached_tokens_details") is True
+            and not self.errors
+            and output.success is True
+        ):
+            # The pinned chain reports every positive hit and elides only zero.
+            # Keep raw absence intact and label the interpretation explicitly.
+            cached = 0
+            cache_source = "pinned_sglang_zero_elision"
+        if self.usage and isinstance(self.usage.get("prompt_tokens_details"), dict):
+            aggregate = self.usage["prompt_tokens_details"].get("cached_tokens")
+            if aggregate is not None and (
+                type(aggregate) is not int or aggregate < 0 or aggregate != cached
+            ):
+                self.errors.append("contradictory_cache_usage")
         if cached is None:
             self.errors.append("cache_observation_missing")
         elif cached and not self.warmup:
@@ -182,6 +215,10 @@ class CaptureRecord:
             "finish_reason": self.finish_reason,
             "cache_details": self.cache_details,
             "cached_tokens": cached,
+            "cache_observation_source": cache_source,
+            "cache_reporting_contract": cache_reporting_contract.SCHEMA
+            if self.zero_elision_verified
+            else None,
             "model_ids": sorted(self.models),
             "saw_done": self.saw_done,
             "wire_file": self.path.name,
@@ -228,7 +265,11 @@ def instrument_source(text):
     return text
 
 
-def install_capture(upstream, payloads, directory, expected_module_sha256):
+def install_capture(
+    upstream, payloads, directory, expected_module_sha256, *, cache_contract=None
+):
+    if cache_contract is not None:
+        cache_reporting_contract.validate(cache_contract)
     path = Path(upstream.__file__)
     if hashlib.sha256(path.read_bytes()).hexdigest() != expected_module_sha256:
         raise ValueError("upstream benchmark source differs from frozen runtime")
@@ -264,7 +305,9 @@ def install_capture(upstream, payloads, directory, expected_module_sha256):
             expected["max_tokens"] = 32
         elif request_func_input.output_len != expected["max_tokens"]:
             raise ValueError("upstream output budget drift")
-        record = CaptureRecord(expected, index, warmup, directory, sequence)
+        record = CaptureRecord(
+            expected, index, warmup, directory, sequence, cache_contract=cache_contract
+        )
         sequence += 1
         token = current.set(record)
         try:

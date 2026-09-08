@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 from scripts import bench_real, compare, niah, vision_bench
 from scripts.benchmark_evidence import input_hash
 from scripts.runtime_context import verify_http_epoch
+from scripts.cache_reporting_contract import from_runtime_lock
 
 MODEL_ID = niah.MODEL_ID
 
@@ -158,6 +159,7 @@ def compose_manifest(
         "capture_adapter_sha256": hashlib.sha256(
             (ROOT / "scripts/upstream_capture.py").read_bytes()
         ).hexdigest(),
+        "cache_reporting_contract": from_runtime_lock(runtime_lock),
         "sampling": {
             "text": {"temperature": 0.0, "top_p": 1.0, "enable_thinking": False},
             "vision": {"temperature": 0.0, "top_p": 1.0, **vision_bench.THINKING},

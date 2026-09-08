@@ -23,6 +23,7 @@ def test_real_cli_uses_frozen_ids_and_observed_lengths(tmp_path, monkeypatch):
     from scripts import run_upstream_round as driver
     from scripts.freeze_benchmark import upstream_payload
     from scripts.benchmark_evidence import input_hash
+    from scripts.cache_reporting_contract import from_runtime_lock
 
     payloads = [upstream_payload([i + 2] * 512, 256) for i in range(8)]
     manifest = {
@@ -30,6 +31,11 @@ def test_real_cli_uses_frozen_ids_and_observed_lengths(tmp_path, monkeypatch):
         "requests": {"short": payloads},
         "inputs": {"short": {"batch": input_hash(payloads)}},
         "seed": 20260907,
+        "cache_reporting_contract": from_runtime_lock(
+            json.loads(
+                (Path(driver.__file__).parents[1] / "locks/runtime.json").read_text()
+            )
+        ),
         "manifest_sha256": "f" * 64,
         "capture_adapter_sha256": hashlib.sha256(
             (Path(driver.__file__).parent / "upstream_capture.py").read_bytes()
@@ -63,7 +69,6 @@ def test_real_cli_uses_frozen_ids_and_observed_lengths(tmp_path, monkeypatch):
                     item = {
                         "model": driver.MODEL_ID,
                         "choices": [{"text": text, "finish_reason": finish}],
-                        "sglext": {"cached_tokens_details": {"device": 0, "host": 0}},
                     }
                     yield ("data: " + json.dumps(item) + "\n\n").encode()
                 n = len(self.payload["prompt"])

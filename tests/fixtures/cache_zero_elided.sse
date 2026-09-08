@@ -1,0 +1,68 @@
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":"c","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":"\n\n","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":"<think>","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":"\n\n","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":"</think>","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":"\n\n","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":"It","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" appears","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" that","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" the","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" text","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" you","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" provided","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" is","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" a","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" corrupted","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" string","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" containing","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" a","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" mix","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" of","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" random","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" characters","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":",","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" code","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" snippets","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":",","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" and","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" multiple","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" languages","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":" (","logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[{"index":0,"text":"including","logprobs":null,"finish_reason":"length","matched_stop":null}],"usage":null}
+
+data: {"id":"aa39da534d444b02b5b889d6c94e2c7f","object":"text_completion","created":1788906949,"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","choices":[],"usage":{"prompt_tokens":512,"total_tokens":544,"completion_tokens":32,"reasoning_tokens":0}}
+
+data: [DONE]
+

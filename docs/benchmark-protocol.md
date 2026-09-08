@@ -52,8 +52,15 @@ empty `choices` list. `scripts/upstream_capture.py` applies an exact-anchor,
 client-process-only correction to that function: record the actual request
 and SSE stream, accept the usage-only event, and use observed usage for native
 aggregation. Missing usage, wrong model, wrong input, wrong finish, nonzero
-cache hits or incomplete `[DONE]` fail the round. No model/server/kernel code
-is changed. Raw wire files and upstream JSONL remain alongside bound rows.
+cache hits or incomplete `[DONE]` fail the round. The pinned native emitter
+elides cache details at zero and returns details for positive hits. The manifest
+binds all seven emitter/forwarder/protocol source hashes; only that exact contract,
+an explicit `return_cached_tokens_details=true` request and an otherwise complete
+valid response authorize `cached_tokens=0` from the elision. Raw SSE and absent
+fields stay unchanged, and the capture records
+`cache_observation_source=pinned_sglang_zero_elision`. Unknown source semantics,
+malformed details or contradictory usage still fail closed. Raw wire files and
+upstream JSONL remain alongside bound rows.
 
 The adapter uses the original upstream argument parser, dataset dispatch,
 semaphore, warmup/flush, request timer and metrics aggregator. The output
