@@ -1,0 +1,12 @@
+# Notices
+
+- The `nvidia/Qwen3.8-Flash-Next-NVFP4` checkpoint is not distributed with
+  this repository. Its use is governed by the NVIDIA Open Model License and
+  applicable Qwen terms.
+- This runtime targets SGLang. SGLang is licensed under Apache-2.0 by its
+  authors; this repository only invokes it and ships none of it.
+- `HEADERS_ADMITTED` (scripts/audit_checkpoint.py) is a structural verdict
+  only. It is not integrity verification; `scripts/verify_files.py` must
+  pass and its receipt must re-check against the mounted tree before spawn.
+- The runtime is NOT QUALIFIED: no GPU test has been executed, no image has
+  been built, and no performance or fit number exists for this repository.
