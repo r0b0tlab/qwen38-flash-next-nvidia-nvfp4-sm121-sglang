@@ -24,6 +24,7 @@ Contract:
 - This helper never starts, stops or kills any server or client process;
   cancellation/draining is the parent's responsibility.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -64,9 +65,18 @@ QUERY_TEMPLATE = (
 
 # frozen code pool: distinctive, unlikely to appear in filler prose
 CODE_POOL: Tuple[str, ...] = (
-    "ZEPHYR-4821", "QUARTZ-9173", "MIRAGE-3058", "LUMEN-7742",
-    "COBALT-6519", "HOLLOW-2384", "SPRUCE-5067", "VELVET-8291",
-    "GRANITE-3476", "ORCHID-9158", "FERRITE-6823", "NIMBUS-1509",
+    "ZEPHYR-4821",
+    "QUARTZ-9173",
+    "MIRAGE-3058",
+    "LUMEN-7742",
+    "COBALT-6519",
+    "HOLLOW-2384",
+    "SPRUCE-5067",
+    "VELVET-8291",
+    "GRANITE-3476",
+    "ORCHID-9158",
+    "FERRITE-6823",
+    "NIMBUS-1509",
 )
 
 FILLER_SENTENCE = (
@@ -90,17 +100,20 @@ class TokenizerProtocol(Protocol):
     def decode(self, ids: Sequence[int]) -> str: ...
 
     def apply_chat_template(
-        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True,
-        tokenize: bool = True, enable_thinking: bool = True, reasoning_effort: str = "low",
+        self,
+        messages: List[Dict[str, str]],
+        add_generation_prompt: bool = True,
+        tokenize: bool = True,
+        enable_thinking: bool = True,
+        reasoning_effort: str = "low",
     ) -> Any: ...
 
 
 class FakeTokenizer:
     """Deterministic word-level tokenizer for CPU unit tests (TEST ONLY).
 
-    Never used for real traffic: every construction function refuses a
-    FakeTokenizer unless explicitly marked test-only, so fake token arrays can
-    never masquerade as real rendered streams.
+    Construction is permitted in CPU tests. The public run_cases boundary
+    rejects this class before any client call; it is not an inference source.
     """
 
     def __init__(self, name: str = "fake-wordlevel"):
@@ -124,8 +137,12 @@ class FakeTokenizer:
         return " ".join(inv.get(i, "<unk>") for i in ids)
 
     def apply_chat_template(
-        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True,
-        tokenize: bool = True, enable_thinking: bool = True, reasoning_effort: str = "low",
+        self,
+        messages: List[Dict[str, str]],
+        add_generation_prompt: bool = True,
+        tokenize: bool = True,
+        enable_thinking: bool = True,
+        reasoning_effort: str = "low",
     ):
         parts = [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>" for m in messages]
         if add_generation_prompt:
@@ -140,8 +157,61 @@ def load_real_tokenizer(tokenizer_dir: str) -> TokenizerProtocol:
         from transformers import AutoTokenizer
     except ImportError as exc:  # pragma: no cover - parent env has transformers
         raise RuntimeError(f"transformers unavailable: {exc}") from exc
-    tok = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=False, local_files_only=True)
-    tok.name = f"real:{tokenizer_dir}"
+    root = Path(tokenizer_dir).resolve(strict=True)
+    sources = json.loads(
+        (Path(__file__).resolve().parents[1] / "locks/sources.json").read_text()
+    )["model"]
+    if sources["id"] != MODEL_ID:
+        raise ValueError("tokenizer source lock names another model")
+    assets = {
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+        "vocab.json",
+        "merges.txt",
+        "added_tokens.json",
+        "special_tokens_map.json",
+    }
+    observed = {}
+    for item in sources["files"]:
+        if item["path"] not in assets:
+            continue
+        path = root / item["path"]
+        if path.is_symlink():
+            raise ValueError("symlink tokenizer asset")
+        data = path.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        match = (
+            sha
+            if item.get("sha256")
+            else hashlib.sha1(
+                b"blob " + str(len(data)).encode() + b"\0" + data
+            ).hexdigest()
+        )
+        if len(data) != item["size"] or match != (
+            item.get("sha256") or item["git_blob"]
+        ):
+            raise ValueError(
+                "tokenizer asset differs from pinned checkpoint: " + item["path"]
+            )
+        observed[item["path"]] = sha
+    if (
+        not {
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+        }
+        <= observed.keys()
+    ):
+        raise ValueError("tokenizer lock is incomplete")
+    tok = AutoTokenizer.from_pretrained(
+        tokenizer_dir, trust_remote_code=False, local_files_only=True
+    )
+    tok.name = f"real:{root}"
+    tok._qwen38_tokenizer_assets = observed
+    tok._qwen38_model_sha = sources["sha"]
     return tok  # type: ignore[return-value]
 
 
@@ -161,15 +231,18 @@ class Needle:
 @dataclasses.dataclass(frozen=True)
 class NiahCase:
     case_id: str
-    n_tokens: int          # constructed prompt token count
+    n_tokens: int  # constructed prompt token count
     depths: Tuple[float, ...]
     needles: Tuple[Needle, ...]
     prompt_ids: Tuple[int, ...]
     rendered_text_sha256: str
     prompt_sha256: str
+    response_starts_in_thinking: bool = False
 
 
-def _build_filler(tokenizer: TokenizerProtocol, sentence: str, n_tokens: int) -> List[int]:
+def _build_filler(
+    tokenizer: TokenizerProtocol, sentence: str, n_tokens: int
+) -> List[int]:
     """Pre-tokenize one filler sentence, then tile it to >= n_tokens tokens."""
     one = tokenizer.encode(sentence, add_special_tokens=False)
     if not one:
@@ -193,10 +266,14 @@ def _encode_with_positions(
     """
     slot = "\x00"
     rendered = tokenizer.apply_chat_template(
-        [{"role": "system", "content": system},
-         {"role": "user", "content": " " + slot + " \n\n" + query}],
-        add_generation_prompt=True, tokenize=False,
-        enable_thinking=True, reasoning_effort="low",
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": " " + slot + " \n\n" + query},
+        ],
+        add_generation_prompt=True,
+        tokenize=False,
+        enable_thinking=True,
+        reasoning_effort="low",
     )
     if not isinstance(rendered, str):
         raise RuntimeError("tokenize=False did not produce template text")
@@ -204,12 +281,15 @@ def _encode_with_positions(
     slot_ids = list(tokenizer.encode(slot, add_special_tokens=False))
     if not slot_ids:
         raise RuntimeError("template insertion slot encoded empty")
-    starts = [i for i in range(len(template_ids) - len(slot_ids) + 1)
-              if template_ids[i:i + len(slot_ids)] == slot_ids]
+    starts = [
+        i
+        for i in range(len(template_ids) - len(slot_ids) + 1)
+        if template_ids[i : i + len(slot_ids)] == slot_ids
+    ]
     if len(starts) != 1:
         raise RuntimeError("slot must be unique and contiguous in the actual template")
     start = starts[0]
-    prefix, suffix = template_ids[:start], template_ids[start + len(slot_ids):]
+    prefix, suffix = template_ids[:start], template_ids[start + len(slot_ids) :]
     body_size = n_target - len(prefix) - len(suffix)
     if body_size <= 0:
         raise RuntimeError("template/query consumes the entire prompt budget")
@@ -221,8 +301,10 @@ def _encode_with_positions(
         end = body_offset + len(needle_ids)
         if not 0 <= body_offset < end <= len(body):
             raise RuntimeError("requested needle position is outside the template body")
-        if any(body_offset < previous_end and previous_start < end
-               for previous_start, previous_end in occupied):
+        if any(
+            body_offset < previous_end and previous_start < end
+            for previous_start, previous_end in occupied
+        ):
             raise RuntimeError("needle token ranges overlap")
         body[body_offset:end] = needle_ids
         occupied.append((body_offset, end))
@@ -231,7 +313,6 @@ def _encode_with_positions(
     if len(prompt_ids) != n_target:
         raise RuntimeError("token-space construction violated its exact length")
     return prompt_ids, offsets, tokenizer.decode(prompt_ids)
-
 
 
 def build_case(
@@ -313,8 +394,12 @@ def build_case(
             for n, off in zip(needles, offsets)
         ),
         prompt_ids=tuple(prompt_ids),
+        response_starts_in_thinking=rendered.rfind("<think>")
+        > rendered.rfind("</think>"),
         rendered_text_sha256=hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
-        prompt_sha256=hashlib.sha256(json.dumps(list(prompt_ids)).encode("utf-8")).hexdigest(),
+        prompt_sha256=hashlib.sha256(
+            json.dumps(list(prompt_ids)).encode("utf-8")
+        ).hexdigest(),
     )
 
 
@@ -322,24 +407,37 @@ def build_default_cases(tokenizer: TokenizerProtocol) -> List[NiahCase]:
     """The nine frozen cases: 8 single-key + 1 full-window ordered multi-key."""
     cases: List[NiahCase] = []
     for ctx in (8_192, 32_768, 131_072):
-        cases.append(build_case(
-            tokenizer, case_id=f"single_{ctx}_d50",
-            n_prompt_tokens=ctx, depths=(0.50,), codes=(CODE_POOL[len(cases)],),
-            query=QUERY_TEMPLATE.format(n=1),
-        ))
+        cases.append(
+            build_case(
+                tokenizer,
+                case_id=f"single_{ctx}_d50",
+                n_prompt_tokens=ctx,
+                depths=(0.50,),
+                codes=(CODE_POOL[len(cases)],),
+                query=QUERY_TEMPLATE.format(n=1),
+            )
+        )
     for i, depth in enumerate((0.05, 0.25, 0.50, 0.75, 0.95)):
-        cases.append(build_case(
-            tokenizer, case_id=f"single_{MAX_PROMPT}_d{int(depth * 100)}",
-            n_prompt_tokens=MAX_PROMPT, depths=(depth,),
-            codes=(CODE_POOL[3 + i],),
-            query=QUERY_TEMPLATE.format(n=1),
-        ))
-    cases.append(build_case(
-        tokenizer, case_id=f"multi_{MAX_PROMPT}_d33_66",
-        n_prompt_tokens=MAX_PROMPT, depths=(0.33, 0.66),
-        codes=(CODE_POOL[8], CODE_POOL[9]),
-        query=QUERY_TEMPLATE.format(n=2),
-    ))
+        cases.append(
+            build_case(
+                tokenizer,
+                case_id=f"single_{MAX_PROMPT}_d{int(depth * 100)}",
+                n_prompt_tokens=MAX_PROMPT,
+                depths=(depth,),
+                codes=(CODE_POOL[3 + i],),
+                query=QUERY_TEMPLATE.format(n=1),
+            )
+        )
+    cases.append(
+        build_case(
+            tokenizer,
+            case_id=f"multi_{MAX_PROMPT}_d33_66",
+            n_prompt_tokens=MAX_PROMPT,
+            depths=(0.33, 0.66),
+            codes=(CODE_POOL[8], CODE_POOL[9]),
+            query=QUERY_TEMPLATE.format(n=2),
+        )
+    )
     return cases
 
 
@@ -348,7 +446,9 @@ def build_default_cases(tokenizer: TokenizerProtocol) -> List[NiahCase]:
 # ---------------------------------------------------------------------------
 
 
-def freeze_manifest(cases: Sequence[NiahCase], tokenizer: TokenizerProtocol) -> Dict[str, Any]:
+def freeze_manifest(
+    cases: Sequence[NiahCase], tokenizer: TokenizerProtocol
+) -> Dict[str, Any]:
     """Freeze token arrays, hashes, offsets and codes BEFORE any traffic."""
     return {
         "kind": "qualification-niah-manifest",
@@ -356,7 +456,11 @@ def freeze_manifest(cases: Sequence[NiahCase], tokenizer: TokenizerProtocol) -> 
         "window": WINDOW,
         "reserve": RESERVE,
         "max_prompt_tokens": MAX_PROMPT,
-        "sampling": {"temperature": TEMPERATURE, "top_p": TOP_P, "max_tokens": MAX_TOKENS},
+        "sampling": {
+            "temperature": TEMPERATURE,
+            "top_p": TOP_P,
+            "max_tokens": MAX_TOKENS,
+        },
         "timeout_s": TIMEOUT_S,
         "tokenizer": getattr(tokenizer, "name", "unknown"),
         "cases": [
@@ -369,6 +473,7 @@ def freeze_manifest(cases: Sequence[NiahCase], tokenizer: TokenizerProtocol) -> 
                 "needle_token_lens": [len(n.token_ids) for n in c.needles],
                 "prompt_sha256": c.prompt_sha256,
                 "prompt_ids": list(c.prompt_ids),
+                "response_starts_in_thinking": c.response_starts_in_thinking,
                 "rendered_text_sha256": c.rendered_text_sha256,
             }
             for c in cases
@@ -389,11 +494,23 @@ def check_response(case: NiahCase, res: CompletionResult) -> Tuple[str, str]:
     invalid_usage / infra_error.
     """
     if res.error is not None:
-        if res.error.startswith("http_status_") or res.error in ("transport", "timeout"):
+        if res.error.startswith("http_status_") or res.error in (
+            "transport",
+            "timeout",
+        ):
             return "infra_error", f"{res.error}: {res.error_detail[:300]}"
         return "invalid_usage", f"{res.error}: {res.error_detail[:300]}"
-    if res.usage is None:
-        return "invalid_usage", "no usage object"
+    if not isinstance(res.usage, dict) or any(
+        type(res.usage.get(k)) is not int
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+    ):
+        return "invalid_usage", "usage must contain exact JSON integers"
+    if (
+        not 0 < res.usage["completion_tokens"] <= MAX_TOKENS
+        or res.usage["total_tokens"]
+        != res.usage["prompt_tokens"] + res.usage["completion_tokens"]
+    ):
+        return "invalid_usage", "invalid completion count or usage total"
     if res.usage["prompt_tokens"] != case.n_tokens:
         return (
             "invalid_usage_echo",
@@ -403,21 +520,17 @@ def check_response(case: NiahCase, res: CompletionResult) -> Tuple[str, str]:
         return "invalid_finish", f"finish_reason={res.finish_reason}"
     text = res.text or ""
     # incomplete thinking is not an answer
-    if "<think>" in text and "</think>" not in text:
+    if (case.response_starts_in_thinking and "</think>" not in text) or text.rfind(
+        "<think>"
+    ) > text.rfind("</think>"):
         return "incomplete_thinking", "unclosed <think> block"
     final = text.split("</think>")[-1].strip() if "</think>" in text else text.strip()
     if not final:
         return "empty_answer", "no final text after thinking"
     codes = [n.code for n in case.needles]
-    idx = 0
-    positions: List[int] = []
-    for code in codes:
-        pos = final.find(code, idx)
-        if pos < 0:
-            return "needle_miss", f"code {code!r} missing or out of order in final text"
-        positions.append(pos)
-        idx = pos + len(code)
-    return "pass", f"codes at positions {positions}"
+    if " ".join(final.split()) != " ".join(codes):
+        return "needle_miss", "final answer is not exactly the ordered code list"
+    return "pass", "exact ordered final codes"
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +538,41 @@ def check_response(case: NiahCase, res: CompletionResult) -> Tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def run_cases(
+DEFAULT_CASE_IDS = tuple(
+    [f"single_{n}_d50" for n in (8192, 32768, 131072)]
+    + [f"single_{MAX_PROMPT}_d{d}" for d in (5, 25, 50, 75, 95)]
+    + [f"multi_{MAX_PROMPT}_d33_66"]
+)
+
+
+def run_cases(client, cases, out_path, *, tokenizer=None, dry_run=False, on_row=None):
+    """Public traffic gate: only pinned real-tokenizer default cases may run."""
+    if not cases or len({c.case_id for c in cases}) != len(cases):
+        raise ValueError("case IDs must be nonempty and unique")
+    if not dry_run:
+        if (
+            tokenizer is None
+            or isinstance(tokenizer, FakeTokenizer)
+            or str(getattr(tokenizer, "name", "")).startswith("test-only:")
+        ):
+            raise ValueError(
+                "real traffic requires the pinned real tokenizer, never FakeTokenizer"
+            )
+        from transformers import PreTrainedTokenizerBase
+
+        if not isinstance(tokenizer, PreTrainedTokenizerBase) or not getattr(
+            tokenizer, "_qwen38_tokenizer_assets", None
+        ):
+            raise ValueError("tokenizer was not admitted by load_real_tokenizer")
+        expected = {c.case_id: c for c in build_default_cases(tokenizer)}
+        if any(c.case_id not in expected or c != expected[c.case_id] for c in cases):
+            raise ValueError(
+                "traffic arrays differ from real-tokenizer default construction"
+            )
+    return _execute_cases(client, cases, out_path, dry_run=dry_run, on_row=on_row)
+
+
+def _execute_cases(
     client: Any,
     cases: Sequence[NiahCase],
     out_path: Path,
@@ -434,6 +581,8 @@ def run_cases(
     on_row: Any = None,
 ) -> Dict[str, Any]:
     """Run (or dry-run) cases; persist every row; return a fail-closed summary."""
+    if not cases or len({c.case_id for c in cases}) != len(cases):
+        raise ValueError("case IDs must be nonempty and unique")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     verdicts: Dict[str, str] = {}
     ran = 0
@@ -441,8 +590,10 @@ def run_cases(
         for case in cases:
             if dry_run:
                 row = {
-                    "case_id": case.case_id, "dry_run": True,
-                    "n_tokens": case.n_tokens, "verdict": "not_run_dry",
+                    "case_id": case.case_id,
+                    "dry_run": True,
+                    "n_tokens": case.n_tokens,
+                    "verdict": "not_run_dry",
                     "prompt_sha256": case.prompt_sha256,
                 }
                 verdicts[case.case_id] = "not_run_dry"
@@ -454,6 +605,7 @@ def run_cases(
                         temperature=TEMPERATURE,
                         top_p=TOP_P,
                         timeout=TIMEOUT_S,
+                        extra={"skip_special_tokens": False},
                     )
                 except Exception as exc:  # infra: recorded, never a needle miss
                     row = {
@@ -494,30 +646,51 @@ def run_cases(
             if on_row:
                 on_row(row)
     passed = [k for k, v in verdicts.items() if v == "pass"]
-    partial = len(verdicts) < len(cases) or any(v == "not_run_dry" for v in verdicts.values())
+    missing = sorted(set(DEFAULT_CASE_IDS) - set(verdicts))
+    partial = (
+        bool(missing)
+        or set(verdicts) != set(DEFAULT_CASE_IDS)
+        or any(v == "not_run_dry" for v in verdicts.values())
+    )
     return {
-        "total_cases": len(cases),
+        "total_cases": len(DEFAULT_CASE_IDS),
+        "selected_cases": len(cases),
+        "selected_ok": not dry_run and len(passed) == len(cases),
+        "missing_case_ids": missing,
         "ran": ran,
         "passed": len(passed),
         "partial": partial or ran != len(cases),
         "verdicts": verdicts,
-        "ok": (not partial) and len(passed) == len(cases),
+        "ok": (not partial) and len(passed) == len(DEFAULT_CASE_IDS),
     }
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="exact-token NIAH (262144 window)")
-    p.add_argument("--base", help="explicit endpoint base URL (required unless --dry-run)")
-    p.add_argument("--tokenizer-dir", default=os.environ.get("QUAL_HARNESS_TOKENIZER_DIR", ""))
+    p.add_argument(
+        "--base", help="explicit endpoint base URL (required unless --dry-run)"
+    )
+    p.add_argument(
+        "--tokenizer-dir", default=os.environ.get("QUAL_HARNESS_TOKENIZER_DIR", "")
+    )
     p.add_argument("--manifest", required=True, help="frozen manifest output path")
-    p.add_argument("--output", required=True, help="JSONL rows (exclusive, no overwrite)")
-    p.add_argument("--only", action="append", help="run only these case_ids (repeatable)")
-    p.add_argument("--dry-run", action="store_true", help="construct+freeze+validate, no traffic")
+    p.add_argument(
+        "--output", required=True, help="JSONL rows (exclusive, no overwrite)"
+    )
+    p.add_argument(
+        "--only", action="append", help="run only these case_ids (repeatable)"
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="construct+freeze+validate, no traffic"
+    )
     args = p.parse_args(argv)
 
     if args.dry_run:
         if not args.tokenizer_dir:
-            print("--dry-run still needs --tokenizer-dir to freeze real arrays", file=sys.stderr)
+            print(
+                "--dry-run still needs --tokenizer-dir to freeze real arrays",
+                file=sys.stderr,
+            )
             return 2
         tokenizer = load_real_tokenizer(args.tokenizer_dir)
     else:
@@ -536,6 +709,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     cases = build_default_cases(tokenizer)
     if args.only:
         want = set(args.only)
+        if len(want) != len(args.only) or not want <= {c.case_id for c in cases}:
+            print("--only has duplicate or unknown case IDs", file=sys.stderr)
+            return 2
         cases = [c for c in cases if c.case_id in want]
         if not cases:
             print("no cases matched --only", file=sys.stderr)
@@ -545,7 +721,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     manifest["partial_selection"] = bool(args.only)
     manifest_path = Path(args.manifest)
     out = Path(args.output)
-    if manifest_path.resolve() == out.resolve() or manifest_path.exists() or out.exists():
+    if (
+        manifest_path.resolve() == out.resolve()
+        or manifest_path.exists()
+        or out.exists()
+    ):
         print("manifest/output must be distinct fresh paths", file=sys.stderr)
         return 2
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -559,7 +739,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         client = OpenAICompatClient(args.base)
         client.verify_model()  # exact identity before heavy traffic
-        summary = run_cases(client, cases, out)
+        summary = run_cases(client, cases, out, tokenizer=tokenizer)
     summary["partial_selection"] = bool(args.only)
     print(json.dumps(summary, indent=2))
     # Successful preparation is not a successful retrieval run: ok stays false.

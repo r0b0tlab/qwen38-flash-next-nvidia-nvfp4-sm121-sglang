@@ -23,6 +23,7 @@ Contract (see benchmarking skill: openai-streaming-benchmark-contract):
 - Usage objects must be nonnegative JSON integers. Booleans, fractional floats,
   missing fields and silent coercion are rejected (claim-bearing traffic).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -268,14 +269,18 @@ class CompletionResult:
 # ---------------------------------------------------------------------------
 
 
-def thinking_request_fields(enabled: bool, effort: Optional[str] = "low") -> Dict[str, Any]:
+def thinking_request_fields(
+    enabled: bool, effort: Optional[str] = "low"
+) -> Dict[str, Any]:
     """Request fields controlling native thinking.
 
     Default harness policy: throughput diagnostics run with
     ``enable_thinking=False``; ``--thinking`` style runs enable native thinking
     at low effort. Only documented request fields are ever sent.
     """
-    fields: Dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": bool(enabled)}}
+    fields: Dict[str, Any] = {
+        "chat_template_kwargs": {"enable_thinking": bool(enabled)}
+    }
     if enabled and effort:
         fields["reasoning_effort"] = effort
     return fields
@@ -421,7 +426,9 @@ class OpenAICompatClient:
 
     # -- low level ----------------------------------------------------------
 
-    def _open(self, method: str, path: str, body: Optional[Dict[str, Any]], timeout: float):
+    def _open(
+        self, method: str, path: str, body: Optional[Dict[str, Any]], timeout: float
+    ):
         data = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(
             self.base + path,
@@ -451,10 +458,14 @@ class OpenAICompatClient:
             with self._open("GET", "/v1/models", None, timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise HTTPStatusError(exc.code, exc.read().decode("utf-8", "replace")) from exc
+            raise HTTPStatusError(
+                exc.code, exc.read().decode("utf-8", "replace")
+            ) from exc
         except Exception as exc:  # URLError, socket, json
             raise self._classify_transport(exc) from exc
-        ids = [item.get("id") for item in body.get("data", []) if isinstance(item, dict)]
+        ids = [
+            item.get("id") for item in body.get("data", []) if isinstance(item, dict)
+        ]
         return [i for i in ids if isinstance(i, str)]
 
     def verify_model(self, timeout: float = 30.0) -> None:
@@ -494,9 +505,16 @@ class OpenAICompatClient:
             thinking=thinking,
             extra=extra,
         )
-        return self._stream_request("/v1/chat/completions", payload, timeout or self.default_timeout_s, capture_raw)
+        return self._stream_request(
+            "/v1/chat/completions",
+            payload,
+            timeout or self.default_timeout_s,
+            capture_raw,
+        )
 
-    def _stream_request(self, path: str, payload: Dict[str, Any], timeout: float, capture_raw: bool) -> StreamResult:
+    def _stream_request(
+        self, path: str, payload: Dict[str, Any], timeout: float, capture_raw: bool
+    ) -> StreamResult:
         res = StreamResult()
         decoder = SSEDecoder()
         t0 = time.perf_counter()
@@ -547,14 +565,22 @@ class OpenAICompatClient:
 
         res.wall_s = time.perf_counter() - t0
         if not res.saw_done:
-            return _fail("missing_done", "stream ended at EOF without [DONE]; partial content preserved")
+            return _fail(
+                "missing_done",
+                "stream ended at EOF without [DONE]; partial content preserved",
+            )
         if res.error == "invalid_usage":
             return _fail("invalid_usage", res.error_detail)
         if res.usage is None:
-            return _fail("missing_usage", "stream completed but no final usage event was received")
+            return _fail(
+                "missing_usage",
+                "stream completed but no final usage event was received",
+            )
         return res
 
-    def _consume_event(self, payload_str: str, res: StreamResult, t0: float, capture_raw: bool) -> None:
+    def _consume_event(
+        self, payload_str: str, res: StreamResult, t0: float, capture_raw: bool
+    ) -> None:
         if payload_str == DONE_SENTINEL:
             res.saw_done = True
             return
@@ -638,7 +664,12 @@ class OpenAICompatClient:
             thinking=thinking,
             extra=extra,
         )
-        return self._json_request("/v1/chat/completions", payload, timeout or self.default_timeout_s, kind="chat")
+        return self._json_request(
+            "/v1/chat/completions",
+            payload,
+            timeout or self.default_timeout_s,
+            kind="chat",
+        )
 
     def completions_tokens(
         self,
@@ -661,9 +692,16 @@ class OpenAICompatClient:
         }
         if extra:
             payload.update(extra)
-        return self._json_request("/v1/completions", payload, timeout or self.default_timeout_s, kind="completions")
+        return self._json_request(
+            "/v1/completions",
+            payload,
+            timeout or self.default_timeout_s,
+            kind="completions",
+        )
 
-    def _json_request(self, path: str, payload: Dict[str, Any], timeout: float, kind: str) -> CompletionResult:
+    def _json_request(
+        self, path: str, payload: Dict[str, Any], timeout: float, kind: str
+    ) -> CompletionResult:
         res = CompletionResult()
         t0 = time.perf_counter()
         try:
@@ -682,14 +720,23 @@ class OpenAICompatClient:
             return res
         res.http_status = resp.status
         try:
-            body = resp.read().decode("utf-8", "replace")
+            data_bytes = resp.read(16 * 1024 * 1024 + 1)
+            body = data_bytes.decode("utf-8", "replace")
+            if len(data_bytes) > 16 * 1024 * 1024:
+                res.wall_s = time.perf_counter() - t0
+                res.error = "response_limit"
+                res.error_detail = (
+                    "response exceeded 16 MiB; raw_body is an incomplete bounded prefix"
+                )
+                res.raw_body = body
+                return res
         except Exception as exc:
             res.wall_s = time.perf_counter() - t0
             res.error = "transport"
             res.error_detail = f"body read failed: {exc}"
             return res
         res.wall_s = time.perf_counter() - t0
-        res.raw_body = body[:20000]
+        res.raw_body = body
         try:
             data = json.loads(body)
         except json.JSONDecodeError as exc:
@@ -760,10 +807,22 @@ class _NoVerifyContext:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Shared qualification HTTP/SSE client (smoke CLI)")
-    p.add_argument("--base", required=True, help="explicit endpoint base URL (mandatory)")
-    p.add_argument("--verify-model", action="store_true", help="GET /v1/models and require the exact frozen model id")
-    p.add_argument("--flush-cache", action="store_true", help="POST /flush_cache (requires owner admission env)")
+    p = argparse.ArgumentParser(
+        description="Shared qualification HTTP/SSE client (smoke CLI)"
+    )
+    p.add_argument(
+        "--base", required=True, help="explicit endpoint base URL (mandatory)"
+    )
+    p.add_argument(
+        "--verify-model",
+        action="store_true",
+        help="GET /v1/models and require the exact frozen model id",
+    )
+    p.add_argument(
+        "--flush-cache",
+        action="store_true",
+        help="POST /flush_cache (requires owner admission env)",
+    )
     p.add_argument(
         "--smoke-chat",
         type=int,
@@ -793,11 +852,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                 top_p=1.0,
             )
         valid, reason = row_validity(res)
-        print(json.dumps({
-            "ok": res.ok, "error": res.error, "finish_reason": res.finish_reason,
-            "valid": valid, "reason": reason, "ttft_s": res.ttft_s, "wall_s": res.wall_s,
-            "usage": res.usage, "rate": res.e2e_output_tok_per_s,
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "ok": res.ok,
+                    "error": res.error,
+                    "finish_reason": res.finish_reason,
+                    "valid": valid,
+                    "reason": reason,
+                    "ttft_s": res.ttft_s,
+                    "wall_s": res.wall_s,
+                    "usage": res.usage,
+                    "rate": res.e2e_output_tok_per_s,
+                },
+                indent=2,
+            )
+        )
         return 0 if valid else 1
     return 0
 

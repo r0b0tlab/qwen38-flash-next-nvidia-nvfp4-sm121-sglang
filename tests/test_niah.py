@@ -6,6 +6,7 @@ runner refuses test-only tokenizers for real requests — enforced by
 TestFakeTokenizerIsolation). Real-tokenizer integration requires the model
 directory and is run by the parent.
 """
+
 from __future__ import annotations
 
 import json
@@ -32,8 +33,12 @@ def tok():
 class TestConstruction:
     def test_single_small_case_slots(self, tok):
         case = nz.build_case(
-            tok, case_id="t_small", n_prompt_tokens=600, depths=(0.5,),
-            codes=("ZEPHYR-4821",), query=nz.QUERY_TEMPLATE.format(n=1),
+            tok,
+            case_id="t_small",
+            n_prompt_tokens=600,
+            depths=(0.5,),
+            codes=("ZEPHYR-4821",),
+            query=nz.QUERY_TEMPLATE.format(n=1),
         )
         assert case.n_tokens == 600
         needle = case.needles[0]
@@ -43,13 +48,18 @@ class TestConstruction:
 
     def test_single_case_unique_needle(self, tok):
         case = nz.build_case(
-            tok, case_id="t_unique", n_prompt_tokens=512, depths=(0.5,),
-            codes=("QUARTZ-9173",), query=nz.QUERY_TEMPLATE.format(n=1),
+            tok,
+            case_id="t_unique",
+            n_prompt_tokens=512,
+            depths=(0.5,),
+            codes=("QUARTZ-9173",),
+            query=nz.QUERY_TEMPLATE.format(n=1),
         )
         ids = list(case.prompt_ids)
         n = case.needles[0]
         occurrences = sum(
-            1 for i in range(len(ids) - len(n.token_ids) + 1)
+            1
+            for i in range(len(ids) - len(n.token_ids) + 1)
             if ids[i : i + len(n.token_ids)] == n.token_ids
         )
         assert occurrences == 1
@@ -57,49 +67,75 @@ class TestConstruction:
     def test_window_budget_enforced(self, tok):
         with pytest.raises(ValueError, match="full-window budget"):
             nz.build_case(
-                tok, case_id="t_over", n_prompt_tokens=nz.MAX_PROMPT + 1,
-                depths=(0.5,), codes=("X-1",), query="q",
+                tok,
+                case_id="t_over",
+                n_prompt_tokens=nz.MAX_PROMPT + 1,
+                depths=(0.5,),
+                codes=("X-1",),
+                query="q",
             )
 
     def test_depth_bounds(self, tok):
         with pytest.raises(ValueError, match="depth"):
             nz.build_case(
-                tok, case_id="t_depth", n_prompt_tokens=512, depths=(1.5,),
-                codes=("X-1",), query="q",
+                tok,
+                case_id="t_depth",
+                n_prompt_tokens=512,
+                depths=(1.5,),
+                codes=("X-1",),
+                query="q",
             )
 
     def test_duplicate_codes_rejected(self, tok):
         with pytest.raises(ValueError, match="unique"):
             nz.build_case(
-                tok, case_id="t_dup", n_prompt_tokens=512, depths=(0.3, 0.6),
-                codes=("X-1", "X-1"), query="q",
+                tok,
+                case_id="t_dup",
+                n_prompt_tokens=512,
+                depths=(0.3, 0.6),
+                codes=("X-1", "X-1"),
+                query="q",
             )
 
     def test_depth_count_mismatch(self, tok):
         with pytest.raises(ValueError, match="equal length"):
             nz.build_case(
-                tok, case_id="t_cnt", n_prompt_tokens=512, depths=(0.3, 0.6),
-                codes=("X-1",), query="q",
+                tok,
+                case_id="t_cnt",
+                n_prompt_tokens=512,
+                depths=(0.3, 0.6),
+                codes=("X-1",),
+                query="q",
             )
 
     def test_multi_key_ordered_case(self, tok):
         case = nz.build_case(
-            tok, case_id="t_multi", n_prompt_tokens=900, depths=(0.33, 0.66),
-            codes=("AAA-1111", "BBB-2222"), query=nz.QUERY_TEMPLATE.format(n=2),
+            tok,
+            case_id="t_multi",
+            n_prompt_tokens=900,
+            depths=(0.33, 0.66),
+            codes=("AAA-1111", "BBB-2222"),
+            query=nz.QUERY_TEMPLATE.format(n=2),
         )
         a, b = case.needles
         assert a.start_offset < b.start_offset
         # both present exactly once, each contiguous at its offset
         ids = list(case.prompt_ids)
         for n in (a, b):
-            assert ids[n.start_offset : n.start_offset + len(n.token_ids)] == n.token_ids
+            assert (
+                ids[n.start_offset : n.start_offset + len(n.token_ids)] == n.token_ids
+            )
 
     def test_rendered_length_exact(self, tok):
         """The construction loop must land exactly on the requested count."""
         for n in (256, 511, 512, 513, 1000):
             case = nz.build_case(
-                tok, case_id=f"t_len{n}", n_prompt_tokens=n, depths=(0.5,),
-                codes=("ZEPHYR-4821",), query=nz.QUERY_TEMPLATE.format(n=1),
+                tok,
+                case_id=f"t_len{n}",
+                n_prompt_tokens=n,
+                depths=(0.5,),
+                codes=("ZEPHYR-4821",),
+                query=nz.QUERY_TEMPLATE.format(n=1),
             )
             assert case.n_tokens == n
 
@@ -126,8 +162,13 @@ class TestConstruction:
         assert len(m["cases"]) == 9
         for entry in m["cases"]:
             assert set(entry) >= {
-                "case_id", "n_tokens", "depths", "codes", "needle_offsets",
-                "prompt_sha256", "rendered_text_sha256",
+                "case_id",
+                "n_tokens",
+                "depths",
+                "codes",
+                "needle_offsets",
+                "prompt_sha256",
+                "rendered_text_sha256",
             }
             assert len(entry["prompt_sha256"]) == 64
 
@@ -152,7 +193,11 @@ def _res(**kw):
 class TestCheckResponse:
     def _case(self, tok, codes=("ZEPHYR-4821",), n=600, depths=(0.5,)):
         return nz.build_case(
-            tok, case_id="chk", n_prompt_tokens=n, depths=depths, codes=codes,
+            tok,
+            case_id="chk",
+            n_prompt_tokens=n,
+            depths=depths,
+            codes=codes,
             query=nz.QUERY_TEMPLATE.format(n=len(codes)),
         )
 
@@ -167,7 +212,9 @@ class TestCheckResponse:
         assert v == "needle_miss"
 
     def test_order_matters(self, tok):
-        case = self._case(tok, codes=("AAA-1111", "BBB-2222"), n=900, depths=(0.33, 0.66))
+        case = self._case(
+            tok, codes=("AAA-1111", "BBB-2222"), n=900, depths=(0.33, 0.66)
+        )
         usage = {"prompt_tokens": 900, "completion_tokens": 10, "total_tokens": 910}
         v, _ = nz.check_response(case, _res(text="BBB-2222 AAA-1111", usage=usage))
         assert v == "needle_miss"
@@ -176,7 +223,16 @@ class TestCheckResponse:
 
     def test_usage_echo_mismatch(self, tok):
         case = self._case(tok)
-        v, _ = nz.check_response(case, _res(usage={"prompt_tokens": 599, "completion_tokens": 3, "total_tokens": 602}))
+        v, _ = nz.check_response(
+            case,
+            _res(
+                usage={
+                    "prompt_tokens": 599,
+                    "completion_tokens": 3,
+                    "total_tokens": 602,
+                }
+            ),
+        )
         assert v == "invalid_usage_echo"
 
     def test_finish_length_fails(self, tok):
@@ -196,14 +252,20 @@ class TestCheckResponse:
 
     def test_transport_is_infra_not_miss(self, tok):
         case = self._case(tok)
-        v, _ = nz.check_response(case, _res(error="timeout", error_detail="read timed out"))
+        v, _ = nz.check_response(
+            case, _res(error="timeout", error_detail="read timed out")
+        )
         assert v == "infra_error"
-        v, _ = nz.check_response(case, _res(error="http_status_503", error_detail="unavailable"))
+        v, _ = nz.check_response(
+            case, _res(error="http_status_503", error_detail="unavailable")
+        )
         assert v == "infra_error"
 
     def test_invalid_usage_reported(self, tok):
         case = self._case(tok)
-        v, _ = nz.check_response(case, _res(error="invalid_usage", error_detail="float usage"))
+        v, _ = nz.check_response(
+            case, _res(error="invalid_usage", error_detail="float usage")
+        )
         assert v == "invalid_usage"
 
 
@@ -218,17 +280,26 @@ class TestFakeTokenizerIsolation:
 
     def test_runner_refuses_fake_tokenizer(self, tok, tmp_path):
         """run_cases must reject a test-only tokenizer for real traffic."""
-        cases = [nz.build_case(
-            tok, case_id="iso", n_prompt_tokens=128, depths=(0.5,),
-            codes=("ZEPHYR-4821",), query="code?",
-        )]
+        cases = [
+            nz.build_case(
+                tok,
+                case_id="iso",
+                n_prompt_tokens=128,
+                depths=(0.5,),
+                codes=("ZEPHYR-4821",),
+                query="code?",
+            )
+        ]
 
         class RefusingClient:
             def completions_tokens(self, *a, **kw):
                 raise AssertionError("fake tokenizer must never produce traffic")
 
-        summary = nz.run_cases(RefusingClient(), cases, tmp_path / "rows.jsonl")
-        assert summary["ok"] is False  # fail closed even before the guard
+        with pytest.raises(ValueError, match="real traffic"):
+            nz.run_cases(
+                RefusingClient(), cases, tmp_path / "rows.jsonl", tokenizer=tok
+            )
+        assert not (tmp_path / "rows.jsonl").exists()
 
     def test_load_real_tokenizer_rejects_missing_dir(self):
         with pytest.raises(Exception):
@@ -244,9 +315,14 @@ class TestDeterminism:
     def test_same_construction_same_hashes(self, tok):
         def build():
             return nz.build_case(
-                tok, case_id="det", n_prompt_tokens=512, depths=(0.5,),
-                codes=("ZEPHYR-4821",), query=nz.QUERY_TEMPLATE.format(n=1),
+                tok,
+                case_id="det",
+                n_prompt_tokens=512,
+                depths=(0.5,),
+                codes=("ZEPHYR-4821",),
+                query=nz.QUERY_TEMPLATE.format(n=1),
             )
+
         a, b = build(), build()
         assert a.prompt_sha256 == b.prompt_sha256
         assert a.rendered_text_sha256 == b.rendered_text_sha256
