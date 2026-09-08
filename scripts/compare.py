@@ -397,8 +397,10 @@ def manifest_fingerprint(manifest):
     ).hexdigest()
 
 
-def check_evidence_binding(manifest, rows, lane):
-    """Promotion requires producer-bound metadata, not two matching documents."""
+def validate_manifest(manifest):
+    """Validate the shared pre-traffic promotion identity contract."""
+    if not isinstance(manifest, dict):
+        raise Reject("promotion manifest must be an object")
     if (
         manifest.get("schema") != "qwen38fn.promotion.v1"
         or manifest.get("model_id") != "nvidia/Qwen3.8-Flash-Next-NVFP4"
@@ -429,6 +431,12 @@ def check_evidence_binding(manifest, rows, lane):
         raise Reject("invalid context/pool envelope")
     if not isinstance(manifest.get("inputs"), dict):
         raise Reject("promotion manifest inputs must be an object")
+    return fingerprint
+
+
+def check_evidence_binding(manifest, rows, lane):
+    """Promotion requires producer-bound metadata, not two matching documents."""
+    fingerprint = validate_manifest(manifest)
     inputs = manifest["inputs"].get(lane)
     if not isinstance(inputs, dict) or not inputs:
         raise Reject("promotion manifest is missing frozen lane inputs")

@@ -10,6 +10,7 @@ Two layers:
   evidence preservation, token-accounting recording — against the in-process
   fake server (synthetic vectors only, never model evidence).
 """
+
 from __future__ import annotations
 
 import base64
@@ -53,10 +54,18 @@ class TestEnvGating:
     def test_cli_refuses_existing_output(self, tmp_path, monkeypatch):
         out = tmp_path / "exists.jsonl"
         out.write_text("seed\n")
-        rc = vb.main([
-            "--base", "http://127.0.0.1:1", "--fixtures", str(tmp_path),
-            "--output", str(out), "--variant", "AR",
-        ])
+        rc = vb.main(
+            [
+                "--base",
+                "http://127.0.0.1:1",
+                "--fixtures",
+                str(tmp_path),
+                "--output",
+                str(out),
+                "--variant",
+                "AR",
+            ]
+        )
         assert rc == 2
 
     def test_cli_requires_base(self):
@@ -102,6 +111,7 @@ class TestPayloads:
         import io
 
         from PIL import Image
+
         for t in (1024, 1536):
             out = vb.resize_png(raw, t)
             assert Image.open(io.BytesIO(out)).size == (t, t)
@@ -137,44 +147,61 @@ class TestScaffoldRun:
         with FakeServer() as srv:
             out = tmp_path / "vision.jsonl"
             summary = vb.run_vision_benchmark(
-                srv.base, fixtures, out, variant="AR", repeats=1, warmup=1, timeout_s=20,
+                srv.base,
+                fixtures,
+                out,
+                variant="AR",
+                repeats=1,
+                warmup=1,
+                timeout_s=20,
                 no_resize_matrix=True,
             )
-            assert summary["errors"] == []  # fake server happy path
+            assert summary["transport_errors"] == []
+            assert (
+                summary["semantic_errors"] and summary["ok"] is False
+            )  # generic fake text is not visual evidence
             rows = [json.loads(l) for l in out.read_text().splitlines()]
             assert summary["rows"] == len(rows) > 0
             for row in rows:
                 assert row["variant"] == "AR"
                 assert row["model"] == vb.MODEL_ID
-                assert row["raw_response"], "raw events must be persisted before assertion"
+                assert row["raw_response"], (
+                    "raw events must be persisted before assertion"
+                )
                 assert row["usage"]["prompt_tokens"] >= 0
                 assert row["ttft_s"] is not None
                 assert row["finish_reason"] == "stop"
 
-    def test_run_records_errors_without_discarding(self, fixtures, tmp_path, monkeypatch):
+    def test_run_records_errors_without_discarding(
+        self, fixtures, tmp_path, monkeypatch
+    ):
         """A failing case is recorded per-row and surfaced in errors."""
         monkeypatch.setenv(vb.ENV_ENABLE, "1")
         with FakeServer() as srv:
             out = tmp_path / "vision2.jsonl"
-            # http-500 scenario is not reachable through the happy-path routing;
-            # instead point one request at a dead port by using a bogus fixtures
-            # dir? No — instead verify error capture via unreachable model check.
+            # Transport succeeds, but generic fake text must fail visual semantics.
             summary = vb.run_vision_benchmark(
-                srv.base, fixtures, out, variant="NEXTN", repeats=1, warmup=0,
-                timeout_s=20, no_resize_matrix=True,
+                srv.base,
+                fixtures,
+                out,
+                variant="NEXTN",
+                repeats=1,
+                warmup=0,
+                timeout_s=20,
+                no_resize_matrix=True,
             )
-            assert summary["errors"] == []
+            assert summary["transport_errors"] == []
+            assert summary["semantic_errors"] and summary["ok"] is False
             rows = [json.loads(l) for l in out.read_text().splitlines()]
-            assert all(r["variant"] == "NEXTN" for r in rows)
+            assert all(r["variant"] == "NEXTN" and not r["valid"] for r in rows)
 
 
 # ---------------------------------------------------------------------------
 # endpoint vision tests — parent-only, deselected on CPU CI
 # ---------------------------------------------------------------------------
 
-_qualifies = (
-    os.environ.get(vb.ENV_ENABLE) == "1"
-    and bool(os.environ.get("QUAL_HARNESS_VISION_BASE"))
+_qualifies = os.environ.get(vb.ENV_ENABLE) == "1" and bool(
+    os.environ.get("QUAL_HARNESS_VISION_BASE")
 )
 
 reason = (
@@ -197,8 +224,14 @@ class TestEndpointVision:
             mvf.generate_all(fixtures)
         out = tmp_path / "endpoint.jsonl"
         summary = vb.run_vision_benchmark(
-            base, fixtures, out, variant="AR", repeats=1, warmup=1,
-            timeout_s=120, no_resize_matrix=True,
+            base,
+            fixtures,
+            out,
+            variant="AR",
+            repeats=1,
+            warmup=1,
+            timeout_s=120,
+            no_resize_matrix=True,
         )
         assert summary["errors"] == []
         rows = [json.loads(l) for l in out.read_text().splitlines()]
@@ -218,12 +251,20 @@ class TestEndpointVision:
             mvf.generate_all(fixtures)
         out = tmp_path / "acct.jsonl"
         summary = vb.run_vision_benchmark(
-            base, fixtures, out, variant="AR", repeats=1, warmup=0,
-            timeout_s=120, no_resize_matrix=True,
+            base,
+            fixtures,
+            out,
+            variant="AR",
+            repeats=1,
+            warmup=0,
+            timeout_s=120,
+            no_resize_matrix=True,
         )
         assert summary["errors"] == []
         rows = [json.loads(l) for l in out.read_text().splitlines()]
         by_id = {r["case_id"]: r for r in rows}
         assert by_id["ocr_text@512"]["usage"]["prompt_tokens"] > 0
         # image token accounting recorded — proof stays the final text
-        assert isinstance(by_id["colors_first_red@video"]["usage"]["prompt_tokens"], int)
+        assert isinstance(
+            by_id["colors_first_red@video"]["usage"]["prompt_tokens"], int
+        )

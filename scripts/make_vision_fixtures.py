@@ -62,12 +62,12 @@ VIDEO_FPS = 2.0
 # Benchmark prompts — property-only, answer-blind (enforced by tests)
 # ---------------------------------------------------------------------------
 
-PROMPT_SQUARE = "Describe the color of the large square in the center of the image and the color of the background around it."
+PROMPT_SQUARE = "What color is the large center square, and what color surrounds it? Answer with only two color words, square first and background second."
 PROMPT_CIRCLES = "How many complete green circles appear in this image? Answer with the number only."
 PROMPT_OCR = "Transcribe the characters shown in this image. Answer with the characters only."
 PROMPT_SIDES = "In this image, is the green region on the left half or the right half? Answer with one word."
 PROMPT_BARS = "Two vertical bars are shown side by side. Which color is the taller bar? Answer with one word."
-PROMPT_VIDEO = "Watch the video. What is the color of the first frame, and what is the color of the last frame? Answer in order."
+PROMPT_VIDEO = "Watch the video. What is the color of the first frame, and what is the color of the last frame? Answer with only two color words in that order."
 
 PROMPTS: Dict[str, str] = {
     "red_square_on_blue": PROMPT_SQUARE,
@@ -83,16 +83,16 @@ PROMPTS: Dict[str, str] = {
 }
 
 EXPECTED: Dict[str, str] = {
-    "red_square_on_blue": "red square on blue background",
-    "blue_square_on_red": "blue square on red background",
+    "red_square_on_blue": "red blue",
+    "blue_square_on_red": "blue red",
     "circles_3": "3",
     "circles_5": "5",
     "ocr_text": "R7K9",
     "left_green_right_yellow": "left",
     "left_yellow_right_green": "right",
     "red_bar_tall_blue_short": "red",
-    "colors_first_red": "first red, last yellow",
-    "colors_first_yellow": "first yellow, last red",
+    "colors_first_red": "red yellow",
+    "colors_first_yellow": "yellow red",
 }
 
 # EXPECTED is intentionally NOT exported into the manifest: requests and

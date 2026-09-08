@@ -20,6 +20,7 @@ exits nonzero unless every measured row is valid.
 Default thinking policy: chat_template_kwargs.enable_thinking=False
 (throughput diagnostic). --thinking enables native thinking at low effort.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -39,7 +40,9 @@ from http_client import (  # noqa: E402
     OpenAICompatClient,
     row_validity,
     thinking_request_fields,
+    build_chat_payload,
 )
+from benchmark_evidence import bind_requests, input_hash, load_manifest
 
 # ---------------------------------------------------------------------------
 # Frozen prose corpus (written before any traffic; sha256 in every run manifest)
@@ -138,17 +141,34 @@ DEFAULT_WARMUP = 1
 MIN_MEANINGFUL_CHARS = 200  # a meaningful prose answer, not a stub
 
 
+def prose_payloads(thinking=None):
+    thinking = thinking if thinking is not None else thinking_request_fields(False)
+    return {
+        case["case_id"]: build_chat_payload(
+            [{"role": "user", "content": case["prompt"]}],
+            model=MODEL_ID,
+            max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
+            top_p=TOP_P,
+            thinking=thinking,
+        )
+        for case in PROSE_CASES
+    }
+
+
 def corpus_sha256() -> str:
     """Stable SHA over the frozen corpus (case_id + prompt pairs)."""
     canon = json.dumps(
         sorted([[c["case_id"], c["prompt"]] for c in PROSE_CASES]),
-        ensure_ascii=False, sort_keys=True,
+        ensure_ascii=False,
+        sort_keys=True,
     )
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
-def write_corpus_lock(path: Path, *, base: str, thinking: Dict[str, Any],
-                      repeats: int, warmup: int) -> None:
+def write_corpus_lock(
+    path: Path, *, base: str, thinking: Dict[str, Any], repeats: int, warmup: int
+) -> None:
     if path.exists():
         raise SystemExit(f"refusing to overwrite corpus lock: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,11 +177,26 @@ def write_corpus_lock(path: Path, *, base: str, thinking: Dict[str, Any],
         "model_id": MODEL_ID,
         "base": base,
         "corpus_sha256": corpus_sha256(),
-        "cases": [{"case_id": c["case_id"], "prompt_sha256": hashlib.sha256(
-            c["prompt"].encode("utf-8")).hexdigest()} for c in PROSE_CASES],
+        "input_sha256": {
+            key: input_hash(payload)
+            for key, payload in prose_payloads(thinking).items()
+        },
+        "requests": prose_payloads(thinking),
+        "cases": [
+            {
+                "case_id": c["case_id"],
+                "prompt_sha256": hashlib.sha256(
+                    c["prompt"].encode("utf-8")
+                ).hexdigest(),
+            }
+            for c in PROSE_CASES
+        ],
         "sampling": {
-            "max_tokens": MAX_TOKENS, "temperature": TEMPERATURE, "top_p": TOP_P,
-            "repeats": repeats, "warmup": warmup,
+            "max_tokens": MAX_TOKENS,
+            "temperature": TEMPERATURE,
+            "top_p": TOP_P,
+            "repeats": repeats,
+            "warmup": warmup,
             "thinking": thinking,
         },
         "frozen_before_traffic_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -186,75 +221,153 @@ def run_bench(
     timeout_s: float = 900.0,
     flush_cold: bool = False,
     variant: str = "",
+    promotion_manifest=None,
 ) -> Dict[str, Any]:
     if flush_cold and os.environ.get("QUAL_HARNESS_OWNER_ADMITTED") != "1":
         raise SystemExit(
             "--flush-cold requires QUAL_HARNESS_OWNER_ADMITTED=1: only the "
             "owner-admitted idle campaign endpoint may be flushed"
         )
-    client = OpenAICompatClient(base)
-    client.verify_model()  # exact model identity before any traffic
-    gate = ConcurrencyGate(1)
+    if type(repeats) is not int or repeats < 1 or type(warmup) is not int or warmup < 0:
+        raise ValueError("repeats must be positive and warmup nonnegative integers")
+    raw_path = out_path.with_suffix(out_path.suffix + ".raw.jsonl")
+    corpus_path = out_path.with_suffix(out_path.suffix + ".corpus.json")
+    if any(path.exists() for path in (out_path, raw_path, corpus_path)):
+        raise FileExistsError("prose output and sidecars must all be fresh")
     thinking = thinking if thinking is not None else thinking_request_fields(False)
-
+    requests = json.loads(json.dumps(prose_payloads(thinking)))
+    bindings = bind_requests(promotion_manifest, "prose", requests)
+    write_corpus_lock(
+        corpus_path, base=base, thinking=thinking, repeats=repeats, warmup=warmup
+    )
+    gate = ConcurrencyGate(1)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    raw_fd = os.open(raw_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     flush_log: List[Dict[str, Any]] = []
     measured: List[Dict[str, Any]] = []
     warm_rows = 0
 
+    def emit_raw(case, repeat, res, warm):
+        row = {
+            "case": case,
+            "repeat": repeat,
+            "warmup": warm,
+            "model": MODEL_ID,
+            "model_reported": res.model_reported,
+            "request": requests[case],
+            "input_sha256": input_hash(requests[case]),
+            "usage": res.usage,
+            "finish_reason": res.finish_reason,
+            "error": res.error,
+            "content": res.content or "",
+            "raw_events": res.raw_events,
+        }
+        os.write(raw_fd, (json.dumps(row, ensure_ascii=False) + "\n").encode())
+        os.fsync(raw_fd)
+
     def emit(row: Dict[str, Any]) -> None:
+        row["input_sha256"] = input_hash(requests[row["case"]])
+        if bindings and not row["warmup"]:
+            row["_evidence"] = bindings[row["case"]]
         line = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
         os.write(fd, line)  # single append write per row
         os.fsync(fd)
 
     try:
+        client = OpenAICompatClient(base)
+        client.verify_model()
         for case in PROSE_CASES:
             if flush_cold:
                 status, body = client.flush_cache(admitted=True, timeout=30.0)
-                flush_log.append({"case": case["case_id"], "status": status,
-                                  "body": body[:200], "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+                flush_log.append(
+                    {
+                        "case": case["case_id"],
+                        "status": status,
+                        "body": body[:200],
+                        "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                )
                 if status != 200:
-                    raise SystemExit(f"flush_cache failed for {case['case_id']}: HTTP {status}")
-            messages = [{"role": "user", "content": case["prompt"]}]
+                    raise SystemExit(
+                        f"flush_cache failed for {case['case_id']}: HTTP {status}"
+                    )
+            request = requests[case["case_id"]]
+            messages = request["messages"]
+            controls = {
+                key: request[key]
+                for key in ("chat_template_kwargs", "reasoning_effort")
+                if key in request
+            }
             for w in range(warmup):  # separately marked warmup, never measured
                 with gate.slot():
                     res = client.chat_stream(
-                        messages, max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
-                        top_p=TOP_P, thinking=thinking, timeout=timeout_s,
+                        messages,
+                        max_tokens=request["max_tokens"],
+                        temperature=request["temperature"],
+                        top_p=request["top_p"],
+                        thinking=controls,
+                        timeout=timeout_s,
                     )
+                emit_raw(case["case_id"], w, res, True)
                 warm_rows += 1
-                emit({
-                    "case": case["case_id"], "repeat": "warmup", "warmup": True,
-                    "valid": False, "reason": "warmup_not_measured",
-                    "ok": res.ok, "error": res.error,
-                    "finish_reason": res.finish_reason, "usage": res.usage,
-                    "wall_s": res.wall_s, "ttft_s": res.ttft_s,
-                    "e2erate": res.e2e_output_tok_per_s,
-                    "model": MODEL_ID, "variant": variant,
-                    "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "final_text": (res.content or "")[-1000:],
-                    "raw_events": res.raw_events,
-                })
+                emit(
+                    {
+                        "case": case["case_id"],
+                        "repeat": "warmup",
+                        "warmup": True,
+                        "valid": False,
+                        "reason": "warmup_not_measured",
+                        "ok": res.ok,
+                        "error": res.error,
+                        "finish_reason": res.finish_reason,
+                        "usage": res.usage,
+                        "wall_s": res.wall_s,
+                        "ttft_s": res.ttft_s,
+                        "e2erate": res.e2e_output_tok_per_s,
+                        "model": MODEL_ID,
+                        "variant": variant,
+                        "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "final_text": (res.content or "")[-1000:],
+                        "raw_events": res.raw_events,
+                    }
+                )
             for rep in range(repeats):
                 with gate.slot():  # admission strictly precedes the clock
                     res = client.chat_stream(
-                        messages, max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
-                        top_p=TOP_P, thinking=thinking, timeout=timeout_s,
+                        messages,
+                        max_tokens=request["max_tokens"],
+                        temperature=request["temperature"],
+                        top_p=request["top_p"],
+                        thinking=controls,
+                        timeout=timeout_s,
                     )
+                emit_raw(case["case_id"], rep, res, False)
                 valid, reason = row_validity(
-                    res, require_finish="stop", require_content=True,
+                    res,
+                    require_finish="stop",
+                    require_content=True,
                     min_content_chars=MIN_MEANINGFUL_CHARS,
                 )
+                if res.model_reported != MODEL_ID:
+                    valid, reason = False, "wrong_reported_model"
                 row = {
-                    "case": case["case_id"], "repeat": rep, "warmup": False,
-                    "valid": valid, "reason": reason,
-                    "ok": res.ok, "error": res.error,
-                    "finish_reason": res.finish_reason, "usage": res.usage,
-                    "wall_s": res.wall_s, "ttft_s": res.ttft_s,
+                    "case": case["case_id"],
+                    "repeat": rep,
+                    "warmup": False,
+                    "model_reported": res.model_reported,
+                    "valid": valid,
+                    "reason": reason,
+                    "ok": res.ok,
+                    "error": res.error,
+                    "finish_reason": res.finish_reason,
+                    "usage": res.usage,
+                    "wall_s": res.wall_s,
+                    "ttft_s": res.ttft_s,
                     "e2erate": res.e2e_output_tok_per_s,
                     "first_fragment_kind": res.first_fragment_kind,
-                    "model": MODEL_ID, "variant": variant,
+                    "model": MODEL_ID,
+                    "variant": variant,
                     "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "final_text": (res.content or "")[-4000:],
                     "raw_events": res.raw_events,
@@ -263,14 +376,19 @@ def run_bench(
                 emit(row)
     finally:
         os.close(fd)
+        os.close(raw_fd)
 
     invalid = [r for r in measured if not r["valid"]]
     summary = {
         "kind": "qualification-c1-prose-summary",
+        "promotion_bound": bool(bindings),
+        "scope": "PROSE_DIAGNOSTIC" if not bindings else "BOUND_PROSE_LANE",
         "model_id": MODEL_ID,
         "corpus_sha256": corpus_sha256(),
         "cases": [c["case_id"] for c in PROSE_CASES],
-        "repeats": repeats, "warmup": warmup, "warm_rows": warm_rows,
+        "repeats": repeats,
+        "warmup": warmup,
+        "warm_rows": warm_rows,
         "measured_rows": len(measured),
         "invalid_rows": [
             {"case": r["case"], "repeat": r["repeat"], "reason": r["reason"]}
@@ -278,10 +396,13 @@ def run_bench(
         ],
         "flush_log": flush_log,
         "median_e2erate_by_case": {
-            c["case_id"]: _median([
-                r["e2erate"] for r in measured
-                if r["case"] == c["case_id"] and r["e2erate"] is not None
-            ])
+            c["case_id"]: _median(
+                [
+                    r["e2erate"]
+                    for r in measured
+                    if r["case"] == c["case_id"] and r["e2erate"] is not None
+                ]
+            )
             for c in PROSE_CASES
         },
         "ok": len(measured) == repeats * len(PROSE_CASES) and not invalid,
@@ -304,31 +425,48 @@ def _median(xs: List[float]) -> Optional[float]:
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="C1 real-prose streaming benchmark")
     p.add_argument("--base", required=True, help="explicit endpoint base URL")
-    p.add_argument("--output", required=True, help="JSONL rows (exclusive, no rerun overwrite)")
+    p.add_argument(
+        "--output", required=True, help="JSONL rows (exclusive, no rerun overwrite)"
+    )
     p.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
     p.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     p.add_argument("--timeout", type=float, default=900.0)
-    p.add_argument("--thinking", action="store_true",
-                   help="enable native thinking at low effort (default: enable_thinking=False)")
-    p.add_argument("--flush-cold", action="store_true",
-                   help="POST /flush_cache before each case (requires owner admission env)")
+    p.add_argument(
+        "--thinking",
+        action="store_true",
+        help="enable native thinking at low effort (default: enable_thinking=False)",
+    )
+    p.add_argument(
+        "--flush-cold",
+        action="store_true",
+        help="POST /flush_cache before each case (requires owner admission env)",
+    )
     p.add_argument("--variant", default="", help="optional label (e.g. AR / NEXTN)")
+    p.add_argument(
+        "--promotion-manifest",
+        help="frozen common manifest; absent means diagnostic-only",
+    )
     args = p.parse_args(argv)
 
     out = Path(args.output)
     if out.exists():
         print(f"refusing to overwrite existing output: {out}", file=sys.stderr)
         return 2
-    thinking = thinking_request_fields(True, "low") if args.thinking else thinking_request_fields(False)
-    write_corpus_lock(
-        out.with_suffix(out.suffix + ".corpus.json"),
-        base=args.base, thinking=thinking,
-        repeats=args.repeats, warmup=args.warmup,
+    thinking = (
+        thinking_request_fields(True, "low")
+        if args.thinking
+        else thinking_request_fields(False)
     )
     summary = run_bench(
-        args.base, out,
-        repeats=args.repeats, warmup=args.warmup, thinking=thinking,
-        timeout_s=args.timeout, flush_cold=args.flush_cold, variant=args.variant,
+        args.base,
+        out,
+        repeats=args.repeats,
+        warmup=args.warmup,
+        thinking=thinking,
+        timeout_s=args.timeout,
+        flush_cold=args.flush_cold,
+        variant=args.variant,
+        promotion_manifest=load_manifest(args.promotion_manifest),
     )
     print(json.dumps(summary, indent=2))
     return 0 if summary["ok"] else 1
