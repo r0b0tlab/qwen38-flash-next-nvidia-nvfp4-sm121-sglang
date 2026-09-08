@@ -85,13 +85,14 @@ class TokenizerProtocol(Protocol):
 
     name: str
 
-    def encode(self, text: str) -> List[int]: ...
+    def encode(self, text: str, add_special_tokens: bool = True) -> List[int]: ...
 
     def decode(self, ids: Sequence[int]) -> str: ...
 
     def apply_chat_template(
-        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True
-    ) -> str: ...
+        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True,
+        tokenize: bool = True, enable_thinking: bool = True, reasoning_effort: str = "low",
+    ) -> Any: ...
 
 
 class FakeTokenizer:
@@ -113,7 +114,9 @@ class FakeTokenizer:
             self._next += 1
         return self._vocab[word]
 
-    def encode(self, text: str) -> List[int]:
+    def encode(self, text: str, add_special_tokens: bool = True) -> List[int]:
+        if not isinstance(text, str):
+            raise ValueError("text input must be a string")
         return [self._tok(w) for w in text.split(" ") if w != ""]
 
     def decode(self, ids: Sequence[int]) -> str:
@@ -121,12 +124,14 @@ class FakeTokenizer:
         return " ".join(inv.get(i, "<unk>") for i in ids)
 
     def apply_chat_template(
-        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True
-    ) -> str:
+        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True,
+        tokenize: bool = True, enable_thinking: bool = True, reasoning_effort: str = "low",
+    ):
         parts = [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>" for m in messages]
         if add_generation_prompt:
             parts.append("<|im_start|>assistant\n")
-        return "".join(parts)
+        rendered = "".join(parts)
+        return self.encode(rendered) if tokenize else rendered
 
 
 def load_real_tokenizer(tokenizer_dir: str) -> TokenizerProtocol:
@@ -135,7 +140,7 @@ def load_real_tokenizer(tokenizer_dir: str) -> TokenizerProtocol:
         from transformers import AutoTokenizer
     except ImportError as exc:  # pragma: no cover - parent env has transformers
         raise RuntimeError(f"transformers unavailable: {exc}") from exc
-    tok = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=False)
+    tok = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=False, local_files_only=True)
     tok.name = f"real:{tokenizer_dir}"
     return tok  # type: ignore[return-value]
 
@@ -166,7 +171,7 @@ class NiahCase:
 
 def _build_filler(tokenizer: TokenizerProtocol, sentence: str, n_tokens: int) -> List[int]:
     """Pre-tokenize one filler sentence, then tile it to >= n_tokens tokens."""
-    one = tokenizer.encode(sentence)
+    one = tokenizer.encode(sentence, add_special_tokens=False)
     if not one:
         raise RuntimeError("filler sentence encoded to zero tokens")
     reps = (n_tokens // len(one)) + 2
@@ -176,79 +181,57 @@ def _build_filler(tokenizer: TokenizerProtocol, sentence: str, n_tokens: int) ->
 def _encode_with_positions(
     tokenizer: TokenizerProtocol,
     system: str,
-    needle_specs: Sequence[Tuple[float, List[int]]],  # (depth, needle_ids)
+    needle_specs: Sequence[Tuple[float, List[int]]],
     query: str,
     n_target: int,
 ) -> Tuple[List[int], List[int], str]:
-    """Render system+body+query through the chat template in token space.
+    """Splice exact IDs between the real template's encoded prefix/suffix.
 
-    Returns (prompt_ids, needle_offsets_in_prompt, rendered_text) with
-    ``len(prompt_ids) == n_target`` exactly.
-
-    Strategy: measure the template wrapper and the query suffix in tokens,
-    size the tiled filler body so the total lands on the target, splice
-    needles at body offsets that map to ``int(depth * n_target)`` in prompt
-    space, then verify by re-encoding the rendered string. If the estimate is
-    off (BPE boundary effects), the body budget is corrected by the measured
-    delta and the build repeats — bounded, and still fail-closed: the loop
-    raises rather than sending a stream whose length differs from the target.
-
-    The body/query boundary is written as ``body + " " + "\n\n" + query``; the
-    single space keeps the separator tokenization independent of the last body
-    word (a merge there would make the length converge structurally wrong).
+    The wire format is token IDs, not a decode/re-encode estimate. A NUL
+    placeholder is used only to locate the insertion point and is removed
+    before any request; both tokenizer and template remain unchanged.
     """
-    wrapper_ids = tokenizer.encode(
-        tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": "\x00"},
-            ],
-            add_generation_prompt=True,
-        )
+    slot = "\x00"
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "system", "content": system},
+         {"role": "user", "content": " " + slot + " \n\n" + query}],
+        add_generation_prompt=True, tokenize=False,
+        enable_thinking=True, reasoning_effort="low",
     )
-    ph_len = len(tokenizer.encode("\x00"))
-    suffix_ids = tokenizer.encode("\n\n" + query)
-    wrapper_est = len(wrapper_ids) - ph_len
-    min_needle = max((len(n) for _, n in needle_specs), default=0)
+    if not isinstance(rendered, str):
+        raise RuntimeError("tokenize=False did not produce template text")
+    template_ids = list(tokenizer.encode(rendered, add_special_tokens=False))
+    slot_ids = list(tokenizer.encode(slot, add_special_tokens=False))
+    if not slot_ids:
+        raise RuntimeError("template insertion slot encoded empty")
+    starts = [i for i in range(len(template_ids) - len(slot_ids) + 1)
+              if template_ids[i:i + len(slot_ids)] == slot_ids]
+    if len(starts) != 1:
+        raise RuntimeError("slot must be unique and contiguous in the actual template")
+    start = starts[0]
+    prefix, suffix = template_ids[:start], template_ids[start + len(slot_ids):]
+    body_size = n_target - len(prefix) - len(suffix)
+    if body_size <= 0:
+        raise RuntimeError("template/query consumes the entire prompt budget")
+    body = _build_filler(tokenizer, FILLER_SENTENCE, body_size)
+    offsets, occupied = [], []
+    for depth, needle_ids in needle_specs:
+        offset = int(depth * n_target)
+        body_offset = offset - len(prefix)
+        end = body_offset + len(needle_ids)
+        if not 0 <= body_offset < end <= len(body):
+            raise RuntimeError("requested needle position is outside the template body")
+        if any(body_offset < previous_end and previous_start < end
+               for previous_start, previous_end in occupied):
+            raise RuntimeError("needle token ranges overlap")
+        body[body_offset:end] = needle_ids
+        occupied.append((body_offset, end))
+        offsets.append(offset)
+    prompt_ids = prefix + body + suffix
+    if len(prompt_ids) != n_target:
+        raise RuntimeError("token-space construction violated its exact length")
+    return prompt_ids, offsets, tokenizer.decode(prompt_ids)
 
-    adjust = 0
-    for _attempt in range(5):
-        body_budget = n_target - wrapper_est - len(suffix_ids) + adjust
-        if body_budget < min_needle + 10:
-            raise RuntimeError(
-                f"body budget {body_budget} too small for target {n_target} "
-                "(template wrapper + query overhead)"
-            )
-        body_ids = _build_filler(tokenizer, FILLER_SENTENCE, body_budget)
-        # splice descending so earlier offsets stay valid while slicing, but
-        # keep offsets aligned to the caller's spec order
-        order = sorted(range(len(needle_specs)), key=lambda i: -needle_specs[i][0])
-        needle_prompt_offsets: List[int] = [0] * len(needle_specs)
-        for i in order:
-            depth, needle_ids = needle_specs[i]
-            body_off = int(depth * n_target) - wrapper_est
-            body_off = max(0, min(body_off, body_budget - len(needle_ids)))
-            body_ids[body_off : body_off + len(needle_ids)] = needle_ids
-            needle_prompt_offsets[i] = wrapper_est + body_off
-
-        body_text = tokenizer.decode(body_ids)
-        user_content = body_text + " \n\n" + query
-        rendered = tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
-            add_generation_prompt=True,
-        )
-        prompt_ids = tokenizer.encode(rendered)
-        if len(prompt_ids) == n_target:
-            return prompt_ids, needle_prompt_offsets, rendered
-        adjust += n_target - len(prompt_ids)
-    raise RuntimeError(
-        f"could not converge rendered stream to {n_target} tokens "
-        f"(last try {len(prompt_ids)}); fix the encoder/template root cause, "
-        "never switch encoders or crop silently"
-    )
 
 
 def build_case(
@@ -286,7 +269,7 @@ def build_case(
     specs: List[Tuple[float, List[int]]] = []
     for code, depth in zip(codes, depths):
         text = NEEDLE_TEMPLATE.format(code=code)
-        ids = tokenizer.encode(text)
+        ids = tokenizer.encode(text, add_special_tokens=False)
         if not ids:
             raise RuntimeError(f"{case_id}: needle for {code!r} encoded empty")
         needles.append(Needle(code=code, text=text, token_ids=ids, start_offset=-1))
@@ -385,6 +368,7 @@ def freeze_manifest(cases: Sequence[NiahCase], tokenizer: TokenizerProtocol) -> 
                 "needle_offsets": [n.start_offset for n in c.needles],
                 "needle_token_lens": [len(n.token_ids) for n in c.needles],
                 "prompt_sha256": c.prompt_sha256,
+                "prompt_ids": list(c.prompt_ids),
                 "rendered_text_sha256": c.rendered_text_sha256,
             }
             for c in cases
@@ -453,7 +437,7 @@ def run_cases(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     verdicts: Dict[str, str] = {}
     ran = 0
-    with out_path.open("a", encoding="utf-8") as fout:
+    with out_path.open("x", encoding="utf-8") as fout:
         for case in cases:
             if dry_run:
                 row = {
@@ -501,8 +485,8 @@ def run_cases(
                     "finish_reason": res.finish_reason,
                     "usage": res.usage,
                     "wall_s": res.wall_s,
-                    "final_text": (res.text or "")[-4000:],
-                    "raw_body": res.raw_body[:8000],  # raw evidence preserved
+                    "final_text": res.text or "",
+                    "raw_body": res.raw_body,  # bounded by client; no silent evidence truncation
                     "prompt_sha256": case.prompt_sha256,
                 }
             fout.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -560,25 +544,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     manifest = freeze_manifest(cases, tokenizer)
     manifest["partial_selection"] = bool(args.only)
     manifest_path = Path(args.manifest)
-    if manifest_path.exists():
-        print(f"refusing to overwrite existing manifest: {manifest_path}", file=sys.stderr)
-        return 2
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-
     out = Path(args.output)
-    if out.exists():
-        print(f"refusing to overwrite existing output: {out}", file=sys.stderr)
+    if manifest_path.resolve() == out.resolve() or manifest_path.exists() or out.exists():
+        print("manifest/output must be distinct fresh paths", file=sys.stderr)
         return 2
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("x", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+        handle.write("\n")
 
-    summary = run_cases(None, cases, out, dry_run=args.dry_run)
-    if not args.dry_run:
+    if args.dry_run:
+        summary = run_cases(None, cases, out, dry_run=True)
+        summary["construction_ok"] = True
+    else:
         client = OpenAICompatClient(args.base)
         client.verify_model()  # exact identity before heavy traffic
-        out.unlink(missing_ok=True)  # rewrite rows for real (dry rows not persisted)
         summary = run_cases(client, cases, out)
-
+    summary["partial_selection"] = bool(args.only)
     print(json.dumps(summary, indent=2))
-    return 0 if summary["ok"] else 1
+    # Successful preparation is not a successful retrieval run: ok stays false.
+    return 0 if args.dry_run or summary["ok"] else 1
 
 
 if __name__ == "__main__":
