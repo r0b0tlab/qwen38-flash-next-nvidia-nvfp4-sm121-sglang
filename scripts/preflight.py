@@ -25,6 +25,8 @@ Status: NOT QUALIFIED.
 from __future__ import annotations
 
 import os
+import math
+import re
 import platform
 from typing import Any, Callable, Dict, List, Optional
 
@@ -71,9 +73,9 @@ def read_meminfo(path: str = "/proc/meminfo") -> Optional[Dict[str, int]]:
     fields: Dict[str, int] = {}
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) >= 2 and parts[1] == "kB":
+        if len(parts) == 3 and parts[2] == "kB":
             try:
-                fields[parts[0].rstrip(":")] = int(parts[1 + -1 + -1 + 1])
+                fields[parts[0].rstrip(":")] = int(parts[1])
             except ValueError:
                 return None
     return fields or None
@@ -99,7 +101,7 @@ def read_gpu_state() -> Optional[Dict[str, Any]]:
             timeout=30,
         )
         apps = subprocess.run(
-            [binary, "--query-compute-apps=pid,process_name,used_memory"],
+            [binary, "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -120,7 +122,7 @@ def read_gpu_state() -> Optional[Dict[str, Any]]:
                     "name": cells[1],
                     "uuid": cells[2],
                     "utilization_percent": float(cells[3]),
-                    "memory_used_mib": float(cells[4]),
+                    "memory_used_mib": None if cells[4] in ("[N/A]", "N/A") else float(cells[4]),
                 }
             )
         except ValueError:
@@ -145,16 +147,12 @@ def read_mountinfo(path: str = "/proc/self/mountinfo") -> Optional[List[Dict[str
         return None
     out: List[Dict[str, str]] = []
     for line in lines:
-        fields = line.split()
-        if len(fields) < 10:
+        left, separator, right = line.partition(" - ")
+        fields, fs = left.split(), right.split()
+        if not separator or len(fields) < 6 or len(fs) < 3:
             return None
-        out.append(
-            {
-                "mount_point": fields[4],
-                "fstype": fields[8],
-                "source": fields[9],
-            }
-        )
+        unescape = lambda s: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), s)
+        out.append({"mount_point": unescape(fields[4]), "fstype": fs[0], "source": unescape(fs[1])})
     return out
 
 
@@ -165,14 +163,15 @@ def statvfs(path: str) -> Any:
 def _mount_for(
     target: str, mounts: List[Dict[str, str]]
 ) -> Optional[Dict[str, str]]:
-    """Deepest mount point at or above ``target``."""
+    """Deepest mount point at or above ``target`` (root "/" included)."""
     best: Optional[Dict[str, str]] = None
-    target = os.path.abspath(target) + "/"
+    target = os.path.abspath(target)
     for entry in mounts:
-        mount_point = os.path.abspath(entry["mount_point"]) + "/"
-        if target.startswith(mount_point):
-            if best is None or len(mount_point) > len(
-                os.path.abspath(best["mount_point"]) + "/"
+        mount_point = os.path.abspath(entry["mount_point"])
+        prefix = mount_point.rstrip("/") + "/"
+        if target == mount_point or target.startswith(prefix):
+            if best is None or len(os.path.abspath(best["mount_point"])) < len(
+                mount_point
             ):
                 best = entry
     return best
@@ -190,7 +189,16 @@ def _fs_identity(
         "known": True,
     }
     try:
-        st = statvfs_fn(target if os.path.exists(target) else os.path.dirname(target))
+        probe = os.path.abspath(target)
+        while True:
+            try:
+                st = statvfs_fn(probe)
+                break
+            except FileNotFoundError:
+                parent = os.path.dirname(probe)
+                if parent == probe:
+                    raise
+                probe = parent
         identity["free_bytes"] = st.f_bavail * st.f_frsize
     except OSError:
         identity["free_bytes"] = None
@@ -198,11 +206,12 @@ def _fs_identity(
     return identity
 
 
-def _present_bytes(root: Optional[str]) -> Optional[int]:
+def _present_bytes(root: Optional[str], *, allocated: bool = False) -> Optional[int]:
     """Total bytes of regular files under ``root`` (None: unreadable)."""
     if not root:
         return 0
     total = 0
+    seen = set()
     stack = [root]
     while stack:
         current = stack.pop()
@@ -219,7 +228,11 @@ def _present_bytes(root: Optional[str]) -> Optional[int]:
                 if entry.is_dir(follow_symlinks=False):
                     stack.append(entry.path)
                 elif entry.is_file(follow_symlinks=False):
-                    total += entry.stat(follow_symlinks=False).st_size
+                    st = entry.stat(follow_symlinks=False)
+                    identity = (st.st_dev, st.st_ino)
+                    if identity not in seen:
+                        total += st.st_blocks * 512 if allocated else st.st_size
+                        seen.add(identity)
             except OSError:
                 return None
     return total
@@ -296,22 +309,23 @@ def run_preflight(
         _add_check(
             checks,
             "gpu_inventory",
-            len(gpus) == 1,
+            len(gpus) == 1 and gpus[0].get("index") == 0 and gpus[0].get("name") in ("GB10", "NVIDIA GB10"),
             "found %d GPU(s), need exactly 1: %s"
             % (len(gpus), [g.get("name") for g in gpus]),
         )
         if gpus:
             target = gpus[0]
+            used = target.get("memory_used_mib")
             idle = (
                 target["utilization_percent"] == 0.0
-                and target["memory_used_mib"] <= GPU_IDLE_MEMORY_MIB_MAX
+                and (used is None or (math.isfinite(used) and used <= GPU_IDLE_MEMORY_MIB_MAX))
             )
             _add_check(
                 checks,
                 "gpu_idle",
                 idle,
-                "utilization=%.0f%% memory_used=%.0f MiB"
-                % (target["utilization_percent"], target["memory_used_mib"]),
+                "utilization=%s%% memory_used_mib=%s (UMA RAM checked separately)"
+                % (target["utilization_percent"], used),
             )
         else:
             _add_check(checks, "gpu_idle", False, "no GPU present")
@@ -333,7 +347,7 @@ def run_preflight(
         disk_rows: List[Dict[str, Any]] = []
     else:
         model_present = _present_bytes(model_root)
-        ple_present = _present_bytes(ple_dir)
+        ple_present = _present_bytes(ple_dir, allocated=True)
         if model_present is None or ple_present is None:
             _add_check(
                 checks, "filesystems", False,
@@ -401,7 +415,7 @@ def run_preflight(
                     known=row["known"],
                 )
             for row in disk_rows:
-                if row["fstype"] in REJECT_FILESYSTEMS:
+                if row["fstype"] in REJECT_FILESYSTEMS or str(row["fstype"]).startswith("fuse."):
                     _add_check(
                         checks,
                         "local_nvme[%s]" % (row["source"],),
