@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "mode": "ar",
+  "context_length": 32768,
+  "max_total_tokens": 32768,
+  "max_running_requests": 1,
+  "chunked_prefill_size": 2048,
+  "max_mamba_cache_size": 16,
+  "mem_fraction_static": 0.8,
+  "kv_cache_dtype": "bf16",
+  "vision": {
+    "backend": "triton_attn",
+    "cuda_graph": true
+  },
+  "ple_rss_gib": 4,
+  "mm_processor_worker_num": 1
+}
