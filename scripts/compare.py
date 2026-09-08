@@ -22,22 +22,35 @@ Gates (all must hold):
   wall-clock TTFT/total only — never a fake encoder timing that was not
   observable.
 """
+
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 REQUIRED_UPSTREAM_KEYS = (
-    "duration", "completed", "total_input_tokens", "total_output_tokens",
+    "duration",
+    "completed",
+    "total_input_tokens",
+    "total_output_tokens",
     "output_throughput",
 )
 REQUIRED_MANIFEST_KEYS = (
-    "model_sha", "image_id", "source_tree", "tokenizer", "input_token_sha",
-    "sampling", "context", "total_pool", "concurrency",
+    "model_sha",
+    "image_id",
+    "source_tree",
+    "tokenizer",
+    "input_token_sha",
+    "sampling",
+    "context",
+    "total_pool",
+    "concurrency",
 )
 LEVER_KEY = "lever"  # the ONLY field allowed to differ (explicit declaration)
 IMPROVEMENT_THRESHOLD = 0.05
@@ -99,32 +112,65 @@ def load_rows(path: Path, variant: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def measured_prose_rows(rows: List[Dict[str, Any]], variant: str) -> List[Dict[str, Any]]:
+def measured_prose_rows(
+    rows: List[Dict[str, Any]], variant: str
+) -> List[Dict[str, Any]]:
     """Keep complete measured prose rows; reject missing/invalid ones."""
     out: List[Dict[str, Any]] = []
     for i, row in enumerate(rows):
         if row.get("warmup") is True or row.get("repeat") == "warmup":
             continue
-        missing = [k for k in ("case", "repeat", "valid", "finish_reason",
-                               "usage", "wall_s", "ttft_s") if k not in row]
+        missing = [
+            k
+            for k in (
+                "case",
+                "repeat",
+                "valid",
+                "finish_reason",
+                "usage",
+                "wall_s",
+                "ttft_s",
+            )
+            if k not in row
+        ]
         if missing:
             raise Reject(f"{variant}: row {i} missing keys {missing}")
-        if row.get("case") in ("short", "medium"):
-            # upstream sglang.benchmark.serving short/medium rows pass through
-            # unchanged; validity is checked by the upstream-key gate below
-            out.append(row)
-            continue
         if row["valid"] is not True:
             raise Reject(
                 f"{variant}: invalid measured row {row.get('case')}#{row.get('repeat')}: "
                 f"{row.get('reason') or row.get('error')}"
             )
+        if (
+            row.get("model") != "nvidia/Qwen3.8-Flash-Next-NVFP4"
+            or row["finish_reason"] != "stop"
+        ):
+            raise Reject(f"{variant}: wrong model or incomplete measured prose")
         usage = row["usage"]
         if not isinstance(usage, dict):
             raise Reject(f"{variant}: row {i} usage is not an object")
-        comp = require_finite_positive(usage.get("completion_tokens"),
-                                       f"{variant} row {i} completion_tokens")
+        if any(
+            type(usage.get(k)) is not int
+            for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+        ):
+            raise Reject(f"{variant}: usage must be exact JSON integers")
+        if (
+            usage["prompt_tokens"] < 0
+            or usage["total_tokens"]
+            != usage["prompt_tokens"] + usage["completion_tokens"]
+        ):
+            raise Reject(f"{variant}: usage total mismatch")
+        comp = require_finite_positive(
+            usage.get("completion_tokens"), f"{variant} row {i} completion_tokens"
+        )
         wall = require_finite_positive(row["wall_s"], f"{variant} row {i} wall_s")
+        if require_finite_positive(row["ttft_s"], "prose ttft_s") > wall:
+            raise Reject("prose TTFT exceeds wall time")
+        if (
+            row.get("ok") is not True
+            or row.get("error") is not None
+            or not row.get("raw_events")
+        ):
+            raise Reject("prose row lacks successful raw response evidence")
         rate = comp / wall  # recomputed, never trusted from the row
         if row.get("e2erate") is not None:
             stated = float(row["e2erate"])
@@ -136,21 +182,35 @@ def measured_prose_rows(rows: List[Dict[str, Any]], variant: str) -> List[Dict[s
     return out
 
 
-def check_counts(rows: List[Dict[str, Any]], variant: str, repeats: int = 5) -> Dict[str, List[Dict[str, Any]]]:
+def check_counts(
+    rows: List[Dict[str, Any]], variant: str, repeats: int = 5
+) -> Dict[str, List[Dict[str, Any]]]:
     by_case: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         by_case.setdefault(row["case"], []).append(row)
-    expected_cases = {"db_index_write_read", "city_heat_water", "compression_vs_random_access"}
-    if not expected_cases.issubset(by_case):
-        raise Reject(f"{variant}: missing prose cases {sorted(expected_cases - set(by_case))}")
+    expected_cases = {
+        "db_index_write_read",
+        "city_heat_water",
+        "compression_vs_random_access",
+    }
+    if set(by_case) != expected_cases:
+        raise Reject(
+            f"{variant}: missing prose cases {sorted(expected_cases - set(by_case))}"
+        )
     for case in sorted(expected_cases):
         seen = [r["repeat"] for r in by_case[case]]
+        if any(type(value) is not int for value in seen):
+            raise Reject("repeat IDs must be exact integers")
         if len(seen) != len(set(seen)):
             raise Reject(f"{variant}: duplicate repeats in {case}")
         if len(seen) != repeats:
-            raise Reject(f"{variant}: {case} has {len(seen)} measured rows, expected {repeats}")
+            raise Reject(
+                f"{variant}: {case} has {len(seen)} measured rows, expected {repeats}"
+            )
         if sorted(seen) != list(range(repeats)):
-            raise Reject(f"{variant}: {case} repeats are {sorted(seen)}, expected 0..{repeats - 1}")
+            raise Reject(
+                f"{variant}: {case} repeats are {sorted(seen)}, expected 0..{repeats - 1}"
+            )
     return by_case
 
 
@@ -158,10 +218,13 @@ def check_prose_pass_cases(rows: List[Dict[str, Any]], variant: str) -> None:
     """When whole-run JSONL is fed, short/medium/prose all must be present."""
     cases = {r.get("case") for r in rows}
     for required in ("short", "medium"):
-        if required not in cases and not (cases & {
-            "db_index_write_read", "city_heat_water", "compression_vs_random_access"
-        }):
-            raise Reject(f"{variant}: neither upstream {required} rows nor prose rows present")
+        if required not in cases and not (
+            cases
+            & {"db_index_write_read", "city_heat_water", "compression_vs_random_access"}
+        ):
+            raise Reject(
+                f"{variant}: neither upstream {required} rows nor prose rows present"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +232,67 @@ def check_prose_pass_cases(rows: List[Dict[str, Any]], variant: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_upstream_detail(path: Path, variant: str, num_prompts: int = 8) -> List[Dict[str, Any]]:
+def _upstream_rate(row, variant, lane):
+    if lane not in ("short", "medium") or not isinstance(row, dict):
+        raise Reject("unknown upstream lane or malformed row")
+    required = set(REQUIRED_UPSTREAM_KEYS) | {
+        "backend",
+        "max_concurrency",
+        "random_input_len",
+        "random_output_len",
+        "input_lens",
+        "output_lens",
+        "errors",
+        "generated_texts",
+        "ttfts",
+    }
+    missing = sorted(required - row.keys())
+    if missing:
+        raise Reject(f"{variant}: missing keys {missing}")
+    if type(row["completed"]) is not int or row["completed"] != 8:
+        raise Reject(f"{variant}: completed={row['completed']}, expected 8")
+    inp, out = (512, 256) if lane == "short" else (2048, 512)
+    for field, expected in (
+        ("random_input_len", inp),
+        ("random_output_len", out),
+        ("max_concurrency", 1),
+        ("total_input_tokens", 8 * inp),
+        ("total_output_tokens", 8 * out),
+    ):
+        if type(row[field]) is not int or row[field] != expected:
+            raise Reject(f"{variant}: {lane} protocol mismatch in {field}")
+    if row["backend"] != "sglang-oai":
+        raise Reject("upstream backend is not the frozen sglang-oai protocol")
+    for field, value in (("input_lens", inp), ("output_lens", out)):
+        if (
+            not isinstance(row[field], list)
+            or len(row[field]) != 8
+            or any(type(x) is not int or x != value for x in row[field])
+        ):
+            raise Reject(f"{variant}: per-request {field} mismatch")
+    if (
+        row["errors"] != [""] * 8
+        or not isinstance(row["generated_texts"], list)
+        or len(row["generated_texts"]) != 8
+        or any(not isinstance(x, str) or not x for x in row["generated_texts"])
+    ):
+        raise Reject(f"{variant}: incomplete or failed upstream requests")
+    if not isinstance(row["ttfts"], list) or len(row["ttfts"]) != 8:
+        raise Reject("upstream request timing count mismatch")
+    for ttft in row["ttfts"]:
+        require_finite_positive(ttft, "upstream ttft")
+    rate = row["total_output_tokens"] / require_finite_positive(
+        row["duration"], "duration"
+    )
+    stated = require_finite_positive(row["output_throughput"], "output_throughput")
+    if abs(stated - rate) > max(1e-6, 0.02 * rate):
+        raise Reject("upstream output_throughput disagrees with tokens/duration")
+    return rate
+
+
+def load_upstream_detail(
+    path: Path, variant: str, num_prompts: int = 8, *, lane: str = "short"
+) -> List[Dict[str, Any]]:
     """Parse upstream bench_serving JSONL preserving raw details.
 
     Requires the source keys: duration, completed, total_input_tokens,
@@ -185,7 +308,9 @@ def load_upstream_detail(path: Path, variant: str, num_prompts: int = 8) -> List
             try:
                 row = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise Reject(f"{variant}:{path.name}:{lineno}: bad upstream JSON: {exc}")
+                raise Reject(
+                    f"{variant}:{path.name}:{lineno}: bad upstream JSON: {exc}"
+                )
             missing = [k for k in REQUIRED_UPSTREAM_KEYS if k not in row]
             if missing:
                 raise Reject(f"{variant}:{path.name}:{lineno}: missing keys {missing}")
@@ -195,8 +320,9 @@ def load_upstream_detail(path: Path, variant: str, num_prompts: int = 8) -> List
                     f"{variant}:{path.name}:{lineno}: completed={completed}, expected {num_prompts}"
                 )
             duration = require_finite_positive(row["duration"], f"{variant} duration")
-            out_tokens = require_finite_positive(row["total_output_tokens"],
-                                                 f"{variant} total_output_tokens")
+            out_tokens = require_finite_positive(
+                row["total_output_tokens"], f"{variant} total_output_tokens"
+            )
             rate = out_tokens / duration  # output/duration
             stated = row["output_throughput"]
             require_finite_positive(stated, f"{variant} output_throughput")
@@ -205,21 +331,27 @@ def load_upstream_detail(path: Path, variant: str, num_prompts: int = 8) -> List
                     f"{variant}:{path.name}:{lineno}: output_throughput {stated} "
                     f"disagrees with total_output_tokens/duration {rate}"
                 )
-            detail.append({
-                "row": row,              # raw details preserved for parent finalize
-                "rate": rate,
-                "completed": completed,
-            })
+            rate = _upstream_rate(row, variant, lane)
+            detail.append(
+                {
+                    "row": row,  # raw details preserved for parent finalize
+                    "rate": rate,
+                    "completed": completed,
+                }
+            )
     if not detail:
         raise Reject(f"{variant}: upstream detail file {path} is empty")
     return detail
 
 
-def upstream_median_rate(detail: List[Dict[str, Any]], variant: str,
-                         rounds: int = 5) -> float:
+def upstream_median_rate(
+    detail: List[Dict[str, Any]], variant: str, rounds: int = 5, *, lane: str = "short"
+) -> float:
     if len(detail) != rounds:
-        raise Reject(f"{variant}: upstream has {len(detail)} measured rounds, expected {rounds}")
-    return median([d["rate"] for d in detail])
+        raise Reject(
+            f"{variant}: upstream has {len(detail)} measured rounds, expected {rounds}"
+        )
+    return median([_upstream_rate(d["row"], variant, lane) for d in detail])
 
 
 # ---------------------------------------------------------------------------
@@ -233,22 +365,98 @@ def check_parity(base_m: Dict[str, Any], cand_m: Dict[str, Any]) -> Dict[str, An
     if missing:
         raise Reject(f"manifests missing required detail: {sorted(set(missing))}")
     mismatch = [
-        k for k in REQUIRED_MANIFEST_KEYS
-        if json.dumps(base_m[k], sort_keys=True) != json.dumps(cand_m[k], sort_keys=True)
+        k
+        for k in REQUIRED_MANIFEST_KEYS
+        if json.dumps(base_m[k], sort_keys=True)
+        != json.dumps(cand_m[k], sort_keys=True)
     ]
-    allowed = [k for k in mismatch if k == LEVER_KEY or k == "lever_kind"]
     # LEVER_KEY itself is not in REQUIRED_MANIFEST_KEYS; any required-key
     # mismatch is fatal. The lever is declared separately.
     if mismatch:
-        raise Reject(f"manifest parity mismatch in {mismatch} (only an explicitly "
-                     f"declared {LEVER_KEY} may differ)")
+        raise Reject(
+            f"manifest parity mismatch in {mismatch} (only an explicitly "
+            f"declared {LEVER_KEY} may differ)"
+        )
     lever_b, lever_c = base_m.get(LEVER_KEY), cand_m.get(LEVER_KEY)
     if not lever_c or not isinstance(lever_c, str):
-        raise Reject("candidate manifest must declare an explicit 'lever' string "
-                     "(the single speculative/profile lever being tested)")
+        raise Reject(
+            "candidate manifest must declare an explicit 'lever' string "
+            "(the single speculative/profile lever being tested)"
+        )
     if mixed := _mixed_epoch_guard(lever_b, lever_c):
         raise Reject(mixed)
     return {"lever": {"baseline": lever_b or "none", "candidate": lever_c}}
+
+
+def manifest_fingerprint(manifest):
+    body = {k: v for k, v in manifest.items() if k != "manifest_sha256"}
+    return hashlib.sha256(
+        json.dumps(
+            body, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    ).hexdigest()
+
+
+def check_evidence_binding(manifest, rows, lane):
+    """Promotion requires producer-bound metadata, not two matching documents."""
+    if (
+        manifest.get("schema") != "qwen38fn.promotion.v1"
+        or manifest.get("model_id") != "nvidia/Qwen3.8-Flash-Next-NVFP4"
+    ):
+        raise Reject("promotion manifest schema/model identity missing")
+    fingerprint = manifest_fingerprint(manifest)
+    if manifest.get("manifest_sha256") != fingerprint:
+        raise Reject("promotion manifest fingerprint mismatch")
+    for key, pattern in (
+        ("model_sha", r"[0-9a-f]{40}"),
+        ("source_tree", r"[0-9a-f]{40}"),
+        ("image_id", r"sha256:[0-9a-f]{64}"),
+        ("tokenizer", r"[0-9a-f]{64}"),
+        ("input_token_sha", r"[0-9a-f]{64}"),
+    ):
+        if not isinstance(manifest.get(key), str) or not re.fullmatch(
+            pattern, manifest[key]
+        ):
+            raise Reject("malformed promotion identity: " + key)
+    if type(manifest.get("concurrency")) is not int or manifest["concurrency"] != 1:
+        raise Reject("this promotion protocol requires C1")
+    if (
+        type(manifest.get("context")) is not int
+        or type(manifest.get("total_pool")) is not int
+        or not 32768 <= manifest["context"] <= 262144
+        or manifest["total_pool"] < manifest["context"]
+    ):
+        raise Reject("invalid context/pool envelope")
+    if not isinstance(manifest.get("inputs"), dict):
+        raise Reject("promotion manifest inputs must be an object")
+    inputs = manifest["inputs"].get(lane)
+    if not isinstance(inputs, dict) or not inputs:
+        raise Reject("promotion manifest is missing frozen lane inputs")
+    measured = [row for row in rows if row.get("warmup") is not True]
+    observed_cases = {row.get("case_id", row.get("case", "batch")) for row in measured}
+    if set(inputs) != observed_cases or (lane == "vision" and len(inputs) != 43):
+        raise Reject("frozen input set is incomplete or differs from measured rows")
+    for row in measured:
+        binding = row.get("_evidence")
+        case = row.get("case_id", row.get("case", "batch"))
+        if (
+            not isinstance(binding, dict)
+            or binding.get("manifest_sha256") != fingerprint
+            or binding.get("lane") != lane
+        ):
+            raise Reject("row is not bound to its producer manifest/lane")
+        if (
+            binding.get("model_id") != manifest["model_id"]
+            or row.get("model", manifest["model_id"]) != manifest["model_id"]
+        ):
+            raise Reject("row model differs from manifest")
+        expected = inputs.get(case)
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or binding.get("input_sha256") != expected
+        ):
+            raise Reject("row input differs from frozen manifest")
 
 
 def _norm_lever(v: Any) -> Optional[str]:
@@ -287,6 +495,8 @@ def compare(
     cand_manifest: Dict[str, Any],
     base_upstream: Optional[List[Dict[str, Any]]] = None,
     cand_upstream: Optional[List[Dict[str, Any]]] = None,
+    base_medium: Optional[List[Dict[str, Any]]] = None,
+    cand_medium: Optional[List[Dict[str, Any]]] = None,
     base_vision: Optional[List[Dict[str, Any]]] = None,
     cand_vision: Optional[List[Dict[str, Any]]] = None,
     repeats: int = 5,
@@ -295,13 +505,30 @@ def compare(
 
     parity = check_parity(base_manifest, cand_manifest)
     report["gates"]["parity"] = parity
+    # Revalidate public-API inputs, not only inputs arriving through main().
+    base_rows = measured_prose_rows(base_rows, "baseline")
+    cand_rows = measured_prose_rows(cand_rows, "candidate")
+    missing = [
+        name
+        for name, pair in {
+            "short": (base_upstream, cand_upstream),
+            "medium": (base_medium, cand_medium),
+            "vision": (base_vision, cand_vision),
+        }.items()
+        if any(x is None for x in pair)
+    ]
+    report["gates"]["complete_lanes"] = {"pass": not missing, "missing": missing}
 
     # ---- prose (C1): per-case median over ALL repeats, >=5% each ----------
     prose_gates: Dict[str, Any] = {}
     try:
         b_by = check_counts(base_rows, "baseline", repeats)
         c_by = check_counts(cand_rows, "candidate", repeats)
-        for case in ("db_index_write_read", "city_heat_water", "compression_vs_random_access"):
+        for case in (
+            "db_index_write_read",
+            "city_heat_water",
+            "compression_vs_random_access",
+        ):
             b_rates = [r["_rate"] for r in b_by[case]]
             c_rates = [r["_rate"] for r in c_by[case]]
             b_med, c_med = median(b_rates), median(c_rates)
@@ -309,8 +536,10 @@ def compare(
                 raise Reject(f"{case}: zero/NaN median rate")
             gain = (c_med - b_med) / b_med
             prose_gates[case] = {
-                "baseline_median": b_med, "candidate_median": c_med,
-                "improvement": gain, "pass": gain >= IMPROVEMENT_THRESHOLD,
+                "baseline_median": b_med,
+                "candidate_median": c_med,
+                "improvement": gain,
+                "pass": gain >= IMPROVEMENT_THRESHOLD,
             }
             if gain < IMPROVEMENT_THRESHOLD:
                 raise Reject(
@@ -333,14 +562,31 @@ def compare(
             if gain < IMPROVEMENT_THRESHOLD:
                 raise Reject(f"short: median improvement {gain:.4f} < 0.05")
             report["gates"]["upstream_short"] = {
-                "baseline_median": b_short, "candidate_median": c_short,
-                "improvement": gain, "pass": True,
+                "baseline_median": b_short,
+                "candidate_median": c_short,
+                "improvement": gain,
+                "pass": True,
             }
         except Reject as exc:
             report["gates"]["upstream_short"] = {"rejected": str(exc)}
             return report
 
-    # ---- vision p95 TTFT gate (when provided) -----------------------------
+    if base_medium is not None or cand_medium is not None:
+        if base_medium is None or cand_medium is None:
+            raise Reject("medium rows must be provided for BOTH variants")
+        b_med = upstream_median_rate(base_medium, "baseline medium", lane="medium")
+        c_med = upstream_median_rate(cand_medium, "candidate medium", lane="medium")
+        gain = (c_med - b_med) / b_med
+        report["gates"]["upstream_medium"] = {
+            "baseline_median": b_med,
+            "candidate_median": c_med,
+            "improvement": gain,
+            "pass": gain >= IMPROVEMENT_THRESHOLD,
+        }
+        if gain < IMPROVEMENT_THRESHOLD:
+            return report
+
+    # ---- paired vision gate ---------------------------------------------
     if base_vision is not None or cand_vision is not None:
         try:
             gate = vision_ttft_gate(base_vision, cand_vision)
@@ -351,6 +597,50 @@ def compare(
             report["gates"]["vision_p95_ttft"] = {"rejected": str(exc)}
             return report
 
+    if missing:
+        return report
+    if cand_manifest.get("lever_kind") == "vision":
+        metric = cand_manifest.get("vision_metric")
+        if metric not in ("wall_s", "ttft_s"):
+            raise Reject("vision lever requires an observable wall_s or ttft_s metric")
+        b = median(
+            [
+                require_finite_positive(r[metric], metric)
+                for r in base_vision
+                if not r.get("warmup")
+            ]
+        )
+        c = median(
+            [
+                require_finite_positive(r[metric], metric)
+                for r in cand_vision
+                if not r.get("warmup")
+            ]
+        )
+        gain = (b - c) / b
+        report["gates"]["vision_lever_gain"] = {
+            "metric": metric,
+            "improvement": gain,
+            "pass": gain >= VISION_LEVER_GAIN,
+        }
+        if gain < VISION_LEVER_GAIN:
+            return report
+    try:
+        for manifest, prose, short, medium, vision in (
+            (base_manifest, base_rows, base_upstream, base_medium, base_vision),
+            (cand_manifest, cand_rows, cand_upstream, cand_medium, cand_vision),
+        ):
+            for lane, rows in (
+                ("prose", prose),
+                ("short", [d["row"] for d in short]),
+                ("medium", [d["row"] for d in medium]),
+                ("vision", vision),
+            ):
+                check_evidence_binding(manifest, rows, lane)
+    except Reject as exc:
+        report["gates"]["evidence_binding"] = {"pass": False, "rejected": str(exc)}
+        return report
+    report["gates"]["evidence_binding"] = {"pass": True}
     report["verdict"] = "PASS"
     report["label"] = "prose E2E (end-to-end request, usage-based token rate)"
     return report
@@ -362,6 +652,7 @@ def vision_ttft_gate(
 ) -> Dict[str, Any]:
     if base_vision is None or cand_vision is None:
         raise Reject("vision rows must be provided for BOTH variants")
+
     def ttfts(rows: List[Dict[str, Any]], variant: str) -> List[float]:
         out = []
         for i, r in enumerate(rows):
@@ -369,19 +660,45 @@ def vision_ttft_gate(
                 continue
             if r.get("error") is not None:
                 raise Reject(f"{variant} vision row {i} has error {r['error']}")
+            if r.get("valid") is not True or r.get("finish_reason") != "stop":
+                raise Reject(
+                    f"{variant} vision row {i} lacks successful semantic/finish evidence"
+                )
             ttft = r.get("ttft_s")
             if ttft is None:
                 raise Reject(f"{variant} vision row {i} missing ttft_s")
-            out.append(require_finite_positive(ttft, f"{variant} vision row {i} ttft_s"))
+            out.append(
+                require_finite_positive(ttft, f"{variant} vision row {i} ttft_s")
+            )
         if len(out) < 2:
             raise Reject(f"{variant}: too few vision rows ({len(out)}) for p95")
         return out
+
     b = ttfts(base_vision, "baseline")
     c = ttfts(cand_vision, "candidate")
+
+    def identities(rows):
+        selected = [r for r in rows if not r.get("warmup")]
+        result = {}
+        for row in selected:
+            key = (row.get("case_id"), row.get("repeat"))
+            if not isinstance(key[0], str) or type(key[1]) is not int or key in result:
+                raise Reject(
+                    "vision rows have missing/duplicate case/repeat identities"
+                )
+            value = row.get("input_sha256")
+            if not isinstance(value, str) or len(value) != 64:
+                raise Reject("vision input byte hash is missing")
+            result[key] = value
+        return result
+
+    if identities(base_vision) != identities(cand_vision):
+        raise Reject("vision case/input pairing mismatch")
     b95, c95 = percentile(b, 0.95), percentile(c, 0.95)
     regression = (c95 - b95) / b95
     return {
-        "baseline_p95_ttft": b95, "candidate_p95_ttft": c95,
+        "baseline_p95_ttft": b95,
+        "candidate_p95_ttft": c95,
         "regression": regression,
         "pass": regression <= VISION_TTFT_REGRESSION_LIMIT,
     }
@@ -410,11 +727,15 @@ def _load_jsonl(name: str) -> List[Dict[str, Any]]:
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="fail-closed C1 comparison reducer")
     p.add_argument("--baseline", required=True, help="baseline JSONL (bench_real rows)")
-    p.add_argument("--candidate", required=True, help="candidate JSONL (bench_real rows)")
+    p.add_argument(
+        "--candidate", required=True, help="candidate JSONL (bench_real rows)"
+    )
     p.add_argument("--baseline-manifest", required=True)
     p.add_argument("--candidate-manifest", required=True)
     p.add_argument("--baseline-upstream", help="upstream bench_serving short JSONL")
     p.add_argument("--candidate-upstream", help="upstream bench_serving short JSONL")
+    p.add_argument("--baseline-medium", help="upstream bench_serving medium JSONL")
+    p.add_argument("--candidate-medium", help="upstream bench_serving medium JSONL")
     p.add_argument("--baseline-vision", help="vision JSONL rows (baseline)")
     p.add_argument("--candidate-vision", help="vision JSONL rows (candidate)")
     p.add_argument("--output", help="optional verdict JSON output path")
@@ -422,14 +743,38 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         report = compare(
-            base_rows=measured_prose_rows(load_rows(Path(args.baseline), "baseline"), "baseline"),
-            cand_rows=measured_prose_rows(load_rows(Path(args.candidate), "candidate"), "candidate"),
+            base_rows=measured_prose_rows(
+                load_rows(Path(args.baseline), "baseline"), "baseline"
+            ),
+            cand_rows=measured_prose_rows(
+                load_rows(Path(args.candidate), "candidate"), "candidate"
+            ),
             base_manifest=_load_json(args.baseline_manifest),
             cand_manifest=_load_json(args.candidate_manifest),
-            base_upstream=load_upstream_detail(Path(args.baseline_upstream), "baseline") if args.baseline_upstream else None,
-            cand_upstream=load_upstream_detail(Path(args.candidate_upstream), "candidate") if args.candidate_upstream else None,
-            base_vision=_load_jsonl(args.baseline_vision) if args.baseline_vision else None,
-            cand_vision=_load_jsonl(args.candidate_vision) if args.candidate_vision else None,
+            base_upstream=load_upstream_detail(Path(args.baseline_upstream), "baseline")
+            if args.baseline_upstream
+            else None,
+            cand_upstream=load_upstream_detail(
+                Path(args.candidate_upstream), "candidate"
+            )
+            if args.candidate_upstream
+            else None,
+            base_medium=load_upstream_detail(
+                Path(args.baseline_medium), "baseline medium", lane="medium"
+            )
+            if args.baseline_medium
+            else None,
+            cand_medium=load_upstream_detail(
+                Path(args.candidate_medium), "candidate medium", lane="medium"
+            )
+            if args.candidate_medium
+            else None,
+            base_vision=_load_jsonl(args.baseline_vision)
+            if args.baseline_vision
+            else None,
+            cand_vision=_load_jsonl(args.candidate_vision)
+            if args.candidate_vision
+            else None,
         )
     except Reject as exc:
         report = {"verdict": "NOT_OPTIMIZED", "rejected": str(exc)}

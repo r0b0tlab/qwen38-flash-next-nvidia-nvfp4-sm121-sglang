@@ -5,10 +5,10 @@ verify freeze-before-traffic, row validity, exclusivity, and the fail-closed
 comparison verdicts (NOT_OPTIMIZED vs PASS, 5%-per-case gate, upstream
 count/keys gate, vision p95 TTFT gate).
 """
+
 from __future__ import annotations
 
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -57,16 +57,23 @@ class TestFrozenCorpus:
         assert first["frozen_before_traffic_utc"]
         assert first["sampling"]["max_tokens"] == 2048
         with pytest.raises(SystemExit, match="refusing to overwrite"):
-            br.write_corpus_lock(lock, base="http://x", thinking={}, repeats=5, warmup=1)
+            br.write_corpus_lock(
+                lock, base="http://x", thinking={}, repeats=5, warmup=1
+            )
 
     def test_default_thinking_controls(self):
         from http_client import thinking_request_fields
-        assert thinking_request_fields(False) == {"chat_template_kwargs": {"enable_thinking": False}}
+
+        assert thinking_request_fields(False) == {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
         assert thinking_request_fields(True, "low") == {
-            "chat_template_kwargs": {"enable_thinking": True}, "reasoning_effort": "low",
+            "chat_template_kwargs": {"enable_thinking": True},
+            "reasoning_effort": "low",
         }
         # bench_real's default thinking policy is enable_thinking=False
         import inspect
+
         src = inspect.getsource(br.run_bench)
         assert "thinking_request_fields(False)" in src
 
@@ -80,8 +87,12 @@ class TestBenchRun:
     def _run(self, tmp_path, srv, **kw):
         out = tmp_path / "rows.jsonl"
         summary = br.run_bench(
-            srv.base, out, repeats=kw.get("repeats", 2), warmup=kw.get("warmup", 1),
-            timeout_s=30, variant="AR",
+            srv.base,
+            out,
+            repeats=kw.get("repeats", 2),
+            warmup=kw.get("warmup", 1),
+            timeout_s=30,
+            variant="AR",
         )
         return out, summary
 
@@ -142,20 +153,51 @@ class TestBenchRun:
 # ---------------------------------------------------------------------------
 
 
+def _vision_rows(ttft, count, error=None):
+    return [
+        {
+            "ttft_s": ttft,
+            "wall_s": 2.0,
+            "warmup": False,
+            "error": error,
+            "case_id": f"test-{i}",
+            "repeat": 0,
+            "input_sha256": "a" * 64,
+            "valid": True,
+            "finish_reason": "stop",
+        }
+        for i in range(count)
+    ]
+
+
 def _mk_rows(rate: float, repeats: int = 5, usage_completion: int = 500) -> list:
     rows = []
     for case in CASES:
         for rep in range(repeats):
             wall = usage_completion / rate
-            rows.append({
-                "case": case, "repeat": rep, "warmup": False,
-                "valid": True, "reason": None, "ok": True, "error": None,
-                "finish_reason": "stop",
-                "usage": {"prompt_tokens": 320, "completion_tokens": usage_completion,
-                          "total_tokens": 820},
-                "wall_s": wall, "ttft_s": 0.2, "e2erate": rate,
-                "model": "nvidia/Qwen3.8-Flash-Next-NVFP4", "variant": "X",
-            })
+            rows.append(
+                {
+                    "case": case,
+                    "repeat": rep,
+                    "warmup": False,
+                    "valid": True,
+                    "reason": None,
+                    "ok": True,
+                    "error": None,
+                    "finish_reason": "stop",
+                    "usage": {
+                        "prompt_tokens": 320,
+                        "completion_tokens": usage_completion,
+                        "total_tokens": 820,
+                    },
+                    "wall_s": wall,
+                    "ttft_s": 0.2,
+                    "e2erate": rate,
+                    "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+                    "variant": "X",
+                    "raw_events": [{"test_only": True}],
+                }
+            )
     return rows
 
 
@@ -179,25 +221,50 @@ def _manifest(lever="none", **over):
 def _upstream(rate: float, rounds: int = 5, completed: int = 8) -> str:
     lines = []
     for _ in range(rounds):
-        dur = 100.0
-        lines.append(json.dumps({
-            "duration": dur, "completed": completed,
-            "total_input_tokens": 800, "total_output_tokens": rate * dur,
-            "output_throughput": rate,
-        }))
+        dur = 2048 / rate
+        lines.append(
+            json.dumps(
+                {
+                    "duration": dur,
+                    "completed": completed,
+                    "total_input_tokens": 4096,
+                    "total_output_tokens": 2048,
+                    "output_throughput": rate,
+                    "backend": "sglang-oai",
+                    "max_concurrency": 1,
+                    "random_input_len": 512,
+                    "random_output_len": 256,
+                    "input_lens": [512] * 8,
+                    "output_lens": [256] * 8,
+                    "errors": [""] * 8,
+                    "generated_texts": ["test-only synthetic fixture"] * 8,
+                    "ttfts": [0.1] * 8,
+                }
+            )
+        )
     return "\n".join(lines) + "\n"
 
 
 class TestCompareFailClosed:
     def test_pass_requires_each_case_ge_5pct(self, tmp_path):
-        b = tmp_path / "b.jsonl"; b.write_text("\n".join(json.dumps(r) for r in _mk_rows(10.0)) + "\n")
-        c = tmp_path / "c.jsonl"; c.write_text("\n".join(json.dumps(r) for r in _mk_rows(11.0)) + "\n")
+        b = tmp_path / "b.jsonl"
+        b.write_text("\n".join(json.dumps(r) for r in _mk_rows(10.0)) + "\n")
+        c = tmp_path / "c.jsonl"
+        c.write_text("\n".join(json.dumps(r) for r in _mk_rows(11.0)) + "\n")
         report = cmp.compare(
             base_rows=cmp.measured_prose_rows(cmp.load_rows(b, "baseline"), "baseline"),
-            cand_rows=cmp.measured_prose_rows(cmp.load_rows(c, "candidate"), "candidate"),
-            base_manifest=_manifest(), cand_manifest=_manifest(lever="nextn"),
+            cand_rows=cmp.measured_prose_rows(
+                cmp.load_rows(c, "candidate"), "candidate"
+            ),
+            base_manifest=_manifest(),
+            cand_manifest=_manifest(lever="nextn"),
         )
-        assert report["verdict"] == "PASS"
+        assert report["verdict"] == "NOT_OPTIMIZED"
+        assert set(report["gates"]["complete_lanes"]["missing"]) == {
+            "short",
+            "medium",
+            "vision",
+        }
         assert all(g["pass"] for g in report["gates"]["prose_3case"].values())
 
     def test_reject_when_only_one_case_improves(self, tmp_path):
@@ -208,12 +275,15 @@ class TestCompareFailClosed:
             if r["case"] == "city_heat_water":
                 r["wall_s"] = r["usage"]["completion_tokens"] / 10.0
                 r["e2erate"] = 10.0
-        b = tmp_path / "b.jsonl"; b.write_text("\n".join(json.dumps(r) for r in rows_b) + "\n")
-        c = tmp_path / "c.jsonl"; c.write_text("\n".join(json.dumps(r) for r in rows_c) + "\n")
+        b = tmp_path / "b.jsonl"
+        b.write_text("\n".join(json.dumps(r) for r in rows_b) + "\n")
+        c = tmp_path / "c.jsonl"
+        c.write_text("\n".join(json.dumps(r) for r in rows_c) + "\n")
         report = cmp.compare(
             base_rows=cmp.measured_prose_rows(cmp.load_rows(b, "b"), "b"),
             cand_rows=cmp.measured_prose_rows(cmp.load_rows(c, "c"), "c"),
-            base_manifest=_manifest(), cand_manifest=_manifest(lever="nextn"),
+            base_manifest=_manifest(),
+            cand_manifest=_manifest(lever="nextn"),
         )
         assert report["verdict"] == "NOT_OPTIMIZED"
         assert "city_heat_water" in report["gates"]["prose_3case"]["rejected"]
@@ -221,8 +291,10 @@ class TestCompareFailClosed:
     def test_reject_missing_repeat(self, tmp_path):
         rows_b = _mk_rows(10.0)
         rows_c = _mk_rows(11.0)[:-1]  # one row missing
-        b = tmp_path / "b.jsonl"; b.write_text("\n".join(json.dumps(r) for r in rows_b) + "\n")
-        c = tmp_path / "c.jsonl"; c.write_text("\n".join(json.dumps(r) for r in rows_c) + "\n")
+        b = tmp_path / "b.jsonl"
+        b.write_text("\n".join(json.dumps(r) for r in rows_b) + "\n")
+        c = tmp_path / "c.jsonl"
+        c.write_text("\n".join(json.dumps(r) for r in rows_c) + "\n")
         with pytest.raises(cmp.Reject, match="expected 5"):
             cmp.check_counts(
                 cmp.measured_prose_rows(cmp.load_rows(c, "c"), "c"), "candidate"
@@ -255,7 +327,9 @@ class TestCompareFailClosed:
 
     def test_parity_mismatch_rejected(self):
         with pytest.raises(cmp.Reject, match="parity mismatch"):
-            cmp.check_parity(_manifest(sampling={"temperature": 0}), _manifest(lever="nextn"))
+            cmp.check_parity(
+                _manifest(sampling={"temperature": 0}), _manifest(lever="nextn")
+            )
 
     def test_parity_only_lever_may_differ(self):
         info = cmp.check_parity(_manifest(), _manifest(lever="nextn-spec"))
@@ -310,42 +384,62 @@ class TestCompareFailClosed:
             cmp.upstream_median_rate(detail, "baseline")
 
     def test_upstream_five_percent_gate(self, tmp_path):
-        b = tmp_path / "b.jsonl"; b.write_text(_upstream(10.0))
-        c = tmp_path / "c.jsonl"; c.write_text(_upstream(10.4))  # 4% gain
+        b = tmp_path / "b.jsonl"
+        b.write_text(_upstream(10.0))
+        c = tmp_path / "c.jsonl"
+        c.write_text(_upstream(10.4))  # 4% gain
         bd = cmp.load_upstream_detail(b, "baseline")
         cd = cmp.load_upstream_detail(c, "candidate")
         report = cmp.compare(
-            base_rows=cmp.measured_prose_rows(cmp.load_rows(
-                _write(tmp_path, "pb.jsonl", _mk_rows(10.0)), "b"), "b"),
-            cand_rows=cmp.measured_prose_rows(cmp.load_rows(
-                _write(tmp_path, "pc.jsonl", _mk_rows(11.0)), "c"), "c"),
-            base_manifest=_manifest(), cand_manifest=_manifest(lever="nextn"),
-            base_upstream=bd, cand_upstream=cd,
+            base_rows=cmp.measured_prose_rows(
+                cmp.load_rows(_write(tmp_path, "pb.jsonl", _mk_rows(10.0)), "b"), "b"
+            ),
+            cand_rows=cmp.measured_prose_rows(
+                cmp.load_rows(_write(tmp_path, "pc.jsonl", _mk_rows(11.0)), "c"), "c"
+            ),
+            base_manifest=_manifest(),
+            cand_manifest=_manifest(lever="nextn"),
+            base_upstream=bd,
+            cand_upstream=cd,
         )
         assert report["verdict"] == "NOT_OPTIMIZED"
         assert "short" in report["gates"]["upstream_short"]["rejected"]
 
     def test_vision_p95_ttft_regression_gate(self):
-        bv = [{"ttft_s": 1.0, "warmup": False, "error": None} for _ in range(10)]
-        cv = [{"ttft_s": 1.06, "warmup": False, "error": None} for _ in range(10)]
+        bv = _vision_rows(1.0, 10)
+        cv = _vision_rows(1.06, 10)
         gate = cmp.vision_ttft_gate(bv, cv)
         assert gate["pass"] is False  # 6% regression > 5% limit
-        cv2 = [{"ttft_s": 1.04, "warmup": False, "error": None} for _ in range(10)]
+        cv2 = _vision_rows(1.04, 10)
         assert cmp.vision_ttft_gate(bv, cv2)["pass"] is True
 
     def test_vision_rows_with_errors_rejected(self):
-        bv = [{"ttft_s": 1.0, "warmup": False, "error": None} for _ in range(3)]
-        cv = [{"ttft_s": 1.0, "warmup": False, "error": "http_status_500"} for _ in range(3)]
+        bv = _vision_rows(1.0, 3)
+        cv = _vision_rows(1.0, 3, error="http_status_500")
         with pytest.raises(cmp.Reject, match="http_status_500"):
             cmp.vision_ttft_gate(bv, cv)
 
     def test_cli_nonzero_on_not_optimized(self, tmp_path):
-        b = tmp_path / "b.jsonl"; b.write_text("\n".join(json.dumps(r) for r in _mk_rows(10.0)) + "\n")
-        c = tmp_path / "c.jsonl"; c.write_text("\n".join(json.dumps(r) for r in _mk_rows(10.3)) + "\n")
-        bm = tmp_path / "bm.json"; bm.write_text(json.dumps(_manifest()))
-        cm = tmp_path / "cm.json"; cm.write_text(json.dumps(_manifest(lever="nextn")))
-        rc = cmp.main(["--baseline", str(b), "--candidate", str(c),
-                       "--baseline-manifest", str(bm), "--candidate-manifest", str(cm)])
+        b = tmp_path / "b.jsonl"
+        b.write_text("\n".join(json.dumps(r) for r in _mk_rows(10.0)) + "\n")
+        c = tmp_path / "c.jsonl"
+        c.write_text("\n".join(json.dumps(r) for r in _mk_rows(10.3)) + "\n")
+        bm = tmp_path / "bm.json"
+        bm.write_text(json.dumps(_manifest()))
+        cm = tmp_path / "cm.json"
+        cm.write_text(json.dumps(_manifest(lever="nextn")))
+        rc = cmp.main(
+            [
+                "--baseline",
+                str(b),
+                "--candidate",
+                str(c),
+                "--baseline-manifest",
+                str(bm),
+                "--candidate-manifest",
+                str(cm),
+            ]
+        )
         assert rc == 1
 
 
