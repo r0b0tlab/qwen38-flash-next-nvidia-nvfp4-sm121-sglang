@@ -3,8 +3,15 @@
 - The `nvidia/Qwen3.8-Flash-Next-NVFP4` checkpoint is not distributed with
   this repository. Its use is governed by the NVIDIA Open Model License and
   applicable Qwen terms.
-- This runtime targets SGLang. SGLang is licensed under Apache-2.0 by its
-  authors; this repository only invokes it and ships none of it.
+- SGLang is Apache-2.0 licensed by its contributors. This repository carries
+  an attributed source patch and the image recipe builds that source. Its
+  license is preserved at third_party/SGLang-LICENSE.txt; wrapper MIT terms
+  do not relicense upstream engine code.
+- docker/q200_sandbox_driver.py is an unchanged first-party MIT copy from
+  r0b0tlab/qwen38-flash-next-w4a16-sm121-sglang at commit
+  7bfacc510506e955a1392f94b87213b798e45e51. Its original notice/license is
+  preserved at third_party/Q200-driver-LICENSE.txt. No old weights or scores
+  are reused.
 - `HEADERS_ADMITTED` (scripts/audit_checkpoint.py) is a structural verdict
   only. It is not integrity verification; `scripts/verify_files.py` must
   pass and its receipt must re-check against the mounted tree before spawn.
