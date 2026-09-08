@@ -173,12 +173,40 @@ SCENARIOS: Dict[str, Scenario] = {
     "stall-close": Scenario(chunks=[sse_event(delta_evt(content="stall")), sse_event(delta_evt(finish="stop"))], stall_s=3.0),
 }
 
+# long synthetic prose answer for benchmark-driver scaffolding (>= 600 chars,
+# realistic ~4 chars/token completion usage). Synthetic test vector only.
+_LONG_TEXT = ("The mechanism works as follows and has several interacting parts. " * 16)
+SCENARIOS["long-answer"] = Scenario(
+    chunks=[
+        sse_event(delta_evt(content=_LONG_TEXT)),
+        sse_event(delta_evt(finish="stop")),
+        sse_event(usage_evt(prompt=350, completion=len(_LONG_TEXT) // 4)),
+        b"data: [DONE]\n\n",
+    ]
+)
+
 
 class FakeHandler(BaseHTTPRequestHandler):
     server_version = "FakeOpenAI/1.0"
 
     def log_message(self, format, *args):  # noqa: A002 - stdlib signature
         pass
+
+    def _chat_scenario_for(self, body: Dict[str, Any]) -> str:
+        """Select a chat scenario from request markers.
+
+        - server-level default (``self.server.chat_scenario_default``) wins:
+          benchmark drivers send fixed payloads and cannot carry test hooks;
+        - ``_force_scenario``: explicit per-request scenario name (test hook);
+        - ``_min_answer_chars`` echo: long-enough reply with realistic usage.
+        """
+        override = getattr(self.server, "chat_scenario_default", None)
+        if override:
+            return override
+        forced = body.get("_force_scenario")
+        if isinstance(forced, str) and forced:
+            return forced
+        return "happy"
 
     # -- routing --------------------------------------------------------------
 
@@ -254,7 +282,7 @@ class FakeHandler(BaseHTTPRequestHandler):
                 }
                 self._send(Scenario(body=json.dumps(payload).encode(), content_type="application/json"))
                 return
-            name = "happy"
+            name = self._chat_scenario_for(body)
         if self.path == "/v1/completions":
             usage = {"prompt_tokens": len(body.get("prompt") or []), "completion_tokens": 2, "total_tokens": len(body.get("prompt") or []) + 2}
             payload = {
