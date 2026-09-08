@@ -1,0 +1,72 @@
+{
+  "model_id": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+  "revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+  "tensor_payloads_included": false,
+  "files": [
+    {
+      "fixture": "config.json",
+      "source_file": "config.json",
+      "scope": "complete_metadata_file",
+      "stored_bytes": 30820,
+      "stored_sha256": "deef67a61f3311faf051b23dc4192f442c7fee4f9cd2f38cbcbe4da55c763a80",
+      "decoded_bytes": 30820,
+      "decoded_sha256": "deef67a61f3311faf051b23dc4192f442c7fee4f9cd2f38cbcbe4da55c763a80",
+      "source_bytes": 30820,
+      "source_sha256": "deef67a61f3311faf051b23dc4192f442c7fee4f9cd2f38cbcbe4da55c763a80",
+      "exact_decoded_bytes": true,
+      "json_value_equal": true
+    },
+    {
+      "fixture": "hf_quant_config.json",
+      "source_file": "hf_quant_config.json",
+      "scope": "complete_metadata_file",
+      "stored_bytes": 23001,
+      "stored_sha256": "331ad11d57c8bc374554579977198084e0d4d0933d5b3558f125f6f670aba0e8",
+      "decoded_bytes": 23001,
+      "decoded_sha256": "331ad11d57c8bc374554579977198084e0d4d0933d5b3558f125f6f670aba0e8",
+      "source_bytes": 23001,
+      "source_sha256": "331ad11d57c8bc374554579977198084e0d4d0933d5b3558f125f6f670aba0e8",
+      "exact_decoded_bytes": true,
+      "json_value_equal": true
+    },
+    {
+      "fixture": "model.safetensors.index.json.gz",
+      "source_file": "model.safetensors.index.json",
+      "scope": "complete_metadata_file",
+      "stored_bytes": 859340,
+      "stored_sha256": "551ac417265f7ad95cab76fb94e10555259a5167914462a413064b4d2e97cb42",
+      "decoded_bytes": 31275518,
+      "decoded_sha256": "660414e8300728ba80062e6a3c81cb76a65e2ab136ac9e9ceb450ba0c51c3c0d",
+      "source_bytes": 31275518,
+      "source_sha256": "660414e8300728ba80062e6a3c81cb76a65e2ab136ac9e9ceb450ba0c51c3c0d",
+      "exact_decoded_bytes": true,
+      "json_value_equal": true
+    },
+    {
+      "fixture": "mtp_ple.header.json",
+      "source_file": "model-fp8-mtp-ple.safetensors",
+      "scope": "header",
+      "stored_bytes": 445163,
+      "stored_sha256": "c90eaacb2bec1b5d86d769dad3368fa4ba4af02dbeb8ab2816df4805f1f14e3d",
+      "decoded_bytes": 445163,
+      "decoded_sha256": "c90eaacb2bec1b5d86d769dad3368fa4ba4af02dbeb8ab2816df4805f1f14e3d",
+      "source_bytes": 416360,
+      "source_sha256": "f40c53c80878e45917adf3602cb55c1f5c2aa496f4b4284994099aca028aa6a9",
+      "exact_decoded_bytes": false,
+      "json_value_equal": true
+    },
+    {
+      "fixture": "shard10.header.json",
+      "source_file": "model-00010-of-00010.safetensors",
+      "scope": "header",
+      "stored_bytes": 2484,
+      "stored_sha256": "114b3acee174d0e0a8a8c3d63ea9c55cb2e1748240868d464b2e4b40168d11b0",
+      "decoded_bytes": 2484,
+      "decoded_sha256": "114b3acee174d0e0a8a8c3d63ea9c55cb2e1748240868d464b2e4b40168d11b0",
+      "source_bytes": 2312,
+      "source_sha256": "5bf7b19c4b5950b6eda6763a0da73fb35f499d006c6c7f4f68a6f616720a87e2",
+      "exact_decoded_bytes": false,
+      "json_value_equal": true
+    }
+  ]
+}
