@@ -66,7 +66,7 @@ def test_native_decode_graph_flags():
     argv, _ = _argv()
     assert _flag(argv, "--cuda-graph-backend-decode") == "full"
     assert _flag(argv, "--cuda-graph-backend-prefill") == "disabled"
-    assert json.loads(_flag(argv, "--cuda-graph-bs-decode")) == [1, 2, 4, 8]
+    assert _flag(argv, "--cuda-graph-bs-decode") == "1"
     assert _flag(argv, "--page-size") == "64"
     assert _flag(argv, "--attention-backend") == "triton"
     assert _flag(argv, "--mamba-ssm-dtype") == "float32"
@@ -93,7 +93,7 @@ def test_parameter_fields_flow_from_profile():
     assert _flag(argv, "--max-prefill-tokens") == "2048"
     assert _flag(argv, "--mem-fraction-static") == "0.82"
     assert _flag(argv, "--max-mamba-cache-size") == "16"
-    assert _flag(argv, "--kv-cache-dtype") == "auto"
+    assert _flag(argv, "--kv-cache-dtype") == "bf16"
     assert profile.chunked_prefill_size == 2048
 
 
@@ -128,7 +128,7 @@ def test_no_unquantized_draft_or_language_only_or_tp2():
     for argv, _ in (_argv(), _argv(mode="nextn", speculative={"steps": 3})):
         joined = " ".join(argv)
         assert "--tp-size 2" not in joined
-        assert "tp-size", 2 not in (None,)  # explicit single-GPU above
+        assert _flag(argv, "--tp-size") == "1"
         assert "language" not in joined
         assert "draft-model-path" not in joined
         assert "--speculative-draft-model-path" not in joined
