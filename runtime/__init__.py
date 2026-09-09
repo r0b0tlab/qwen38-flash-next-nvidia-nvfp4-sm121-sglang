@@ -17,6 +17,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 from typing import Any, Dict, Optional, Tuple
 
 PROFILE_SCHEMA = 1
@@ -42,7 +43,7 @@ MEM_FRACTION_STATIC_DEFAULT = 0.80
 MEM_FRACTION_STATIC_MIN = 0.70
 MEM_FRACTION_STATIC_MAX = 0.88
 
-KV_CACHE_DTYPES = ("bf16", "fp8_e4m3")
+KV_CACHE_DTYPES = ("bf16", "fp8_e4m3", "nvfp4")
 KV_CACHE_DTYPE_DEFAULT = "bf16"
 
 SPECULATIVE_STEPS_MIN = 1
@@ -157,6 +158,29 @@ def _optional_enum(raw: Dict[str, Any], key: str, allowed, default: str) -> str:
     return _require_enum(raw, key, allowed)
 
 
+def _validate_kv_calibration(raw: Dict[str, Any], dtype: str) -> None:
+    if "kv_calibration" not in raw:
+        if dtype == "nvfp4":
+            _fail("nvfp4 KV requires explicit frozen kv_calibration")
+        return
+    value = raw["kv_calibration"]
+    if not isinstance(value, dict):
+        _fail("kv_calibration must be an object")
+    mode = _require_enum(value, "mode", ("collect", "frozen"))
+    if mode == "collect":
+        if set(value) != {"mode"} or dtype != "bf16":
+            _fail("collect kv_calibration requires BF16 KV and only the mode field")
+        return
+    if set(value) != {"mode", "file", "sha256"} or dtype != "nvfp4":
+        _fail("frozen kv_calibration requires nvfp4 KV and mode/file/sha256")
+    name = value["file"]
+    if not isinstance(name, str) or name in (".", "..") or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name):
+        _fail("kv_calibration.file must be a safe basename")
+    digest = value["sha256"]
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        _fail("kv_calibration.sha256 must be a literal lowercase SHA256")
+
+
 def validate_payload(payload: str) -> Dict[str, Any]:
     """Parse and fully validate a profile JSON document.
 
@@ -210,7 +234,8 @@ def validate_payload(payload: str) -> Dict[str, Any]:
         minimum=MEM_FRACTION_STATIC_MIN, maximum=MEM_FRACTION_STATIC_MAX,
         default=MEM_FRACTION_STATIC_DEFAULT,
     )
-    _optional_enum(raw, "kv_cache_dtype", KV_CACHE_DTYPES, KV_CACHE_DTYPE_DEFAULT)
+    kv_dtype = _optional_enum(raw, "kv_cache_dtype", KV_CACHE_DTYPES, KV_CACHE_DTYPE_DEFAULT)
+    _validate_kv_calibration(raw, kv_dtype)
 
     speculative = raw.get("speculative")
     if mode == "nextn":
@@ -254,7 +279,7 @@ def validate_payload(payload: str) -> Dict[str, Any]:
         "schema", "mode", "context_length", "max_total_tokens",
         "max_running_requests", "chunked_prefill_size", "max_mamba_cache_size",
         "mem_fraction_static", "kv_cache_dtype", "speculative", "vision",
-        "ple_rss_gib", "mm_processor_worker_num",
+        "ple_rss_gib", "mm_processor_worker_num", "kv_calibration",
     }
     unknown = sorted(set(raw) - known)
     if unknown:
@@ -282,6 +307,9 @@ class Profile:
     ple_rss_gib: int
     mm_processor_worker_num: int
     raw: Dict[str, Any] = dataclasses.field(repr=False, compare=False)
+    kv_calibration_mode: Optional[str] = None
+    kv_scale_file: Optional[str] = None
+    kv_scale_sha256: Optional[str] = None
 
     def digest(self) -> str:
         """SHA-256 over the canonical JSON form of the raw profile."""
@@ -326,6 +354,9 @@ def profile_from_dict(raw: Dict[str, Any]) -> Profile:
             "mm_processor_worker_num", MM_PROCESSOR_WORKER_NUM_DEFAULT
         ),
         raw=validated,
+        kv_calibration_mode=validated.get("kv_calibration", {}).get("mode"),
+        kv_scale_file=validated.get("kv_calibration", {}).get("file"),
+        kv_scale_sha256=validated.get("kv_calibration", {}).get("sha256"),
     )
 
 

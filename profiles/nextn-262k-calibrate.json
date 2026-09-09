@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "mode": "nextn",
+  "context_length": 262144,
+  "max_total_tokens": 262144,
+  "max_running_requests": 2,
+  "chunked_prefill_size": 4096,
+  "max_mamba_cache_size": 10,
+  "mem_fraction_static": 0.88,
+  "kv_cache_dtype": "bf16",
+  "vision": {
+    "backend": "triton_attn",
+    "cuda_graph": true
+  },
+  "ple_rss_gib": 4,
+  "mm_processor_worker_num": 1,
+  "speculative": {
+    "steps": 2
+  },
+  "kv_calibration": {
+    "mode": "collect"
+  }
+}

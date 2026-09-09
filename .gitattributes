@@ -1,0 +1,2 @@
+# Unified diffs contain significant blank context lines; audit their applied source.
+patches/*.patch -whitespace

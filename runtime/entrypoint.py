@@ -36,6 +36,10 @@ ENV_VARS_OWNED = (
     "SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED",
     "SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB",
     "SGLANG_QWEN4_PLE_FILE_PREFETCH",
+    "SGLANG_QSA_KV_AMAX_CALIB",
+    "SGLANG_QSA_KV_MODEL_REVISION",
+    "SGLANG_QSA_KV_SCALE_SIDECAR",
+    "SGLANG_QSA_KV_SCALE_SHA256",
     "R0B0TLAB_PLE_PREPARED_PATH",
     "R0B0TLAB_PLE_PREPARED_SHA256",
     "TMPDIR",
@@ -116,7 +120,7 @@ def build_env(profile: Profile, sources: Dict[str, Any]) -> Dict[str, str]:
     """Writable cache paths, non-overridable safety settings, and cleared
     PLE handoff slots (filled with fresh verified values just before exec)."""
     profile = _checked_profile(profile)
-    _checked_sources(sources)
+    model = _checked_sources(sources)
     env = {
         "HOME": "/cache/home",
         "TMPDIR": "/cache/tmp",
@@ -127,6 +131,13 @@ def build_env(profile: Profile, sources: Dict[str, Any]) -> Dict[str, str]:
         "SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED": "1",
         "SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB": str(profile.ple_rss_gib),
         "SGLANG_QWEN4_PLE_FILE_PREFETCH": "1",
+        "SGLANG_QSA_KV_AMAX_CALIB": "1" if profile.kv_calibration_mode == "collect" else "0",
+        "SGLANG_QSA_KV_MODEL_REVISION": model["sha"],
+        "SGLANG_QSA_KV_SCALE_SIDECAR": (
+            "/opt/r0b0tlab/kv-calibration/%s/%s" % (model["sha"], profile.kv_scale_file)
+            if profile.kv_calibration_mode == "frozen" else ""
+        ),
+        "SGLANG_QSA_KV_SCALE_SHA256": profile.kv_scale_sha256 or "",
         "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK": "0",
         "SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH": "0",
         "R0B0TLAB_PLE_PREPARED_PATH": "",

@@ -5016,10 +5016,10 @@ index c9d8fb65ee..bd8e785788 100644
  
  
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index 1239dd34de..44aab49cc4 100644
+index 1239dd34de..d8fc1c0aa0 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -298,6 +298,27 @@ class Envs:
+@@ -298,6 +298,32 @@ class Envs:
      #        keeping access relatively ordered.
      SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
      SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
@@ -5041,6 +5041,11 @@ index 1239dd34de..44aab49cc4 100644
 +    # sizes the KV pool. Cap its resident set; 0 disables the trim.
 +    SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
 +    SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
++    # Opt-in QSA calibration and immutable checkpoint-bound NVFP4 KV scales.
++    SGLANG_QSA_KV_AMAX_CALIB = EnvBool(False)
++    SGLANG_QSA_KV_MODEL_REVISION = EnvStr("")
++    SGLANG_QSA_KV_SCALE_SIDECAR = EnvStr("")
++    SGLANG_QSA_KV_SCALE_SHA256 = EnvStr("")
 +    # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
 +    # path is ported, so setting this fails loudly instead of degrading.
 +    SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
@@ -6465,6 +6470,224 @@ index 0000000000..56070c4964
 +    "qsa_sparse_attention",
 +    "qsa_sparse_attention_reference",
 +]
+diff --git a/python/sglang/srt/layers/attention/qsa/kv_calibration.py b/python/sglang/srt/layers/attention/qsa/kv_calibration.py
+new file mode 100644
+index 0000000000..77de0fcddf
+--- /dev/null
++++ b/python/sglang/srt/layers/attention/qsa/kv_calibration.py
+@@ -0,0 +1,212 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Opt-in BF16 QSA KV calibration and checkpoint-bound NVFP4 sidecars."""
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++import os
++import re
++import stat
++import struct
++import weakref
++from pathlib import Path
++
++import torch
++
++COLLECT_ENV = 'SGLANG_QSA_KV_AMAX_CALIB'
++SIDECAR_ENV = 'SGLANG_QSA_KV_SCALE_SIDECAR'
++REVISION_ENV = 'SGLANG_QSA_KV_MODEL_REVISION'
++SHA_ENV = 'SGLANG_QSA_KV_SCALE_SHA256'
++SCHEMA = 'sglang.qsa.nvfp4-kv-scales.v1'
++_COLLECTORS = weakref.WeakSet()
++_SIDECARS = weakref.WeakKeyDictionary()
++
++
++def _flag():
++    value = os.environ.get(COLLECT_ENV, '0')
++    if value not in ('0', '1'):
++        raise ValueError(COLLECT_ENV + ' must be 0 or 1')
++    return value == '1'
++
++
++def _revision(value):
++    if not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{40}', value):
++        raise ValueError('QSA KV model revision must be an exact lowercase commit SHA')
++    return value
++
++
++def _pairs(pairs):
++    out = {}
++    for key, value in pairs:
++        if key in out:
++            raise ValueError('duplicate QSA scale key: ' + key)
++        out[key] = value
++    return out
++
++
++def _positive_fp32(value):
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        raise ValueError('NVFP4 scales must be finite positive numbers')
++    try:
++        value = float(value)
++    except (OverflowError, ValueError) as exc:
++        raise ValueError('NVFP4 scale is outside FP32 range') from exc
++    if not math.isfinite(value) or value <= 0:
++        raise ValueError('NVFP4 scales must be finite positive numbers')
++    try:
++        result = struct.unpack('f', struct.pack('f', value))[0]
++    except (OverflowError, struct.error) as exc:
++        raise ValueError('NVFP4 scale is outside FP32 range') from exc
++    if not math.isfinite(result) or result <= 0:
++        raise ValueError('NVFP4 scale underflows/overflows FP32')
++    return result
++
++
++def validate_sidecar(document, *, model_revision, role, layer_ids, heads, dim):
++    _revision(model_revision)
++    if not isinstance(document, dict) or document.get('schema') != SCHEMA:
++        raise ValueError('QSA NVFP4 sidecar schema mismatch')
++    if document.get('model_revision') != model_revision:
++        raise ValueError('QSA NVFP4 sidecar checkpoint mismatch')
++    if document.get('scale_policy') != 'bf16-amax-over-6x448':
++        raise ValueError('QSA NVFP4 scale policy mismatch')
++    if role not in ('target', 'draft'):
++        raise ValueError('invalid QSA pool role')
++    pools = document.get('pools')
++    if not isinstance(pools, dict) or role not in pools or not isinstance(pools[role], dict):
++        raise ValueError('QSA NVFP4 sidecar pool missing')
++    pool = pools[role]
++    if pool.get('layer_ids') != list(layer_ids) or any(type(x) is not int or x < 0 for x in pool.get('layer_ids', [])):
++        raise ValueError('QSA NVFP4 global layer mapping mismatch')
++    if len(set(layer_ids)) != len(layer_ids) or not layer_ids:
++        raise ValueError('invalid QSA global layer mapping')
++    if type(pool.get('heads')) is not int or type(pool.get('head_dim')) is not int or pool['heads'] != heads or pool['head_dim'] != dim:
++        raise ValueError('QSA NVFP4 sidecar geometry mismatch')
++    counts = pool.get('observations')
++    if not isinstance(counts, list) or len(counts) != len(layer_ids) or any(type(n) is not int or n <= 0 for n in counts):
++        raise ValueError('QSA NVFP4 sidecar has unobserved layers')
++    values = {}
++    for name in ('k_scale', 'v_scale'):
++        raw = pool.get(name)
++        if not isinstance(raw, list) or len(raw) != len(layer_ids):
++            raise ValueError('QSA NVFP4 scale vector size mismatch')
++        values[name] = [_positive_fp32(x) for x in raw]
++    return values
++
++
++def load_sidecar(path, expected_sha, **geometry):
++    if not isinstance(expected_sha, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
++        raise ValueError('QSA NVFP4 sidecar hash must be explicit')
++    p = Path(path)
++    if not p.is_absolute() or '..' in p.parts:
++        raise ValueError('QSA NVFP4 sidecar must be an absolute non-traversing path')
++    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
++    try:
++        info = os.fstat(fd)
++        if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024 or info.st_mode & 0o022:
++            raise ValueError('unsafe QSA NVFP4 sidecar file')
++        with os.fdopen(fd, 'rb', closefd=False) as stream:
++            raw = stream.read(1024 * 1024 + 1)
++    finally:
++        os.close(fd)
++    if hashlib.sha256(raw).hexdigest() != expected_sha:
++        raise ValueError('QSA NVFP4 sidecar hash mismatch')
++    def reject(value):
++        raise ValueError('non-finite QSA scale JSON')
++    doc = json.loads(raw, object_pairs_hook=_pairs, parse_constant=reject)
++    return validate_sidecar(doc, **geometry)
++
++
++class AmaxCollector:
++    def __init__(self, role, layer_ids, heads, dim, device, model_revision):
++        self.role = role
++        self.layer_ids = tuple(layer_ids)
++        self.layer_map = {n: i for i, n in enumerate(layer_ids)}
++        self.heads, self.dim = heads, dim
++        self.model_revision = _revision(model_revision)
++        self.k_amax = torch.zeros(len(layer_ids), dtype=torch.float32, device=device)
++        self.v_amax = torch.zeros_like(self.k_amax)
++        self.observations = torch.zeros(len(layer_ids), dtype=torch.int64, device=device)
++        _COLLECTORS.add(self)
++
++    def observe(self, global_layer_id, k, v):
++        index = self.layer_map[global_layer_id]
++        if not k.numel():
++            return
++        # Tensor-only updates are captured/replayed; no item()/CPU read in forward.
++        with torch.no_grad():
++            self.k_amax[index].copy_(torch.maximum(self.k_amax[index], k.detach().abs().amax().float()))
++            self.v_amax[index].copy_(torch.maximum(self.v_amax[index], v.detach().abs().amax().float()))
++            self.observations[index].add_(1)
++
++    def reset(self):
++        self.k_amax.zero_(); self.v_amax.zero_(); self.observations.zero_()
++
++    def export(self):
++        return {'role': self.role, 'model_revision': self.model_revision,
++                'layer_ids': list(self.layer_ids), 'heads': self.heads, 'head_dim': self.dim,
++                'k_amax': self.k_amax.cpu().tolist(), 'v_amax': self.v_amax.cpu().tolist(),
++                'observations': self.observations.cpu().tolist()}
++
++
++def export_qsa_kv_state():
++    collectors = list(_COLLECTORS)
++    receipts = list(_SIDECARS.values())
++    if not collectors and not receipts:
++        return None
++    return {'collectors': [c.export() for c in sorted(collectors, key=lambda c: (c.role, c.layer_ids))],
++            'scale_receipts': sorted(receipts, key=lambda r: (r['role'], r['layer_ids']))}
++
++
++def qsa_kv_calibration_enabled():
++    return bool(_COLLECTORS)
++
++
++def reset_qsa_kv_amax():
++    collectors = list(_COLLECTORS)
++    if not collectors:
++        raise ValueError('QSA KV calibration collection is not enabled')
++    if any(c.k_amax.is_cuda for c in collectors):
++        torch.cuda.synchronize()
++    for collector in collectors:
++        collector.reset()
++    if any(c.k_amax.is_cuda for c in collectors):
++        torch.cuda.synchronize()
++
++
++class QSAKVCalibrationMixin:
++    def _init_qsa_kv_scales(self, *, role, layer_ids, heads, dim, dtype, device):
++        if role not in ('target', 'draft'):
++            raise ValueError('invalid QSA calibration pool role')
++        self._qsa_amax_collector = None
++        collect = _flag()
++        method = self.get_kv_cache_quant_method()
++        nvfp4 = getattr(method, 'name', None) == 'nvfp4'
++        revision = os.environ.get(REVISION_ENV, '')
++        if collect:
++            if nvfp4 or dtype != torch.bfloat16:
++                raise ValueError('QSA KV calibration must collect on BF16 KV')
++            self._qsa_amax_collector = AmaxCollector(role, layer_ids, heads, dim, device, revision)
++        if nvfp4:
++            expected_sha = os.environ.get(SHA_ENV, '')
++            scales = load_sidecar(os.environ.get(SIDECAR_ENV, ''), expected_sha,
++                                  model_revision=revision, role=role, layer_ids=layer_ids, heads=heads, dim=dim)
++            size = max(max(layer_ids) + 1, method.k_scales_gpu.numel(), method.v_scales_gpu.numel())
++            k_values, v_values = [1.0] * size, [1.0] * size
++            for n, k, v in zip(layer_ids, scales['k_scale'], scales['v_scale']):
++                k_values[n] = k; v_values[n] = v
++            # Factory model-scale loading precedes QSA pool construction. These
++            # explicit, verified global-ID arrays are used by the first KV write.
++            method.k_scales_gpu = torch.tensor(k_values, dtype=torch.float32, device=device)
++            method.v_scales_gpu = torch.tensor(v_values, dtype=torch.float32, device=device)
++            method.k_scales_float = k_values
++            method.v_scales_float = v_values
++            _SIDECARS[self] = {'sha256': expected_sha, 'model_revision': revision,
++                               'role': role, 'layer_ids': list(layer_ids), 'heads': heads, 'head_dim': dim}
++
++    def set_kv_buffer(self, layer, loc, cache_k, cache_v, *args, **kwargs):
++        collector = self._qsa_amax_collector
++        if collector is not None:
++            collector.observe(layer.layer_id, cache_k, cache_v)
++        return super().set_kv_buffer(layer, loc, cache_k, cache_v, *args, **kwargs)
 diff --git a/python/sglang/srt/layers/attention/qsa/metadata.py b/python/sglang/srt/layers/attention/qsa/metadata.py
 new file mode 100644
 index 0000000000..a9e3270f4e
@@ -7205,6 +7428,183 @@ index 0000000000..6446ed145c
 +    "torch_qsa_mqa_decode",
 +    "torch_qsa_mqa_prefill",
 +]
+diff --git a/python/sglang/srt/layers/attention/qsa/nvfp4.py b/python/sglang/srt/layers/attention/qsa/nvfp4.py
+new file mode 100644
+index 0000000000..dc54e2f45d
+--- /dev/null
++++ b/python/sglang/srt/layers/attention/qsa/nvfp4.py
+@@ -0,0 +1,171 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Native NVFP4 cache reads for QSA; attention compute remains BF16.
++
++Packed cache data and E4M3 block scales are never reinterpreted as plain K/V.
++The global scale arguments are device tensors, not host values sampled in a
++captured forward.  This module does not select or invent calibration scales.
++"""
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _e2m1(bits):
++    magnitude = bits & 7
++    value = tl.where(magnitude == 0, 0.0,
++            tl.where(magnitude == 1, 0.5,
++            tl.where(magnitude == 2, 1.0,
++            tl.where(magnitude == 3, 1.5,
++            tl.where(magnitude == 4, 2.0,
++            tl.where(magnitude == 5, 3.0,
++            tl.where(magnitude == 6, 4.0, 6.0)))))))
++    return tl.where((bits & 8) != 0, -value, value)
++
++
++@triton.jit
++def _pack_indices(indices, lengths, packed, topk: tl.constexpr,
++                  stride_in: tl.constexpr, stride_out: tl.constexpr,
++                  BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    col = tl.arange(0, BLOCK)
++    length = tl.load(lengths + row)
++    index = tl.load(indices + row * stride_in + col, col < topk, -1)
++    valid = (col < topk) & (index >= 0) & (index < length)
++    rank = tl.cumsum(valid.to(tl.int32)) - 1
++    # Only the prefix indicated by cu_k is subsequently read.
++    tl.store(packed + row * stride_out + rank, index, valid)
++
++
++@triton.jit
++def _compact_nvfp4(k, v, ks, vs, kg, vg, req_to_token, req_indices,
++                   indices, lengths, cu_k, out_k, out_v,
++                   topk: tl.constexpr, heads: tl.constexpr, dim: tl.constexpr,
++                   req_stride: tl.constexpr, idx_stride: tl.constexpr,
++                   BLOCK_T: tl.constexpr, BLOCK_D: tl.constexpr):
++    row, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    col = block * BLOCK_T + tl.arange(0, BLOCK_T)
++    d = tl.arange(0, BLOCK_D)
++    begin = tl.load(cu_k + row)
++    count = tl.load(cu_k + row + 1) - begin
++    length = tl.load(lengths + row)
++    req = tl.load(req_indices + row)
++    position = tl.load(indices + row * idx_stride + col,
++                       (col < topk) & (col < count), -1)
++    valid = (col < count) & (position >= 0) & (position < length)
++    slot = tl.load(req_to_token + req * req_stride + tl.where(valid, position, 0), valid, 0)
++    mask = valid[:, None] & (d[None, :] < dim)
++    packed_offset = slot[:, None] * heads * (dim // 2) + head * (dim // 2) + d[None, :] // 2
++    scale_offset = slot[:, None] * heads * (dim // 16) + head * (dim // 16) + d[None, :] // 16
++    kb = tl.load(k + packed_offset, mask, 0).to(tl.int32)
++    vb = tl.load(v + packed_offset, mask, 0).to(tl.int32)
++    shift = (d[None, :] & 1) * 4
++    kvalue = _e2m1((kb >> shift) & 15)
++    vvalue = _e2m1((vb >> shift) & 15)
++    kscale = tl.load(ks + scale_offset, mask, 0.0).to(tl.float32)
++    vscale = tl.load(vs + scale_offset, mask, 0.0).to(tl.float32)
++    kvalue = kvalue * kscale * tl.load(kg).to(tl.float32)
++    vvalue = vvalue * vscale * tl.load(vg).to(tl.float32)
++    dst = (begin + col)[:, None] * heads * dim + head * dim + d[None, :]
++    tl.store(out_k + dst, kvalue, mask)
++    tl.store(out_v + dst, vvalue, mask)
++
++
++@triton.jit
++def _gather_rows(k, v, ks, vs, kg, vg, indices, out_k, out_v,
++                 rows: tl.constexpr, heads: tl.constexpr, dim: tl.constexpr,
++                 BLOCK: tl.constexpr):
++    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    total = rows * heads * dim
++    row = offset // (heads * dim)
++    head = (offset // dim) % heads
++    d = offset % dim
++    mask = offset < total
++    slot = tl.load(indices + row, mask, 0)
++    packed_offset = slot * heads * (dim // 2) + head * (dim // 2) + d // 2
++    scale_offset = slot * heads * (dim // 16) + head * (dim // 16) + d // 16
++    kb = tl.load(k + packed_offset, mask, 0).to(tl.int32)
++    vb = tl.load(v + packed_offset, mask, 0).to(tl.int32)
++    shift = (d & 1) * 4
++    kval = _e2m1((kb >> shift) & 15) * tl.load(ks + scale_offset, mask, 0.0).to(tl.float32)
++    vval = _e2m1((vb >> shift) & 15) * tl.load(vs + scale_offset, mask, 0.0).to(tl.float32)
++    tl.store(out_k + offset, kval * tl.load(kg).to(tl.float32), mask)
++    tl.store(out_v + offset, vval * tl.load(vg).to(tl.float32), mask)
++
++
++def validate_buffers(k, v, ks, vs, kg, vg, dim):
++    if k.dtype != torch.uint8 or v.dtype != torch.uint8 or k.ndim != 3 or v.shape != k.shape:
++        raise ValueError("NVFP4 K/V must be equal rank-3 packed uint8 buffers")
++    if not k.is_contiguous() or not v.is_contiguous() or dim % 16 or k.shape[-1] * 2 != dim:
++        raise ValueError("unsupported NVFP4 QSA storage geometry")
++    expected = (k.shape[0], k.shape[1], dim // 16)
++    if ks.shape != expected or vs.shape != expected:
++        raise ValueError("NVFP4 block-scale shape mismatch")
++    for scale in (ks, vs):
++        if scale.dtype not in (torch.uint8, torch.float8_e4m3fn) or not scale.is_contiguous():
++            raise ValueError("NVFP4 block scales must contain contiguous E4M3 bytes")
++    for tensor in (v, ks, vs, kg, vg):
++        if tensor.device != k.device:
++            raise ValueError("NVFP4 buffer device mismatch")
++    for scale in (kg, vg):
++        if scale.dtype != torch.float32 or scale.numel() != 1 or not scale.is_contiguous():
++            raise ValueError("NVFP4 global scale must be one device FP32 value")
++    if k.device.type != "cuda":
++        raise ValueError("native QSA NVFP4 reads require CUDA")
++
++
++def raw_nvfp4_layer(pool, layer_id, dim):
++    """Use the pool's dense-buffer mapping, but global IDs for scale lookup."""
++    method = pool.get_kv_cache_quant_method()
++    if method.name != "nvfp4":
++        raise ValueError("QSA packed reader requires the explicit nvfp4 recipe")
++    k, v, ks, vs = pool.get_raw_kv_buffer(layer_id)
++    if not 0 <= layer_id < method.k_scales_gpu.numel() or layer_id >= method.v_scales_gpu.numel():
++        raise ValueError("NVFP4 global scale layer ID is out of range")
++    kg = method.k_scales_gpu[layer_id:layer_id + 1]
++    vg = method.v_scales_gpu[layer_id:layer_id + 1]
++    validate_buffers(k, v, ks, vs, kg, vg, dim)
++    return k, v, ks.view(torch.float8_e4m3fn), vs.view(torch.float8_e4m3fn), kg, vg
++
++
++def compact_nvfp4_kv(buffers, req_to_token, req_indices, indices, lengths,
++                      cu_k, out_k, out_v, batch, topk):
++    k, v, ks, vs, kg, vg = buffers
++    dim = out_k.shape[-1]
++    validate_buffers(k, v, ks, vs, kg, vg, dim)
++    if out_k.dtype != torch.bfloat16 or out_v.dtype != torch.bfloat16 or out_k.shape != out_v.shape:
++        raise ValueError("NVFP4 QSA compute scratch must be BF16")
++    if not out_k.is_contiguous() or not out_v.is_contiguous() or out_k.device != k.device or out_v.device != k.device:
++        raise ValueError("NVFP4 QSA scratch layout/device mismatch")
++    if out_k.shape[1] != k.shape[1] or out_k.shape[0] < batch * topk:
++        raise ValueError("NVFP4 QSA scratch capacity mismatch")
++    if indices.shape[0] < batch or indices.shape[1] != topk:
++        raise ValueError("NVFP4 sparse-index geometry mismatch")
++    packed_indices = torch.empty((batch, topk), device=indices.device, dtype=torch.int32)
++    _pack_indices[(batch,)](indices, lengths, packed_indices, topk, indices.stride(0),
++                           packed_indices.stride(0), BLOCK=triton.next_power_of_2(topk), num_warps=8)
++    _compact_nvfp4[(batch, k.shape[1], triton.cdiv(topk, 16))](
++        k, v, ks.view(torch.float8_e4m3fn), vs.view(torch.float8_e4m3fn), kg, vg,
++        req_to_token, req_indices, packed_indices, lengths, cu_k, out_k, out_v,
++        topk, k.shape[1], dim, req_to_token.stride(0), packed_indices.stride(0),
++        BLOCK_T=16, BLOCK_D=triton.next_power_of_2(dim), num_warps=8,
++    )
++
++
++def dequantize_nvfp4_rows(buffers, indices, dim):
++    """Gather valid physical prefix slots directly into BF16, without FP8 staging."""
++    k, v, ks, vs, kg, vg = buffers
++    validate_buffers(k, v, ks, vs, kg, vg, dim)
++    if indices.ndim != 1 or not indices.is_contiguous() or indices.device != k.device:
++        raise ValueError("NVFP4 row gather requires contiguous device slot IDs")
++    rows = indices.numel()
++    out_k = torch.empty((rows, k.shape[1], dim), dtype=torch.bfloat16, device=k.device)
++    out_v = torch.empty_like(out_k)
++    if rows:
++        _gather_rows[(triton.cdiv(rows * k.shape[1] * dim, 1024),)](
++            k, v, ks.view(torch.float8_e4m3fn), vs.view(torch.float8_e4m3fn), kg, vg,
++            indices, out_k, out_v, rows, k.shape[1], dim, BLOCK=1024, num_warps=8,
++        )
++    return out_k, out_v
 diff --git a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
 new file mode 100644
 index 0000000000..4de4c6a8dd
@@ -8305,10 +8705,10 @@ index 0000000000..e2d7148158
 +]
 diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
 new file mode 100644
-index 0000000000..4f8eaefef0
+index 0000000000..e668be6539
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
-@@ -0,0 +1,1764 @@
+@@ -0,0 +1,1801 @@
 +"""Sparse-attention backend for Qwen4-Exp models with an indexer.
 +
 +The backend is installed as the full-attention side of Qwen4-Exp's hybrid backend;
@@ -8485,11 +8885,22 @@ index 0000000000..4f8eaefef0
 +    # Every seq_lens_cpu read here has a device fallback (one readback);
 +    # the graphed decode path never reads it, so opting out is safe.
 +    needs_cpu_seq_lens: bool = False
++    # Metadata-only/reference fixtures may construct without __init__. Real
++    # runners overwrite this from the concrete pool below.
++    use_nvfp4_kv: bool = False
 +
 +    def __init__(self, runner=None) -> None:
 +        self.runner = runner
 +        self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
++        quant_getter = getattr(self.token_to_kv_pool, "get_kv_cache_quant_method", None)
++        quant_method = quant_getter() if callable(quant_getter) else None
++        self.use_nvfp4_kv = getattr(quant_method, "name", None) == "nvfp4"
 +        self.device = getattr(runner, "device", None)
++        if self.use_nvfp4_kv:
++            from sglang.srt.utils import is_sm121
++
++            if not is_sm121():
++                raise ValueError("native QSA NVFP4 cache reads are implemented only for SM121")
 +        model_config = getattr(runner, "model_config", None)
 +        config = getattr(model_config, "hf_text_config", None)
 +        if config is None:
@@ -9653,22 +10064,39 @@ index 0000000000..4f8eaefef0
 +        # The validated chunk-prefill kernel consumes tightly packed full-context
 +        # K/V. Current-chunk K/V has already been committed to the cache above.
 +        pool = self.token_to_kv_pool
-+        k_buffer = pool.get_key_buffer(layer.layer_id)
-+        v_buffer = pool.get_value_buffer(layer.layer_id)
 +        req_to_token = self.req_to_token_pool.req_to_token
 +        req_indices = forward_batch.req_pool_indices.tolist()
-+        k_parts = [
-+            k_buffer.index_select(
-+                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
++        if self.use_nvfp4_kv:
++            from sglang.srt.layers.attention.qsa.nvfp4 import (
++                dequantize_nvfp4_rows, raw_nvfp4_layer,
 +            )
-+            for i in range(len(sequence_lens))
-+        ]
-+        v_parts = [
-+            v_buffer.index_select(
-+                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-+            )
-+            for i in range(len(sequence_lens))
-+        ]
++
++            buffers = raw_nvfp4_layer(pool, layer.layer_id, layer.head_dim)
++            parts = [
++                dequantize_nvfp4_rows(
++                    buffers,
++                    req_to_token[req_indices[i], : sequence_lens[i]].long().contiguous(),
++                    layer.head_dim,
++                )
++                for i in range(len(sequence_lens))
++            ]
++            k_parts = [pair[0] for pair in parts]
++            v_parts = [pair[1] for pair in parts]
++        else:
++            k_buffer = pool.get_key_buffer(layer.layer_id)
++            v_buffer = pool.get_value_buffer(layer.layer_id)
++            k_parts = [
++                k_buffer.index_select(
++                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
++                )
++                for i in range(len(sequence_lens))
++            ]
++            v_parts = [
++                v_buffer.index_select(
++                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
++                )
++                for i in range(len(sequence_lens))
++            ]
 +        sequence_lens_tensor = torch.tensor(
 +            sequence_lens, dtype=torch.int32, device=q.device
 +        )
@@ -9845,8 +10273,17 @@ index 0000000000..4f8eaefef0
 +        topk_indices: torch.Tensor,
 +    ) -> torch.Tensor:
 +        pool = self.token_to_kv_pool
-+        k_buffer = pool.get_key_buffer(layer.layer_id)
-+        v_buffer = pool.get_value_buffer(layer.layer_id)
++        nvfp4_buffers = None
++        if self.use_nvfp4_kv:
++            from sglang.srt.layers.attention.qsa.nvfp4 import raw_nvfp4_layer
++
++            if not q.is_cuda or q.dtype != torch.bfloat16:
++                raise ValueError("native NVFP4 QSA requires BF16 CUDA queries")
++            nvfp4_buffers = raw_nvfp4_layer(pool, layer.layer_id, layer.head_dim)
++            k_buffer, v_buffer = nvfp4_buffers[:2]
++        else:
++            k_buffer = pool.get_key_buffer(layer.layer_id)
++            v_buffer = pool.get_value_buffer(layer.layer_id)
 +        if not q.is_cuda:
 +            metadata = self._resolve_metadata(forward_batch)
 +            slots = self._logical_to_physical(topk_indices, metadata)
@@ -9855,7 +10292,7 @@ index 0000000000..4f8eaefef0
 +
 +        metadata = self._resolve_metadata(forward_batch)
 +        topk_indices = topk_indices.to(torch.int32).contiguous()
-+        trtllm_decode = _resolve_trtllm_sparse_decode()
++        trtllm_decode = None if self.use_nvfp4_kv else _resolve_trtllm_sparse_decode()
 +        if trtllm_decode is not None:
 +            return self._forward_trtllm_sparse(
 +                q,
@@ -9897,27 +10334,27 @@ index 0000000000..4f8eaefef0
 +        packed_k, packed_v = self._get_fa2_scratch(
 +            scratch_capacity,
 +            k_buffer.shape[1],
-+            k_buffer.shape[2],
-+            k_buffer.dtype,
++            layer.head_dim if self.use_nvfp4_kv else k_buffer.shape[2],
++            torch.bfloat16 if self.use_nvfp4_kv else k_buffer.dtype,
 +            k_buffer.device,
 +        )
-+        qwen_sparse_kv_extraction_compact_triton(
-+            k_buffer,
-+            v_buffer,
-+            self.req_to_token_pool.req_to_token,
-+            (
-+                metadata.row_req_pool_indices
-+                if metadata.row_req_pool_indices is not None
-+                else forward_batch.req_pool_indices
-+            ),
-+            topk_indices,
-+            sequence_lens,
-+            cu_seqlens_k,
-+            packed_k,
-+            packed_v,
-+            batch,
-+            topk,
++        req_indices = (
++            metadata.row_req_pool_indices
++            if metadata.row_req_pool_indices is not None
++            else forward_batch.req_pool_indices
 +        )
++        if nvfp4_buffers is not None:
++            from sglang.srt.layers.attention.qsa.nvfp4 import compact_nvfp4_kv
++
++            compact_nvfp4_kv(
++                nvfp4_buffers, self.req_to_token_pool.req_to_token, req_indices,
++                topk_indices, sequence_lens, cu_seqlens_k, packed_k, packed_v, batch, topk,
++            )
++        else:
++            qwen_sparse_kv_extraction_compact_triton(
++                k_buffer, v_buffer, self.req_to_token_pool.req_to_token, req_indices,
++                topk_indices, sequence_lens, cu_seqlens_k, packed_k, packed_v, batch, topk,
++            )
 +        output = flash_attn_varlen_func(
 +            q=q,
 +            k=packed_k,
@@ -11257,8 +11694,57 @@ index 74dd32e825..761f8e5540 100644
          output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
          return output_parallel
  
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 85b9c203c9..03a7268c4b 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -4957,6 +4957,11 @@ class Scheduler(
+         )
+         ret["startup_time"] = self.startup_time
+         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
++        from sglang.srt.layers.attention.qsa.kv_calibration import export_qsa_kv_state
++
++        qsa_kv_state = export_qsa_kv_state()
++        if qsa_kv_state is not None:
++            ret["qsa_kv_state"] = qsa_kv_state
+ 
+         if get_exec().moe.elastic_ep_backend is not None:
+             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+@@ -5002,6 +5007,7 @@ class Scheduler(
+                 "speculative_accept_threshold_acc",
+                 "dspark_force_budget_frac",
+                 "dspark_clear_info_records",
++                "qsa_kv_amax_reset",
+             ]
+         )
+ 
+@@ -5019,6 +5025,13 @@ class Scheduler(
+                 )
+                 if_success = False
+                 break
++            elif k == "qsa_kv_amax_reset":
++                from sglang.srt.layers.attention.qsa.kv_calibration import qsa_kv_calibration_enabled
++
++                if v is not True or not self.is_fully_idle() or not qsa_kv_calibration_enabled():
++                    logger.warning("QSA KV calibration reset requires true, an idle scheduler, and collection enabled")
++                    if_success = False
++                    break
+             elif k == "dspark_force_budget_frac":
+                 if not self.spec_algorithm.is_dspark() or not hasattr(
+                     self.draft_worker, "set_dspark_forced_budget_frac"
+@@ -5060,6 +5073,10 @@ class Scheduler(
+             # DSpark control keys are worker commands, not server args; route
+             # them to the draft worker and keep them out of the override.
+             remaining = dict(server_args_dict)
++            if remaining.pop("qsa_kv_amax_reset", False):
++                from sglang.srt.layers.attention.qsa.kv_calibration import reset_qsa_kv_amax
++
++                reset_qsa_kv_amax()
+             frac = remaining.pop("dspark_force_budget_frac", None)
+             if "dspark_force_budget_frac" in server_args_dict:
+                 self.draft_worker.set_dspark_forced_budget_frac(
 diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-index 33b58fe59f..264d07ac66 100644
+index 33b58fe59f..dfd3736aaf 100644
 --- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
 +++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
 @@ -1106,6 +1106,20 @@ class KVCacheConfigurator:
@@ -11290,7 +11776,7 @@ index 33b58fe59f..264d07ac66 100644
              # A PD prefill server never runs TARGET_VERIFY, so skip the
              # verify-only per-draft-token state snapshots (see the draft-head
              # case above: None => the pool skips SpeculativeState).
-@@ -1840,7 +1855,36 @@ class KVCacheConfigurator:
+@@ -1840,7 +1855,38 @@ class KVCacheConfigurator:
              if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
              else mha_pool_class
          )
@@ -11305,6 +11791,8 @@ index 33b58fe59f..264d07ac66 100644
 +        )
 +
 +        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
++        if qsa_profile is not None:
++            extra_args["qsa_calibration_role"] = "draft" if self.is_draft_worker else "target"
 +        if qsa_profile is None:
 +            pool_class = HybridLinearKVPool
 +            extra_args["use_mla"] = self.use_mla_backend
@@ -11328,7 +11816,7 @@ index 33b58fe59f..264d07ac66 100644
              page_size=self.pool_page_size,
              size=max_total_num_tokens,
              dtype=self.kv_cache_dtype,
-@@ -1854,7 +1898,6 @@ class KVCacheConfigurator:
+@@ -1854,7 +1900,6 @@ class KVCacheConfigurator:
              mamba_pool=req_to_token_pool.mamba_pool,
              enable_memory_saver=get_exec().features.enable_memory_saver,
              enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
@@ -11761,10 +12249,10 @@ index 0000000000..a4242636d1
 +        )
 diff --git a/python/sglang/srt/mem_cache/qsa_kv_pool.py b/python/sglang/srt/mem_cache/qsa_kv_pool.py
 new file mode 100644
-index 0000000000..f8c1c0e8ed
+index 0000000000..54785e8d19
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/qsa_kv_pool.py
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,323 @@
 +"""KV pools carrying the QSA sparse-attention indexer caches."""
 +
 +from __future__ import annotations
@@ -11773,6 +12261,7 @@ index 0000000000..f8c1c0e8ed
 +
 +import torch
 +
++from sglang.srt.layers.attention.qsa.kv_calibration import QSAKVCalibrationMixin
 +from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
 +
 +
@@ -11780,7 +12269,7 @@ index 0000000000..f8c1c0e8ed
 +    return kv_heads * head_dim * dtype.itemsize
 +
 +
-+class QSATokenToKVPool(HybridLinearKVPool):
++class QSATokenToKVPool(QSAKVCalibrationMixin, HybridLinearKVPool):
 +    """Hybrid KV pool with the minimal BF16 state required by simple QSA."""
 +
 +    # Full-KV pages are a multiple of the compress ratio, so no group straddles pages;
@@ -11821,6 +12310,7 @@ index 0000000000..f8c1c0e8ed
 +        start_layer: Optional[int] = None,
 +        full_kv_pool_class: Optional[type] = None,
 +        quant_method=None,
++        qsa_calibration_role: str = "target",
 +        post_capture_active: bool = False,
 +    ):
 +        if page_size <= 1 or page_size % qsa_compress_ratio != 0:
@@ -11853,6 +12343,10 @@ index 0000000000..f8c1c0e8ed
 +            full_kv_pool_class=full_kv_pool_class,
 +            quant_method=quant_method,
 +            post_capture_active=post_capture_active,
++        )
++        self._init_qsa_kv_scales(
++            role=qsa_calibration_role, layer_ids=full_attention_layer_ids,
++            heads=head_num, dim=head_dim, dtype=dtype, device=device,
 +        )
 +        if (
 +            min(
@@ -11975,7 +12469,7 @@ index 0000000000..f8c1c0e8ed
 +        return k_size + qsa_k_size, v_size
 +
 +
-+class QwenDSATokenToKVPool(HybridLinearKVPool):
++class QwenDSATokenToKVPool(QSAKVCalibrationMixin, HybridLinearKVPool):
 +    """Hybrid KV pool carrying the per-token index-K cache of tokenwise QSA:
 +    a ``[size + page_size, index_kv_heads, index_head_dim]`` BF16 buffer per DSA layer,
 +    addressed by raw KV slots; the FP8 deep_gemm layout is deliberately absent."""
@@ -12012,6 +12506,7 @@ index 0000000000..f8c1c0e8ed
 +        start_layer: Optional[int] = None,
 +        full_kv_pool_class: Optional[type] = None,
 +        quant_method=None,
++        qsa_calibration_role: str = "target",
 +        post_capture_active: bool = False,
 +    ):
 +        if page_size != 64:
@@ -12036,6 +12531,10 @@ index 0000000000..f8c1c0e8ed
 +            full_kv_pool_class=full_kv_pool_class,
 +            quant_method=quant_method,
 +            post_capture_active=post_capture_active,
++        )
++        self._init_qsa_kv_scales(
++            role=qsa_calibration_role, layer_ids=full_attention_layer_ids,
++            heads=head_num, dim=head_dim, dtype=dtype, device=device,
 +        )
 +        if qsa_index_kv_heads != 1:
 +            raise ValueError(
@@ -20173,6 +20672,287 @@ index 0000000000..9664b83f9c
 +    import sys
 +
 +    sys.exit(pytest.main([__file__, "-v", "-s"]))
+diff --git a/test/registered/kernel/qsa/test_qsa_kv_calibration.py b/test/registered/kernel/qsa/test_qsa_kv_calibration.py
+new file mode 100644
+index 0000000000..9097df2542
+--- /dev/null
++++ b/test/registered/kernel/qsa/test_qsa_kv_calibration.py
+@@ -0,0 +1,117 @@
++# SPDX-License-Identifier: Apache-2.0
++import copy
++import hashlib
++import json
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.srt.layers.attention.qsa.kv_calibration import (
++    AmaxCollector, QSAKVCalibrationMixin, SCHEMA, export_qsa_kv_state,
++    load_sidecar, reset_qsa_kv_amax, validate_sidecar,
++)
++
++REV = '1' * 40
++ARGS = dict(model_revision=REV, role='target', layer_ids=[3, 7], heads=2, dim=256)
++
++
++def document():
++    return {'schema': SCHEMA, 'model_revision': REV, 'scale_policy': 'bf16-amax-over-6x448',
++            'pools': {'target': {'layer_ids': [3, 7], 'heads': 2, 'head_dim': 256,
++                                 'observations': [10, 10], 'k_scale': [.01, .02], 'v_scale': [.03, .04]},
++                      'draft': {'layer_ids': [0], 'heads': 2, 'head_dim': 256,
++                                'observations': [10], 'k_scale': [.05], 'v_scale': [.06]}}}
++
++
++def test_valid_sidecar_and_distinct_draft_mapping():
++    assert validate_sidecar(document(), **ARGS)['k_scale'] == pytest.approx([.01, .02])
++    assert validate_sidecar(document(), model_revision=REV, role='draft', layer_ids=[0], heads=2, dim=256)['k_scale'] == pytest.approx([.05])
++
++
++@pytest.mark.parametrize('value', [0, -1, True, float('nan'), float('inf'), 1e-100, 1e100, 1 << 4096])
++def test_reject_bad_scale(value):
++    data = document(); data['pools']['target']['k_scale'][0] = value
++    with pytest.raises(ValueError): validate_sidecar(data, **ARGS)
++
++
++@pytest.mark.parametrize('change', ['revision', 'role', 'layers', 'heads', 'observations'])
++def test_reject_sidecar_identity_or_unobserved_geometry(change):
++    data = document()
++    if change == 'revision': data['model_revision'] = '2' * 40
++    elif change == 'role': del data['pools']['target']
++    elif change == 'layers': data['pools']['target']['layer_ids'] = [0, 1]
++    elif change == 'heads': data['pools']['target']['heads'] = 4
++    else: data['pools']['target']['observations'][0] = 0
++    with pytest.raises(ValueError): validate_sidecar(data, **ARGS)
++
++
++def test_file_hash_and_no_follow(tmp_path):
++    p = tmp_path / 'scales.json'; p.write_text(json.dumps(document())); p.chmod(0o600)
++    digest = hashlib.sha256(p.read_bytes()).hexdigest()
++    assert load_sidecar(str(p), digest, **ARGS)['v_scale'] == pytest.approx([.03, .04])
++    with pytest.raises(ValueError, match='hash mismatch'): load_sidecar(str(p), '0' * 64, **ARGS)
++    link = tmp_path / 'link.json'; link.symlink_to(p)
++    with pytest.raises(OSError): load_sidecar(str(link), digest, **ARGS)
++    p.chmod(0o666)
++    with pytest.raises(ValueError, match='unsafe'): load_sidecar(str(p), digest, **ARGS)
++
++
++def test_duplicate_json_keys_rejected(tmp_path):
++    p = tmp_path / 'duplicate.json'
++    p.write_text('{"schema":"one","schema":"two"}'); p.chmod(0o600)
++    with pytest.raises(ValueError, match='duplicate'):
++        load_sidecar(str(p), hashlib.sha256(p.read_bytes()).hexdigest(), **ARGS)
++
++
++def test_cpu_collector_preserves_global_layer_order_and_running_max():
++    c = AmaxCollector('target', [3, 7], 2, 256, 'cpu', REV)
++    c.observe(7, torch.tensor([-2., 3.]), torch.tensor([-5., 4.]))
++    c.observe(7, torch.tensor([1.]), torch.tensor([2.]))
++    data = c.export()
++    assert data['layer_ids'] == [3, 7]
++    assert data['k_amax'] == [0., 3.] and data['v_amax'] == [0., 5.]
++    assert data['observations'] == [0, 2]
++    c.reset(); assert c.export()['observations'] == [0, 0]
++
++
++def test_nvfp4_requires_bound_sidecar_and_installs_global_scales(monkeypatch, tmp_path):
++    data = document(); path = tmp_path / 'scales.json'
++    path.write_text(json.dumps(data)); path.chmod(0o600)
++    method = SimpleNamespace(name='nvfp4', k_scales_gpu=torch.ones(2), v_scales_gpu=torch.ones(2))
++    class Base:
++        def get_kv_cache_quant_method(self): return method
++    class Pool(QSAKVCalibrationMixin, Base): pass
++    p = Pool()
++    monkeypatch.setenv('SGLANG_QSA_KV_AMAX_CALIB', '0')
++    monkeypatch.setenv('SGLANG_QSA_KV_MODEL_REVISION', REV)
++    monkeypatch.setenv('SGLANG_QSA_KV_SCALE_SIDECAR', str(path))
++    monkeypatch.delenv('SGLANG_QSA_KV_SCALE_SHA256', raising=False)
++    with pytest.raises(ValueError, match='hash must be explicit'):
++        p._init_qsa_kv_scales(role='target', layer_ids=[3,7], heads=2, dim=256, dtype=torch.float4_e2m1fn_x2, device='cpu')
++    monkeypatch.setenv('SGLANG_QSA_KV_SCALE_SHA256', hashlib.sha256(path.read_bytes()).hexdigest())
++    p._init_qsa_kv_scales(role='target', layer_ids=[3,7], heads=2, dim=256, dtype=torch.float4_e2m1fn_x2, device='cpu')
++    assert method.k_scales_gpu.numel() == 8
++    assert method.k_scales_gpu[[3,7]].tolist() == pytest.approx([.01,.02])
++    assert method.v_scales_gpu[[3,7]].tolist() == pytest.approx([.03,.04])
++    assert method.k_scales_gpu[0].item() == 1.
++    state = export_qsa_kv_state()
++    assert any(r['role']=='target' and r['layer_ids']==[3,7] for r in state['scale_receipts'])
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA graph required')
++def test_collector_tracks_changed_inputs_in_graph_without_cpu_forward_reads():
++    c = AmaxCollector('draft', [0], 2, 256, 'cuda', REV)
++    k = torch.tensor([2.], device='cuda', dtype=torch.bfloat16)
++    v = torch.tensor([-4.], device='cuda', dtype=torch.bfloat16)
++    c.observe(0, k, v)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph): c.observe(0, k, v)
++    k.fill_(-7.); v.fill_(1.)
++    graph.replay(); torch.cuda.synchronize()
++    assert c.export()['k_amax'] == [7.] and c.export()['v_amax'] == [4.]
++    k.fill_(1.); v.fill_(9.)
++    graph.replay(); torch.cuda.synchronize()
++    assert c.export()['k_amax'] == [7.] and c.export()['v_amax'] == [9.]
++    reset_qsa_kv_amax()
++    assert c.export()['observations'] == [0] and c.export()['k_amax'] == [0.]
+diff --git a/test/registered/kernel/qsa/test_qsa_nvfp4.py b/test/registered/kernel/qsa/test_qsa_nvfp4.py
+new file mode 100644
+index 0000000000..58c26a9e17
+--- /dev/null
++++ b/test/registered/kernel/qsa/test_qsa_nvfp4.py
+@@ -0,0 +1,152 @@
++# SPDX-License-Identifier: Apache-2.0
++"""QSA NVFP4 storage reads: native GPU equivalence and graph ownership."""
++from types import SimpleNamespace
++import pytest
++import torch
++
++from sglang.srt.layers.attention.qsa.nvfp4 import (
++    compact_nvfp4_kv, dequantize_nvfp4_rows, raw_nvfp4_layer, validate_buffers,
++)
++from sglang.srt.layers.attention.qsa.sparse_attn import qwen_sparse_fa2_cu_seqlens_triton
++from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
++
++GPU = torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 1)
++
++
++def test_reject_unpacked_storage_before_cuda_use():
++    k = torch.zeros((4, 2, 128), dtype=torch.bfloat16)
++    s = torch.zeros((4, 2, 16), dtype=torch.uint8)
++    g = torch.ones(1)
++    with pytest.raises(ValueError, match="packed uint8"):
++        validate_buffers(k, k, s, s, g, g, 256)
++
++
++def test_reject_scale_geometry_before_cuda_use():
++    k = torch.zeros((4, 2, 128), dtype=torch.uint8)
++    s = torch.zeros((4, 2, 8), dtype=torch.uint8)
++    g = torch.ones(1)
++    with pytest.raises(ValueError, match="scale shape"):
++        validate_buffers(k, k, s, s, g, g, 256)
++
++
++def fixture(seed=10):
++    from flashinfer import nvfp4_kv_quantize, nvfp4_kv_dequantize
++    torch.manual_seed(seed)
++    shape = (24, 2, 256)
++    kg = torch.tensor([.01], device='cuda')
++    vg = torch.tensor([.02], device='cuda')
++    k = torch.randn(shape, device='cuda', dtype=torch.bfloat16)
++    v = torch.randn_like(k)
++    kp, ks = nvfp4_kv_quantize(k.reshape(-1, 256), kg)
++    vp, vs = nvfp4_kv_quantize(v.reshape(-1, 256), vg)
++    kd = nvfp4_kv_dequantize(kp, ks, kg, output_dtype=torch.bfloat16).reshape(shape)
++    vd = nvfp4_kv_dequantize(vp, vs, vg, output_dtype=torch.bfloat16).reshape(shape)
++    buffers = (kp.reshape(24, 2, 128), vp.reshape(24, 2, 128),
++               ks.reshape(24, 2, 16), vs.reshape(24, 2, 16), kg, vg)
++    return buffers, kd, vd
++
++
++@pytest.mark.skipif(not GPU, reason='SM121 CUDA required')
++def test_nvfp4_physical_rows_match_native_dequant():
++    buffers, kd, vd = fixture()
++    ids = torch.tensor([17, 3, 0, 23, 4], device='cuda', dtype=torch.int64)
++    k, v = dequantize_nvfp4_rows(buffers, ids, 256)
++    torch.testing.assert_close(k, kd.index_select(0, ids), rtol=.008, atol=.005)
++    torch.testing.assert_close(v, vd.index_select(0, ids), rtol=.008, atol=.005)
++
++
++@pytest.mark.skipif(not GPU, reason='SM121 CUDA required')
++def test_global_scale_id_not_dense_buffer_id():
++    buffers, _, _ = fixture()
++    calls = []
++    kg = torch.tensor([99., 88., 77., .01], device='cuda')
++    vg = torch.tensor([99., 88., 77., .02], device='cuda')
++    method = SimpleNamespace(name='nvfp4', k_scales_gpu=kg, v_scales_gpu=vg)
++    def raw(global_id):
++        calls.append(global_id)
++        assert global_id == 3
++        return buffers[:4]
++    pool = SimpleNamespace(get_kv_cache_quant_method=lambda: method, get_raw_kv_buffer=raw)
++    result = raw_nvfp4_layer(pool, 3, 256)
++    assert calls == [3]
++    torch.testing.assert_close(result[4], buffers[4])
++    torch.testing.assert_close(result[5], buffers[5])
++
++
++def expected(kd, vd, table, req, indices, lengths):
++    ks, vs = [], []
++    for r in range(indices.shape[0]):
++        valid = indices[r][(indices[r] >= 0) & (indices[r] < lengths[r])].long()
++        slots = table[req[r], valid].long()
++        ks.append(kd.index_select(0, slots)); vs.append(vd.index_select(0, slots))
++    return torch.cat(ks), torch.cat(vs)
++
++
++@pytest.mark.skipif(not GPU, reason='SM121 CUDA required')
++def test_compact_holes_ragged_rows_and_changed_graph_replay():
++    buffers, kd, vd = fixture()
++    table = torch.tensor([[3, 8, 1, 17, 5, 19], [21, 2, 16, 7, 4, 0]], device='cuda', dtype=torch.int32)
++    req = torch.tensor([0, 1, 0], device='cuda', dtype=torch.int32)
++    indices = torch.tensor([[4, -1, 0, 99, 1, -1, -1, -1],
++                            [0, 2, -1, 1, 3, -1, -1, -1],
++                            [-1, -1, -1, -1, -1, -1, -1, -1]], device='cuda', dtype=torch.int32)
++    lengths = torch.tensor([5, 4, 0], device='cuda', dtype=torch.int32)
++    counts = torch.empty(3, device='cuda', dtype=torch.int32)
++    cu = torch.empty(4, device='cuda', dtype=torch.int32)
++    outk = torch.empty((24, 2, 256), device='cuda', dtype=torch.bfloat16)
++    outv = torch.empty_like(outk)
++    def run():
++        qwen_sparse_fa2_cu_seqlens_triton(lengths, indices, counts, cu, 3, 8)
++        compact_nvfp4_kv(buffers, table, req, indices, lengths, cu, outk, outv, 3, 8)
++    run(); torch.cuda.synchronize()
++    ka, va = expected(kd, vd, table, req, indices, lengths)
++    torch.testing.assert_close(outk[:len(ka)], ka, rtol=.008, atol=.005)
++    torch.testing.assert_close(outv[:len(va)], va, rtol=.008, atol=.005)
++    saved_indices, saved_lengths = indices.clone(), lengths.clone()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph): run()
++    indices.copy_(torch.tensor([[1, 0, -1, -1, -1, -1, -1, -1],
++                                [3, 1, 0, -1, -1, -1, -1, -1],
++                                [2, 1, -1, -1, -1, -1, -1, -1]], device='cuda', dtype=torch.int32))
++    lengths.copy_(torch.tensor([2, 4, 3], device='cuda', dtype=torch.int32))
++    kb, vb = expected(kd, vd, table, req, indices, lengths)
++    assert not torch.equal(ka, kb)
++    for _ in range(3):
++        graph.replay(); torch.cuda.synchronize()
++        torch.testing.assert_close(outk[:len(kb)], kb, rtol=.008, atol=.005)
++        torch.testing.assert_close(outv[:len(vb)], vb, rtol=.008, atol=.005)
++    indices.copy_(saved_indices); lengths.copy_(saved_lengths)
++    graph.replay(); torch.cuda.synchronize()
++    torch.testing.assert_close(outk[:len(ka)], ka, rtol=.008, atol=.005)
++    torch.testing.assert_close(outv[:len(va)], va, rtol=.008, atol=.005)
++
++
++@pytest.mark.skipif(not GPU, reason='SM121 CUDA required')
++def test_backend_nvfp4_matches_bf16_selected_attention():
++    buffers, kd, vd = fixture()
++    method = SimpleNamespace(name='nvfp4', k_scales_gpu=buffers[4], v_scales_gpu=buffers[5])
++    pool = SimpleNamespace(get_kv_cache_quant_method=lambda: method,
++                           get_raw_kv_buffer=lambda layer: buffers[:4])
++    table = torch.arange(24, device='cuda', dtype=torch.int32).reshape(2, 12)
++    indices = torch.tensor([[0, 4, 2, -1], [5, 1, 0, 3]], device='cuda', dtype=torch.int32)
++    lengths = torch.tensor([6, 6], device='cuda', dtype=torch.int32)
++    req = torch.tensor([0, 1], device='cuda', dtype=torch.int32)
++    backend = object.__new__(QwenSparseAttnBackend)
++    backend.use_nvfp4_kv = True
++    backend.token_to_kv_pool = pool
++    backend.req_to_token_pool = SimpleNamespace(req_to_token=table)
++    backend._fa2_scratch = {}
++    metadata = SimpleNamespace(sequence_lengths=lengths, is_cuda_graph=False, row_req_pool_indices=None)
++    backend._resolve_metadata = lambda batch: metadata
++    q = torch.randn((2, 24, 256), device='cuda', dtype=torch.bfloat16)
++    layer = SimpleNamespace(layer_id=0, head_dim=256, scaling=256**-.5)
++    out = backend._forward_paged_attention(q, layer, SimpleNamespace(req_pool_indices=req), indices).reshape_as(q)
++    refs = []
++    for b in range(2):
++        selected = indices[b][indices[b] >= 0].long()
++        slots = table[b, selected].long()
++        k = kd[slots].repeat_interleave(12, dim=1).float()
++        v = vd[slots].repeat_interleave(12, dim=1).float()
++        probs = torch.softmax(torch.einsum('hd,khd->hk', q[b].float(), k) * layer.scaling, dim=-1)
++        refs.append(torch.einsum('hk,khd->hd', probs, v).to(q.dtype))
++    torch.testing.assert_close(out, torch.stack(refs), rtol=.03, atol=.03)
 diff --git a/test/registered/kernel/speculative/test_verify_commit_triton.py b/test/registered/kernel/speculative/test_verify_commit_triton.py
 new file mode 100644
 index 0000000000..fed30ec8f2

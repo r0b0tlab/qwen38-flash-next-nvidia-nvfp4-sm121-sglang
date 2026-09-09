@@ -41,6 +41,8 @@ RUN python3 -m pip uninstall -y sglang && \
     rm -rf /tmp/sglang-wheels /opt/r0b0tlab/wheelhouse
 COPY runtime/ /opt/r0b0tlab/runtime/
 COPY profiles/ /opt/r0b0tlab/profiles/
+COPY kv-calibration/ /opt/r0b0tlab/kv-calibration/
+RUN python3 -c "from pathlib import Path; r=Path('/opt/r0b0tlab/kv-calibration'); paths=[r,*r.rglob('*')]; [p.chmod(0o555 if p.is_dir() else 0o444) for p in paths]"
 COPY third_party/ /opt/r0b0tlab/third_party/
 COPY docker/q200_sandbox_driver.py /opt/r0b0tlab/q200_sandbox_driver.py
 COPY scripts/audit_checkpoint.py /opt/r0b0tlab/audit_checkpoint.py
