@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "mode": "nextn",
+  "context_length": 262144,
+  "max_total_tokens": 262144,
+  "max_running_requests": 2,
+  "chunked_prefill_size": 4096,
+  "max_mamba_cache_size": 10,
+  "mem_fraction_static": 0.88,
+  "kv_cache_dtype": "nvfp4",
+  "vision": {
+    "backend": "triton_attn",
+    "cuda_graph": true
+  },
+  "ple_rss_gib": 8,
+  "mm_processor_worker_num": 1,
+  "speculative": {
+    "steps": 1,
+    "kv_cache_dtype": "bf16"
+  },
+  "kv_calibration": {
+    "mode": "frozen",
+    "file": "kv-scales-v1.json",
+    "sha256": "6f8ba46347d0d2946a0269381343016ce2e4bfc366d75a4dc20b51d3680dce04"
+  },
+  "moe_backend": "marlin"
+}

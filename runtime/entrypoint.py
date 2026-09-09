@@ -514,7 +514,7 @@ def build_argv(profile: Profile, sources: Dict[str, Any]) -> List[str]:
         "--fp4-gemm-backend",
         "flashinfer_cutlass",
         "--moe-runner-backend",
-        "flashinfer_cutlass",
+        profile.moe_backend,
         "--attention-backend",
         "triton",
         "--mamba-ssm-dtype",
