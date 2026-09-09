@@ -11856,7 +11856,7 @@ index 33b58fe59f..dfd3736aaf 100644
              full_kv_pool_class=full_pool_class,
              quant_method=quant_method,
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index 1ec550735a..5133a2276c 100644
+index 1ec550735a..500db7f730 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -383,6 +383,15 @@ class MambaPool:
@@ -12054,6 +12054,21 @@ index 1ec550735a..5133a2276c 100644
          # The int8 checkpoint pool holds radix-cached states in its own slots; a
          # flush/reset drops the radix tree, so its slots must be released too,
          # otherwise the (now unreferenced) slots leak and break the int8-pool
+@@ -3986,10 +4086,12 @@ class HybridLinearKVPool(KVCache):
+         loc: torch.Tensor,
+         cache_k: torch.Tensor,
+         cache_v: torch.Tensor,
+-        k_scale: float = 1.0,
+-        v_scale: float = 1.0,
++        k_scale: Optional[float] = None,
++        v_scale: Optional[float] = None,
+         dcp_kv_mask: Optional[torch.Tensor] = None,
+     ):
++        # Keep absent scales absent: MHA resolves calibrated global-layer scales.
++        # An inherited 1.0 would silently override NVFP4 calibration.
+         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
+         # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
+         # `loc` is already physical) — either way the pool writes a PHYSICAL loc.
 diff --git a/python/sglang/srt/mem_cache/ple_state_pool.py b/python/sglang/srt/mem_cache/ple_state_pool.py
 new file mode 100644
 index 0000000000..a4242636d1
@@ -20851,10 +20866,10 @@ index 0000000000..92f54821b1
 +    assert c.export()['observations'] == [0] and c.export()['k_amax'] == [0.]
 diff --git a/test/registered/kernel/qsa/test_qsa_nvfp4.py b/test/registered/kernel/qsa/test_qsa_nvfp4.py
 new file mode 100644
-index 0000000000..58c26a9e17
+index 0000000000..190bd3a197
 --- /dev/null
 +++ b/test/registered/kernel/qsa/test_qsa_nvfp4.py
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,168 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""QSA NVFP4 storage reads: native GPU equivalence and graph ownership."""
 +from types import SimpleNamespace
@@ -20884,6 +20899,22 @@ index 0000000000..58c26a9e17
 +    g = torch.ones(1)
 +    with pytest.raises(ValueError, match="scale shape"):
 +        validate_buffers(k, k, s, s, g, g, 256)
++
++
++def test_hybrid_default_does_not_override_quantized_layer_scales():
++    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
++    calls=[]
++    h=object.__new__(HybridLinearKVPool)
++    h.use_mla=False
++    h.full_attention_layer_id_mapping={3:0}
++    h.full_kv_pool=SimpleNamespace(set_kv_buffer=lambda *args,**kwargs:calls.append((args,kwargs)))
++    layer=SimpleNamespace(layer_id=3)
++    empty=torch.empty(0)
++    h.set_kv_buffer(layer,torch.tensor([4]),empty,empty)
++    assert calls[-1][0][4:6]==(None,None)
++    assert calls[-1][1]['layer_id_override']==0
++    h.set_kv_buffer(layer,torch.tensor([4]),empty,empty,k_scale=.25,v_scale=.5)
++    assert calls[-1][0][4:6]==(.25,.5)
 +
 +
 +def fixture(seed=10):
@@ -21007,6 +21038,64 @@ index 0000000000..58c26a9e17
 +        probs = torch.softmax(torch.einsum('hd,khd->hk', q[b].float(), k) * layer.scaling, dim=-1)
 +        refs.append(torch.einsum('hk,khd->hd', probs, v).to(q.dtype))
 +    torch.testing.assert_close(out, torch.stack(refs), rtol=.03, atol=.03)
+diff --git a/test/registered/kernel/qsa/test_qsa_nvfp4_pool.py b/test/registered/kernel/qsa/test_qsa_nvfp4_pool.py
+new file mode 100644
+index 0000000000..16262158f5
+--- /dev/null
++++ b/test/registered/kernel/qsa/test_qsa_nvfp4_pool.py
+@@ -0,0 +1,52 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Actual QSA NVFP4 pool and graph replay, not a fake storage wrapper."""
++import hashlib
++import json
++from types import SimpleNamespace
++import pytest
++import torch
++
++@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA pool required')
++def test_actual_nvfp4_pool_store_scales_and_changed_graph_replay(tmp_path,monkeypatch):
++    import flashinfer
++    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import NVFP4KVCacheMethod
++    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
++    from sglang.srt.layers.attention.qsa.nvfp4 import raw_nvfp4_layer,dequantize_nvfp4_rows
++    rev='1'*40
++    value={'schema':'sglang.qsa.nvfp4-kv-scales.v1','model_revision':rev,'scale_policy':'bf16-amax-over-6x448',
++           'pools':{'target':{'layer_ids':[3],'heads':2,'head_dim':256,'observations':[1],'k_scale':[0.02],'v_scale':[0.03]}}}
++    p=tmp_path/'component-scales.json';p.write_text(json.dumps(value));p.chmod(0o600)
++    for name,value in {'SGLANG_QSA_KV_AMAX_CALIB':'0','SGLANG_QSA_KV_MODEL_REVISION':rev,'SGLANG_QSA_KV_SCALE_SIDECAR':str(p),'SGLANG_QSA_KV_SCALE_SHA256':hashlib.sha256(p.read_bytes()).hexdigest()}.items():
++        monkeypatch.setenv(name,value)
++    method=NVFP4KVCacheMethod(num_layers=1,device='cuda')
++    pool=QSATokenToKVPool(size=64,dtype=torch.float4_e2m1fn_x2,page_size=16,head_num=2,head_dim=256,
++        full_attention_layer_ids=[3],device='cuda',mamba_pool=None,qsa_index_kv_heads=2,qsa_index_head_dim=64,
++        qsa_compress_ratio=4,qsa_token_topk=8,num_request_slots=4,quant_method=method,qsa_calibration_role='target')
++    assert method.k_scales_gpu.shape==(4,) and method.k_scales_gpu[3].item()!=1
++    layer=SimpleNamespace(layer_id=3)
++    loc=torch.arange(16,20,device='cuda',dtype=torch.int64)
++    k=torch.randn(4,2,256,device='cuda',dtype=torch.bfloat16);v=torch.randn_like(k)
++    pool.set_kv_buffer(layer,loc,k,v)
++    raw=raw_nvfp4_layer(pool,3,256)
++    a,b=dequantize_nvfp4_rows(raw,loc,256)
++    fpk,fsk=flashinfer.nvfp4_kv_quantize(k.reshape(-1,256),method.k_scales_gpu[3:4]);fpv,fsv=flashinfer.nvfp4_kv_quantize(v.reshape(-1,256),method.v_scales_gpu[3:4])
++    ek=flashinfer.nvfp4_kv_dequantize(fpk,fsk,method.k_scales_gpu[3:4],output_dtype=torch.bfloat16).reshape_as(k)
++    ev=flashinfer.nvfp4_kv_dequantize(fpv,fsv,method.v_scales_gpu[3:4],output_dtype=torch.bfloat16).reshape_as(v)
++    torch.testing.assert_close(a,ek,rtol=0.008,atol=0.004);torch.testing.assert_close(b,ev,rtol=0.008,atol=0.004)
++    
++    for name in ('get_key_buffer','get_value_buffer','get_kv_buffer'):
++        with pytest.raises(ValueError,match='raw'):getattr(pool,name)(3)
++    graph=torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        pool.set_kv_buffer(layer,loc,k,v)
++        graph_k,graph_v=dequantize_nvfp4_rows(raw,loc,256)
++    for step in range(3):
++        k.copy_(torch.randn_like(k));v.copy_(torch.randn_like(v))
++        loc.copy_(torch.arange(32+step*4,36+step*4,device='cuda',dtype=torch.int64))
++        graph.replay();torch.cuda.synchronize()
++        pk,sk=flashinfer.nvfp4_kv_quantize(k.reshape(-1,256),method.k_scales_gpu[3:4])
++        pv,sv=flashinfer.nvfp4_kv_quantize(v.reshape(-1,256),method.v_scales_gpu[3:4])
++        expected_k=flashinfer.nvfp4_kv_dequantize(pk,sk,method.k_scales_gpu[3:4],output_dtype=torch.bfloat16).reshape_as(k)
++        expected_v=flashinfer.nvfp4_kv_dequantize(pv,sv,method.v_scales_gpu[3:4],output_dtype=torch.bfloat16).reshape_as(v)
++        torch.testing.assert_close(graph_k,expected_k,rtol=.008,atol=.004)
++        torch.testing.assert_close(graph_v,expected_v,rtol=.008,atol=.004)
 diff --git a/test/registered/kernel/speculative/test_verify_commit_triton.py b/test/registered/kernel/speculative/test_verify_commit_triton.py
 new file mode 100644
 index 0000000000..fed30ec8f2

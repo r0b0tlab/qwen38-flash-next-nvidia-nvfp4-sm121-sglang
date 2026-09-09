@@ -17,10 +17,10 @@
   ],
   "schema": "r0b0tlab.qwen38fn.runtime.v1",
   "sglang": {
-    "commit": "295dafef895eca0ceb69a65ae5e6ad1d8e87a899",
+    "commit": "ffce4fdfb1cd6cc9a583c71f93c998b6a1fa5148",
     "main": "20ca564bf77518604b89dc9f7fdba640daabd88b",
-    "package_version": "0.5.19+sm121.g295dafef895e",
-    "patch_sha256": "c22213f6af3b77b7c9f73a869f1f57e757e469c4efe508d946428916689f9967",
+    "package_version": "0.5.19+sm121.gffce4fdfb1cd",
+    "patch_sha256": "382a6e82508e096d41d56941ac6f378bfa7d56170a75c08caed400e14d5ea6a9",
     "python_files": {
       "__init__.py": "0c6bd1b5bc75da013d49d26f7799ca36d682779293405dce1adc193b97a0e6bd",
       "_platform_stubs.py": "79315697f34c57d0809973e32fa68fa89b4260d3d3271a2e0fcfdaa516a339e2",
@@ -2745,7 +2745,7 @@
       "srt/mem_cache/mamba_checkpoint_pool.py": "3422cc4a2f79c2156a0303c3eb989c5a2d23c890734811eeb78329feb36cae17",
       "srt/mem_cache/mamba_radix_cache.py": "1b0f5eafa71598f688154ec07d7eb168f9d556defa935f0f783f1622b590f0e3",
       "srt/mem_cache/mamba_slot_fused.py": "291c34436e1d82b97f82a8ec8afe8b7999692c9be677f30b1a98f306e8970522",
-      "srt/mem_cache/memory_pool.py": "03bfed1b1ffdcb21f4bcc428c3db94641d835565b10d3a7847057bb20a009867",
+      "srt/mem_cache/memory_pool.py": "799b25c607076c4b4418d6a0807c73a27e7ce2360f440d094a1104de018b76a8",
       "srt/mem_cache/memory_pool_host.py": "6411955804fc51d90f57e8e6b2a6eca2a32e69f331edb32f5590d813d913823f",
       "srt/mem_cache/multimodal_cache.py": "f1415edeb4554534de2648e2ee1ffacde06236a7b0028f29f94b9b94a954b739",
       "srt/mem_cache/ple_state_pool.py": "ea926846b50e70a92b338b6d5414d8a5f483bc41c7bbc809de3cda1cc1fa8990",
@@ -3654,7 +3654,7 @@
       "kernels/aot/",
       "_version.py"
     ],
-    "tree": "b09c3ecbdc68d604d732b2cc58b71243cf14abd1",
+    "tree": "72dd648ca003828ddb4ac33eefc1b2d6314dc18e",
     "wheel_omissions": [
       "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py",
       "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py"
