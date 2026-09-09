@@ -17,10 +17,10 @@
   ],
   "schema": "r0b0tlab.qwen38fn.runtime.v1",
   "sglang": {
-    "commit": "ffce4fdfb1cd6cc9a583c71f93c998b6a1fa5148",
+    "commit": "535192c2d76ca0c507deb3aec0f13fa16ac56077",
     "main": "20ca564bf77518604b89dc9f7fdba640daabd88b",
-    "package_version": "0.5.19+sm121.gffce4fdfb1cd",
-    "patch_sha256": "382a6e82508e096d41d56941ac6f378bfa7d56170a75c08caed400e14d5ea6a9",
+    "package_version": "0.5.19+sm121.g535192c2d76c",
+    "patch_sha256": "9913dedf032281a0b513f6de55b5e131128cb596b29bff714698fb42cd8b885f",
     "python_files": {
       "__init__.py": "0c6bd1b5bc75da013d49d26f7799ca36d682779293405dce1adc193b97a0e6bd",
       "_platform_stubs.py": "79315697f34c57d0809973e32fa68fa89b4260d3d3271a2e0fcfdaa516a339e2",
@@ -1650,7 +1650,7 @@
       "srt/arg_groups/fields/parallel.py": "e2a8660f1ca9e771e71495d570fa1210bf395ba365b524271d3c24509e05720f",
       "srt/arg_groups/fields/schedule.py": "8cfd0a798932c0f0a5bb6fd3113c4515e93e8dd1fd5cc81b3dd41965e26f5840",
       "srt/arg_groups/fields/serving.py": "7d93ef38ef92bacff774e4a2819ac56f5bb46678c45ff799c3d942426ecb647d",
-      "srt/arg_groups/fields/spec.py": "b5bddb584275f60ab292b87b107a8348a4fc3635a8591805a2690a2ade1570b9",
+      "srt/arg_groups/fields/spec.py": "15ec839dadb32437ee5a9b2e2b154e1f8816ff062e1c51c13699bf1b771b4721",
       "srt/arg_groups/hicache_hook.py": "1935590d4a208d38e315f809fe766859580f169cc67d5b23a9ae4f89b067664b",
       "srt/arg_groups/hisparse_hook.py": "131975e40b50ebc0b0b58a034770283cab0dbe6f9a2e90c02b999c2357c3faa3",
       "srt/arg_groups/kimi_k3_hook.py": "eef88337a0dcd24e6ed8c9f79d51fcb2b2d32a588714f099c1641eac5e1ba24d",
@@ -3654,7 +3654,7 @@
       "kernels/aot/",
       "_version.py"
     ],
-    "tree": "72dd648ca003828ddb4ac33eefc1b2d6314dc18e",
+    "tree": "eba6ff567e4e5955d08c97fec3ddb28bd5902415",
     "wheel_omissions": [
       "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py",
       "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py"

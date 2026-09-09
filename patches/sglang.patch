@@ -4430,6 +4430,19 @@ index f80d877c9b..742ad6cdf0 100644
  
  
  @dataclasses.dataclass
+diff --git a/python/sglang/srt/arg_groups/fields/spec.py b/python/sglang/srt/arg_groups/fields/spec.py
+index f71db32960..3ed79d71f4 100644
+--- a/python/sglang/srt/arg_groups/fields/spec.py
++++ b/python/sglang/srt/arg_groups/fields/spec.py
+@@ -151,7 +151,7 @@ class Spec:
+             "pool; the saving shows up as free device memory, so raise "
+             "--mem-fraction-static to convert it into KV capacity. Default follows "
+             "--kv-cache-dtype.",
+-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
++            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "nvfp4"],
+         ),
+     ] = None
+     speculative_draft_window_size: A[
 diff --git a/python/sglang/srt/arg_groups/memory_hook.py b/python/sglang/srt/arg_groups/memory_hook.py
 index 437a4d8bb2..a894286e86 100644
 --- a/python/sglang/srt/arg_groups/memory_hook.py
@@ -21038,6 +21051,31 @@ index 0000000000..190bd3a197
 +        probs = torch.softmax(torch.einsum('hd,khd->hk', q[b].float(), k) * layer.scaling, dim=-1)
 +        refs.append(torch.einsum('hk,khd->hd', probs, v).to(q.dtype))
 +    torch.testing.assert_close(out, torch.stack(refs), rtol=.03, atol=.03)
+diff --git a/test/registered/kernel/qsa/test_qsa_nvfp4_cli.py b/test/registered/kernel/qsa/test_qsa_nvfp4_cli.py
+new file mode 100644
+index 0000000000..a3644497f2
+--- /dev/null
++++ b/test/registered/kernel/qsa/test_qsa_nvfp4_cli.py
+@@ -0,0 +1,19 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Exercise the generated CLI, not just the runtime dtype resolver."""
++import argparse
++import pytest
++from sglang.srt.server_args import ServerArgs
++
++@pytest.mark.parametrize('dtype', ['bf16', 'nvfp4'])
++def test_native_draft_kv_flag_is_accepted(dtype):
++    parser=argparse.ArgumentParser()
++    ServerArgs.add_cli_args(parser)
++    args=parser.parse_args(['--model-path','/unused','--kv-cache-dtype',dtype,
++                           '--speculative-draft-kv-cache-dtype',dtype])
++    assert args.kv_cache_dtype==args.speculative_draft_kv_cache_dtype==dtype
++
++def test_invalid_draft_kv_dtype_remains_rejected():
++    parser=argparse.ArgumentParser()
++    ServerArgs.add_cli_args(parser)
++    with pytest.raises(SystemExit):
++        parser.parse_args(['--model-path','/unused','--speculative-draft-kv-cache-dtype','invalid'])
 diff --git a/test/registered/kernel/qsa/test_qsa_nvfp4_pool.py b/test/registered/kernel/qsa/test_qsa_nvfp4_pool.py
 new file mode 100644
 index 0000000000..16262158f5
