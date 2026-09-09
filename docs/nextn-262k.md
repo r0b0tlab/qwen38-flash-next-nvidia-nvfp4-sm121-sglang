@@ -27,9 +27,9 @@ This is a working, screened full-pool candidate, **not a claim of global optimal
 | MEDIUM | 23.83 | 26.32 | 4 / 4 |
 | PROSE | 26.43 | 36.31 | 3 / 3 |
 
-C1 request latency and C2 batch throughput are different metrics. They are labeled separately, not presented as interchangeable speedups. The C1 SHORT median is -6.74% below the earlier four-request32K NEXTN-S1 screen; C1 acceleration is still an open optimization goal.
+C1 request latency and C2 batch throughput are different metrics. They are labeled separately, not presented as interchangeable speedups. The C1 SHORT median is 6.74% below the earlier four-request32K NEXTN-S1 screen; C1 acceleration is still an open optimization goal.
 
-Allocated target/index KV was reported as6.189 GiB, with14.630 GiB startup-available memory; this is not a peak-memory guarantee. Two post-ready generation canaries and the focused host/profile regressions passed. Full-window retrieval, vision requalification at this envelope, Q200, and sustained stability remain unrun here.
+Allocated target/index KV was reported as6.189 GiB, with14.630 GiB startup-available memory; this is not a peak-memory guarantee. Two post-ready generation canaries passed. Host regressions passed590 tests with5 declared skips. The fixed vision/video/multi-image suite passed11 measured cases plus11 warmups with no semantic or transport errors at this envelope. Full-window retrieval, Q200, and sustained stability remain unrun here.
 
 ## Run using the existing guard
 
@@ -69,3 +69,5 @@ The installed image's real `nvfp4_kv_quantize` and `nvfp4_kv_dequantize` primiti
 The live profile still uses BF16 KV. Native NVFP4 storage would require scale-aware QSA prefix and selected-row reads into BF16 compute scratch. The checkpoint declares no KV quantization and provides no named k_scale/v_scale tensors, so per-layer calibration provenance and quality require validation. Estimated saving is approximately4.2 GiB with the existing dequant workspaces, potentially4.7 GiB with bounded QSA-specific scratch; these are sizing estimates, not observed allocation or speed gains.
 
 Private local evidence: `.hermes/evidence/nextn-262k-c2-s3-fast/verified-screen-summary.json` and `.hermes/evidence/nvfp4-kv-research/`. No image or model upload is implied by this document.
+
+The standalone native MTP tuning probe was not admitted: duplicating its weights and TP1 context beside the live full-window model crossed the probe's9 GiB headroom reserve. It exited without changing the service. No unmeasured tuning table was installed and no reserve was lowered; further full-MoE tuning needs an admitted idle-GPU window.
