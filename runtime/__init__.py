@@ -18,7 +18,7 @@ import hashlib
 import json
 import os
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, NoReturn
 
 PROFILE_SCHEMA = 1
 
@@ -58,6 +58,7 @@ MM_PROCESSOR_WORKER_NUM_ALLOWED = (1, 2)
 MM_PROCESSOR_WORKER_NUM_DEFAULT = 1
 
 _SPECULATIVE_FIELDS = frozenset({"steps"})
+_SPECULATIVE_OPTIONAL_FIELDS = frozenset({"kv_cache_dtype"})
 _VISION_FIELDS = frozenset({"backend", "cuda_graph"})
 
 
@@ -78,7 +79,7 @@ def _object_pairs(pairs: list) -> Dict[str, Any]:
     return seen
 
 
-def _fail(reason: str) -> None:
+def _fail(reason: str) -> NoReturn:
     raise ProfileError(reason)
 
 
@@ -241,11 +242,12 @@ def validate_payload(payload: str) -> Dict[str, Any]:
     if mode == "nextn":
         if not isinstance(speculative, dict):
             _fail("mode 'nextn' requires a 'speculative' object")
-        if set(speculative) != _SPECULATIVE_FIELDS:
-            _fail(
-                "field 'speculative' must contain exactly %s, got %s"
-                % (sorted(_SPECULATIVE_FIELDS), sorted(speculative))
-            )
+        if not _SPECULATIVE_FIELDS <= set(speculative) or set(speculative) - (_SPECULATIVE_FIELDS | _SPECULATIVE_OPTIONAL_FIELDS):
+            _fail("field 'speculative' requires steps and only documented optional fields")
+        if "kv_cache_dtype" in speculative:
+            _optional_enum(speculative, "kv_cache_dtype", ("bf16", "nvfp4"), "bf16")
+            if speculative["kv_cache_dtype"] == "nvfp4" and kv_dtype != "nvfp4":
+                _fail("NVFP4 draft KV requires the frozen NVFP4 scale profile")
         _optional_int(
             speculative, "steps",
             minimum=SPECULATIVE_STEPS_MIN, maximum=SPECULATIVE_STEPS_MAX,
@@ -310,6 +312,7 @@ class Profile:
     kv_calibration_mode: Optional[str] = None
     kv_scale_file: Optional[str] = None
     kv_scale_sha256: Optional[str] = None
+    draft_kv_cache_dtype: Optional[str] = None
 
     def digest(self) -> str:
         """SHA-256 over the canonical JSON form of the raw profile."""
@@ -357,6 +360,7 @@ def profile_from_dict(raw: Dict[str, Any]) -> Profile:
         kv_calibration_mode=validated.get("kv_calibration", {}).get("mode"),
         kv_scale_file=validated.get("kv_calibration", {}).get("file"),
         kv_scale_sha256=validated.get("kv_calibration", {}).get("sha256"),
+        draft_kv_cache_dtype=speculative.get("kv_cache_dtype"),
     )
 
 

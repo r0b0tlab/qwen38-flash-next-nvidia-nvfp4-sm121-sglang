@@ -576,7 +576,7 @@ def build_argv(profile: Profile, sources: Dict[str, Any]) -> List[str]:
             "--speculative-moe-runner-backend",
             "triton",
             "--speculative-draft-kv-cache-dtype",
-            _kv_cache_flag(profile.kv_cache_dtype),
+            _kv_cache_flag(profile.draft_kv_cache_dtype or profile.kv_cache_dtype),
         ]
     return argv
 
