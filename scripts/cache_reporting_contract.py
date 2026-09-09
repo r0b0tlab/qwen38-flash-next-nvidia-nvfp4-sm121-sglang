@@ -16,6 +16,12 @@ EXPECTED_SOURCE_HASHES = {
     "srt/entrypoints/openai/protocol.py": "c9f05204379a6dd611d662c0350f97654800d76fcdeda5ba6f8dcc5f58b424f9",
 }
 
+# The second pin changes only the control DTO; all cache-transport AST is identical.
+APPROVED_SOURCE_HASH_SETS = (
+    EXPECTED_SOURCE_HASHES,
+    {**EXPECTED_SOURCE_HASHES, "srt/managers/io_struct.py": "6f2c4030a85d95a78046a0ddda295cafd5165b6bc4cd30861e57e3f4924f7e79"},
+)
+
 
 def from_runtime_lock(lock):
     files = lock.get("sglang", {}).get("python_files", {})
@@ -30,7 +36,7 @@ def validate(contract):
         not isinstance(contract, dict)
         or set(contract) != {"schema", "source_hashes"}
         or contract.get("schema") != SCHEMA
-        or contract.get("source_hashes") != EXPECTED_SOURCE_HASHES
+        or contract.get("source_hashes") not in APPROVED_SOURCE_HASH_SETS
     ):
         raise ValueError("unverified native cache-reporting semantics")
     return True

@@ -1,0 +1,115 @@
+{
+  "schema": "sglang.qsa.nvfp4-kv-scales.v1",
+  "model_revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+  "scale_policy": "bf16-amax-over-6x448",
+  "pools": {
+    "draft": {
+      "layer_ids": [
+        0
+      ],
+      "heads": 2,
+      "head_dim": 256,
+      "observations": [
+        6307
+      ],
+      "k_scale": [
+        0.03459821428571429
+      ],
+      "v_scale": [
+        0.005440848214285714
+      ]
+    },
+    "target": {
+      "layer_ids": [
+        3,
+        7,
+        11,
+        15,
+        19,
+        23,
+        27,
+        31,
+        35,
+        39,
+        43,
+        47
+      ],
+      "heads": 2,
+      "head_dim": 256,
+      "observations": [
+        3172,
+        3172,
+        3172,
+        3172,
+        3172,
+        3172,
+        3172,
+        3172,
+        3172,
+        3172,
+        3172,
+        3172
+      ],
+      "k_scale": [
+        0.0026157924107142855,
+        0.0026041666666666665,
+        0.003208705357142857,
+        0.0033249627976190475,
+        0.003441220238095238,
+        0.0032784598214285715,
+        0.003394717261904762,
+        0.0035342261904761905,
+        0.004069010416666667,
+        0.004534040178571429,
+        0.0032784598214285715,
+        0.005859375
+      ],
+      "v_scale": [
+        0.0018949962797619048,
+        0.004069010416666667,
+        0.006603422619047619,
+        0.004743303571428571,
+        0.008277529761904762,
+        0.004789806547619048,
+        0.011858258928571428,
+        0.007533482142857143,
+        0.009672619047619048,
+        0.005789620535714286,
+        0.002232142857142857,
+        0.0032552083333333335
+      ]
+    }
+  },
+  "provenance": {
+    "image": "sha256:b5210af52288532dcac6ae51551bd606261d0bf0e09e377daab74d00156c4d27",
+    "source": "8f489cff92e6d74b200b0fa037d7ccbdedec727b",
+    "profile": {
+      "schema": 1,
+      "mode": "nextn",
+      "context_length": 262144,
+      "max_total_tokens": 262144,
+      "max_running_requests": 2,
+      "chunked_prefill_size": 4096,
+      "max_mamba_cache_size": 10,
+      "mem_fraction_static": 0.88,
+      "kv_cache_dtype": "bf16",
+      "vision": {
+        "backend": "triton_attn",
+        "cuda_graph": true
+      },
+      "ple_rss_gib": 4,
+      "mm_processor_worker_num": 1,
+      "speculative": {
+        "steps": 2
+      },
+      "kv_calibration": {
+        "mode": "collect"
+      }
+    },
+    "calibration_corpus_sha256": "06e4c8fe529e5dd963bbf44220963432f65226317a1df1ee0c3998facff09950",
+    "requests": 34,
+    "not_q200": true,
+    "bootstrap_observations_included": true,
+    "initial_state_sha256": "3285b2caea725f9147f5bff9615cd6f335187d796b0ea26b48853030c7de1e09"
+  }
+}

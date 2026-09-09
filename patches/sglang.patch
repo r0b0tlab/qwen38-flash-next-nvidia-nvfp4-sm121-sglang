@@ -6472,10 +6472,10 @@ index 0000000000..56070c4964
 +]
 diff --git a/python/sglang/srt/layers/attention/qsa/kv_calibration.py b/python/sglang/srt/layers/attention/qsa/kv_calibration.py
 new file mode 100644
-index 0000000000..77de0fcddf
+index 0000000000..ad8fd23d91
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/qsa/kv_calibration.py
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,228 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Opt-in BF16 QSA KV calibration and checkpoint-bound NVFP4 sidecars."""
 +from __future__ import annotations
@@ -6654,6 +6654,22 @@ index 0000000000..77de0fcddf
 +
 +
 +class QSAKVCalibrationMixin:
++    def _require_plain_qsa_cache(self):
++        if getattr(self.get_kv_cache_quant_method(), 'name', None) == 'nvfp4':
++            raise ValueError('QSA NVFP4 requires raw packed buffers and scale-aware reads')
++
++    def get_key_buffer(self, layer_id):
++        self._require_plain_qsa_cache()
++        return super().get_key_buffer(layer_id)
++
++    def get_value_buffer(self, layer_id):
++        self._require_plain_qsa_cache()
++        return super().get_value_buffer(layer_id)
++
++    def get_kv_buffer(self, layer_id):
++        self._require_plain_qsa_cache()
++        return super().get_kv_buffer(layer_id)
++
 +    def _init_qsa_kv_scales(self, *, role, layer_ids, heads, dim, dtype, device):
 +        if role not in ('target', 'draft'):
 +            raise ValueError('invalid QSA calibration pool role')
@@ -11694,6 +11710,21 @@ index 74dd32e825..761f8e5540 100644
          output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
          return output_parallel
  
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 764205f08a..2b46d49d43 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -2101,8 +2101,8 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
+ 
+ 
+ class SetInternalStateReq(BaseReq, kw_only=True):
+-    # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
+-    server_args: Dict[str, Union[int, float]]
++    # Numeric scheduler knobs and explicit boolean control commands.
++    server_args: Dict[str, Union[int, float, bool]]
+ 
+ 
+ class SetInternalStateReqOutput(BaseReq, kw_only=True):
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
 index 85b9c203c9..03a7268c4b 100644
 --- a/python/sglang/srt/managers/scheduler.py
@@ -20674,10 +20705,10 @@ index 0000000000..9664b83f9c
 +    sys.exit(pytest.main([__file__, "-v", "-s"]))
 diff --git a/test/registered/kernel/qsa/test_qsa_kv_calibration.py b/test/registered/kernel/qsa/test_qsa_kv_calibration.py
 new file mode 100644
-index 0000000000..9097df2542
+index 0000000000..92f54821b1
 --- /dev/null
 +++ b/test/registered/kernel/qsa/test_qsa_kv_calibration.py
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,140 @@
 +# SPDX-License-Identifier: Apache-2.0
 +import copy
 +import hashlib
@@ -20742,6 +20773,29 @@ index 0000000000..9097df2542
 +    p.write_text('{"schema":"one","schema":"two"}'); p.chmod(0o600)
 +    with pytest.raises(ValueError, match='duplicate'):
 +        load_sidecar(str(p), hashlib.sha256(p.read_bytes()).hexdigest(), **ARGS)
++
++
++@pytest.mark.parametrize('name', ['get_key_buffer', 'get_value_buffer', 'get_kv_buffer'])
++def test_packed_qsa_rejects_plain_buffer_getters(name):
++    class Base:
++        recipe = 'nvfp4'
++        def get_kv_cache_quant_method(self):return SimpleNamespace(name=self.recipe)
++        def get_key_buffer(self, layer):return ('key', layer)
++        def get_value_buffer(self, layer):return ('value', layer)
++        def get_kv_buffer(self, layer):return ('kv', layer)
++    class Pool(QSAKVCalibrationMixin, Base):pass
++    pool=Pool()
++    with pytest.raises(ValueError, match='raw'):
++        getattr(pool,name)(3)
++    pool.recipe='none'
++    assert getattr(pool,name)(3)[1]==3
++
++
++def test_control_request_preserves_reset_boolean():
++    from pydantic import TypeAdapter
++    from sglang.srt.managers.io_struct import SetInternalStateReq
++    req=TypeAdapter(SetInternalStateReq).validate_python({'server_args':{'qsa_kv_amax_reset':True}})
++    assert req.server_args['qsa_kv_amax_reset'] is True
 +
 +
 +def test_cpu_collector_preserves_global_layer_order_and_running_max():

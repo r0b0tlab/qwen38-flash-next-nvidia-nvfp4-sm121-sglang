@@ -17,10 +17,10 @@
   ],
   "schema": "r0b0tlab.qwen38fn.runtime.v1",
   "sglang": {
-    "commit": "8f489cff92e6d74b200b0fa037d7ccbdedec727b",
+    "commit": "295dafef895eca0ceb69a65ae5e6ad1d8e87a899",
     "main": "20ca564bf77518604b89dc9f7fdba640daabd88b",
-    "package_version": "0.5.19+sm121.g8f489cff92e6",
-    "patch_sha256": "d14d4bcd6b9cd8059dfe3722c7a8586808e01dd3fc2585360eb6e82b2e34f881",
+    "package_version": "0.5.19+sm121.g295dafef895e",
+    "patch_sha256": "c22213f6af3b77b7c9f73a869f1f57e757e469c4efe508d946428916689f9967",
     "python_files": {
       "__init__.py": "0c6bd1b5bc75da013d49d26f7799ca36d682779293405dce1adc193b97a0e6bd",
       "_platform_stubs.py": "79315697f34c57d0809973e32fa68fa89b4260d3d3271a2e0fcfdaa516a339e2",
@@ -2348,7 +2348,7 @@
       "srt/layers/attention/qsa/glue.py": "e283b641f93cab82586529b15f9cd86a261278478538e7679caafc34caab55ff",
       "srt/layers/attention/qsa/graph_metadata.py": "7508e186750c147a26aeecfed902fadc89e63cc398b28b11eb72587a8e2a5807",
       "srt/layers/attention/qsa/kernel.py": "d0c7b61dce8b1440a2ea785fa87bb4ce7c06e608c7cda61469b28d594da65146",
-      "srt/layers/attention/qsa/kv_calibration.py": "5258b66fda4e524d6506d251a036024bc6ee1960016b94b43572f9b2c6ba9c2c",
+      "srt/layers/attention/qsa/kv_calibration.py": "56cb790469da8f19e84a1901bb1605df1701ba2f06bc77e6e3324bfe164ad3ef",
       "srt/layers/attention/qsa/metadata.py": "d361742e04dff8d9157211ed4b41f167d328a477767429eb515b7f44ff483c09",
       "srt/layers/attention/qsa/mqa.py": "3b269a6849e08aea1f9d2e08ed7b79b1e6b82bf7fce10f647cf591764751d2ad",
       "srt/layers/attention/qsa/nvfp4.py": "a83a2bed3a2315b2c8124193dca2ffb01af68a68b46e3037a94089990eb1a5b3",
@@ -2655,7 +2655,7 @@
       "srt/managers/disagg_service.py": "d282d060b91b272b0170522a0260b1c58883d47c1e872bb2b02922a8cdaecb53",
       "srt/managers/embed_types.py": "a82f4dec31163faf0982b1346290698b1a19aa648f7b6381d3b129d73046de75",
       "srt/managers/hisparse_coordinator.py": "4f5f8b0267797a32bc6a7d607379827d85ea958c1a6f50eadcde1d9aa6cda446",
-      "srt/managers/io_struct.py": "cb482b4c70faecea58b862cb6a8d87e26e2f605b944f5918657cfe2d54f82548",
+      "srt/managers/io_struct.py": "6f2c4030a85d95a78046a0ddda295cafd5165b6bc4cd30861e57e3f4924f7e79",
       "srt/managers/load_snapshot.py": "e38c1ace5876b6420c3c3a6be7e7ae94da8afbd61024c4987af1ae45b4b6e528",
       "srt/managers/min_free_slots_delayer.py": "bb864fc17446d3ccedc208250ac0171a235a39870bc151139c411049772fbeef",
       "srt/managers/mm_schedule.py": "8cee0ab89b8942125473e55e8d1ed845736ab4925e668d33231fae9d68c0605d",
@@ -3654,7 +3654,7 @@
       "kernels/aot/",
       "_version.py"
     ],
-    "tree": "0dc211ec13d9501f51ab1d42a1c8a66324662b33",
+    "tree": "b09c3ecbdc68d604d732b2cc58b71243cf14abd1",
     "wheel_omissions": [
       "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py",
       "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py"

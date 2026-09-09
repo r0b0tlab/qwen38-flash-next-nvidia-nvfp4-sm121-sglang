@@ -93,3 +93,15 @@ def test_tampered_dataclass_is_rejected_by_runtime():
     p = profile_from_dict(frozen())
     changed = dataclasses.replace(p, kv_scale_sha256='b' * 64)
     with pytest.raises(ProfileError): build_env(changed, SOURCES)
+
+
+def test_frozen_nvfp4_candidate_has_hash_bound_complete_scale_file():
+    profile=profile_from_json((ROOT/'profiles/nextn-262k-nvfp4-c2-s2.json').read_text())
+    assert (profile.context_length,profile.max_total_tokens)==(262144,262144)
+    assert (profile.kv_cache_dtype,profile.ple_rss_gib,profile.speculative_steps)==('nvfp4',8,2)
+    path=ROOT/'kv-calibration'/REV/profile.kv_scale_file
+    assert hashlib.sha256(path.read_bytes()).hexdigest()==profile.kv_scale_sha256
+    data=json.loads(path.read_text())
+    assert data['model_revision']==REV and set(data['pools'])=={'target','draft'}
+    assert len(data['pools']['target']['layer_ids'])==12 and len(data['pools']['draft']['layer_ids'])==1
+    assert data['provenance']['requests']==34 and data['provenance']['bootstrap_observations_included'] is True
