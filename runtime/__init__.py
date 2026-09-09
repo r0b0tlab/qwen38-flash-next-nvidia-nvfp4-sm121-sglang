@@ -58,8 +58,12 @@ MM_PROCESSOR_WORKER_NUM_ALLOWED = (1, 2)
 MM_PROCESSOR_WORKER_NUM_DEFAULT = 1
 
 _SPECULATIVE_FIELDS = frozenset({"steps"})
-_SPECULATIVE_OPTIONAL_FIELDS = frozenset({"kv_cache_dtype"})
+_SPECULATIVE_OPTIONAL_FIELDS = frozenset({"kv_cache_dtype", "draft_quantization"})
 _VISION_FIELDS = frozenset({"backend", "cuda_graph"})
+
+#: Decode CUDA-graph backend. "disabled" exists only for measured A/B
+#: diagnostics; a promoted production profile must be "full".
+DECODE_GRAPH_BACKENDS = ("full", "disabled")
 
 
 class ProfileError(ValueError):
@@ -249,6 +253,11 @@ def validate_payload(payload: str) -> Dict[str, Any]:
             _optional_enum(speculative, "kv_cache_dtype", ("bf16", "nvfp4"), "bf16")
             if speculative["kv_cache_dtype"] == "nvfp4" and kv_dtype != "nvfp4":
                 _fail("NVFP4 draft KV requires the frozen NVFP4 scale profile")
+        if "draft_quantization" in speculative:
+            _optional_enum(
+                speculative, "draft_quantization",
+                ("modelopt_mixed", "unquant"), "modelopt_mixed",
+            )
         _optional_int(
             speculative, "steps",
             minimum=SPECULATIVE_STEPS_MIN, maximum=SPECULATIVE_STEPS_MAX,
@@ -283,10 +292,13 @@ def validate_payload(payload: str) -> Dict[str, Any]:
         "max_running_requests", "chunked_prefill_size", "max_mamba_cache_size",
         "mem_fraction_static", "kv_cache_dtype", "speculative", "vision",
         "ple_rss_gib", "mm_processor_worker_num", "kv_calibration", "moe_backend",
+        "decode_graph_backend",
     }
     unknown = sorted(set(raw) - known)
     if unknown:
         _fail("unknown profile field(s): %s" % (", ".join(repr(k) for k in unknown)))
+
+    _optional_enum(raw, "decode_graph_backend", DECODE_GRAPH_BACKENDS, "full")
 
     return raw
 
@@ -315,6 +327,8 @@ class Profile:
     kv_scale_sha256: Optional[str] = None
     draft_kv_cache_dtype: Optional[str] = None
     moe_backend: str = "flashinfer_cutlass"
+    draft_quantization: str = "modelopt_mixed"
+    decode_graph_backend: str = "full"
 
     def digest(self) -> str:
         """SHA-256 over the canonical JSON form of the raw profile."""
@@ -364,6 +378,8 @@ def profile_from_dict(raw: Dict[str, Any]) -> Profile:
         kv_scale_sha256=validated.get("kv_calibration", {}).get("sha256"),
         draft_kv_cache_dtype=speculative.get("kv_cache_dtype"),
         moe_backend=validated.get("moe_backend", "flashinfer_cutlass"),
+        draft_quantization=speculative.get("draft_quantization", "modelopt_mixed"),
+        decode_graph_backend=validated.get("decode_graph_backend", "full"),
     )
 
 
