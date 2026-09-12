@@ -36,7 +36,9 @@ def test_live_cli_constructs_and_verifies_client_before_one_run(tmp_path, monkey
         def verify_model(self):
             calls.append("verify")
 
-    def run(client, cases, out, *, tokenizer=None, dry_run=False, on_row=None):
+    def run(
+        client, cases, out, *, tokenizer=None, dry_run=False, on_row=None, retries=0
+    ):
         assert isinstance(client, Client)
         assert calls == ["construct", "verify"]
         assert not dry_run

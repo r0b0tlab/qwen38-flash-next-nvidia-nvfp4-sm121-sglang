@@ -551,7 +551,9 @@ DEFAULT_CASE_IDS = tuple(
 )
 
 
-def run_cases(client, cases, out_path, *, tokenizer=None, dry_run=False, on_row=None):
+def run_cases(
+    client, cases, out_path, *, tokenizer=None, dry_run=False, on_row=None, retries=0
+):
     """Public traffic gate: only pinned real-tokenizer default cases may run."""
     if not cases or len({c.case_id for c in cases}) != len(cases):
         raise ValueError("case IDs must be nonempty and unique")
@@ -575,7 +577,9 @@ def run_cases(client, cases, out_path, *, tokenizer=None, dry_run=False, on_row=
             raise ValueError(
                 "traffic arrays differ from real-tokenizer default construction"
             )
-    return _execute_cases(client, cases, out_path, dry_run=dry_run, on_row=on_row)
+    return _execute_cases(
+        client, cases, out_path, dry_run=dry_run, on_row=on_row, retries=retries
+    )
 
 
 def _execute_cases(
@@ -585,8 +589,15 @@ def _execute_cases(
     *,
     dry_run: bool = False,
     on_row: Any = None,
+    retries: int = 0,
 ) -> Dict[str, Any]:
-    """Run (or dry-run) cases; persist every row; return a fail-closed summary."""
+    """Run (or dry-run) cases; persist every row; return a fail-closed summary.
+
+    ``retries`` is a bounded, infra-only retry: only rows whose verdict is
+    ``infra_error`` are re-attempted (up to ``retries`` extra attempts). Every
+    attempt is persisted with an explicit ``attempt`` ordinal; scored model
+    verdicts are never retried.
+    """
     if not cases or len({c.case_id for c in cases}) != len(cases):
         raise ValueError("case IDs must be nonempty and unique")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -603,7 +614,14 @@ def _execute_cases(
                     "prompt_sha256": case.prompt_sha256,
                 }
                 verdicts[case.case_id] = "not_run_dry"
-            else:
+                fout.write(json.dumps(row, ensure_ascii=False) + "\n")
+                fout.flush()
+                if on_row:
+                    on_row(row)
+                continue
+            attempt = 0
+            while True:
+                attempt += 1
                 try:
                     res = client.completions_tokens(
                         list(case.prompt_ids),
@@ -613,44 +631,43 @@ def _execute_cases(
                         timeout=TIMEOUT_S,
                         extra={"skip_special_tokens": False},
                     )
+                    verdict, detail = check_response(case, res)
                 except Exception as exc:  # infra: recorded, never a needle miss
-                    row = {
-                        "case_id": case.case_id,
-                        "n_tokens": case.n_tokens,
-                        "verdict": "infra_error",
-                        "detail": f"{type(exc).__name__}: {exc}"[:500],
-                        "finish_reason": None,
-                        "usage": None,
-                        "wall_s": None,
-                        "final_text": "",
-                        "raw_body": "",
-                        "prompt_sha256": case.prompt_sha256,
-                    }
-                    verdicts[case.case_id] = "infra_error"
-                    fout.write(json.dumps(row, ensure_ascii=False) + "\n")
-                    fout.flush()
-                    if on_row:
-                        on_row(row)
-                    continue
-                verdict, detail = check_response(case, res)
-                verdicts[case.case_id] = verdict
-                ran += 1
+                    verdict, detail = (
+                        "infra_error",
+                        f"{type(exc).__name__}: {exc}"[:500],
+                    )
+                    res = None
                 row = {
                     "case_id": case.case_id,
                     "n_tokens": case.n_tokens,
                     "verdict": verdict,
+                    "attempt": attempt,
                     "detail": detail,
-                    "finish_reason": res.finish_reason,
-                    "usage": res.usage,
-                    "wall_s": res.wall_s,
-                    "final_text": res.text or "",
-                    "raw_body": res.raw_body,  # bounded by client; no silent evidence truncation
+                    "finish_reason": getattr(res, "finish_reason", None),
+                    "usage": getattr(res, "usage", None),
+                    "wall_s": getattr(res, "wall_s", None),
+                    "final_text": (getattr(res, "text", "") or ""),
+                    "raw_body": (
+                        getattr(res, "raw_body", "") if res is not None else ""
+                    ),  # bounded by client; no silent evidence truncation
                     "prompt_sha256": case.prompt_sha256,
                 }
-            fout.write(json.dumps(row, ensure_ascii=False) + "\n")
-            fout.flush()
-            if on_row:
-                on_row(row)
+                verdicts[case.case_id] = verdict
+                if verdict != "infra_error":
+                    ran += 1
+                    fout.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    fout.flush()
+                    if on_row:
+                        on_row(row)
+                    break
+                # infra_error: retry only while attempts remain
+                fout.write(json.dumps(row, ensure_ascii=False) + "\n")
+                fout.flush()
+                if on_row:
+                    on_row(row)
+                if attempt > retries:
+                    break
     passed = [k for k, v in verdicts.items() if v == "pass"]
     missing = sorted(set(DEFAULT_CASE_IDS) - set(verdicts))
     partial = (
@@ -685,6 +702,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument(
         "--only", action="append", help="run only these case_ids (repeatable)"
+    )
+    p.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="bounded infra-only retries per case (every attempt persisted)",
     )
     p.add_argument(
         "--dry-run", action="store_true", help="construct+freeze+validate, no traffic"
@@ -745,7 +768,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         client = OpenAICompatClient(args.base)
         client.verify_model()  # exact identity before heavy traffic
-        summary = run_cases(client, cases, out, tokenizer=tokenizer)
+        summary = run_cases(client, cases, out, tokenizer=tokenizer, retries=args.retries)
     summary["partial_selection"] = bool(args.only)
     print(json.dumps(summary, indent=2))
     # Successful preparation is not a successful retrieval run: ok stays false.
