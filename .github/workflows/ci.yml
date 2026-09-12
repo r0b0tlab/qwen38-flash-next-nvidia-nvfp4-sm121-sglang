@@ -11,5 +11,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install --upgrade pip pytest
+      - run: python -m pip install --upgrade pip pytest pillow numpy
       - run: python -m pytest tests -q
