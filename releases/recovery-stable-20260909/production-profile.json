@@ -1,0 +1,20 @@
+{
+  "chunked_prefill_size": 4096,
+  "context_length": 262144,
+  "kv_cache_dtype": "bf16",
+  "max_mamba_cache_size": 10,
+  "max_running_requests": 2,
+  "max_total_tokens": 262144,
+  "mem_fraction_static": 0.88,
+  "mm_processor_worker_num": 1,
+  "mode": "nextn",
+  "ple_rss_gib": 4,
+  "schema": 1,
+  "speculative": {
+    "steps": 3
+  },
+  "vision": {
+    "backend": "triton_attn",
+    "cuda_graph": true
+  }
+}

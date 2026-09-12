@@ -1,0 +1,62 @@
+{
+  "source_image": "sha256:2ee545cf877ae8497c123637e061b6e6313c624e30018f975969b1d554e27f56",
+  "scope": "archived native controlled screen; not a fresh post-reboot performance measurement",
+  "lanes": [
+    {
+      "concurrency": 1,
+      "lane": "short",
+      "requests": 4,
+      "median_request_e2e_tok_s": 21.348978061980787,
+      "batch_e2e_tok_s": 22.6647501407095,
+      "median_ttft_s": 0.37919358799263136,
+      "output_tokens": 1024
+    },
+    {
+      "concurrency": 1,
+      "lane": "medium",
+      "requests": 4,
+      "median_request_e2e_tok_s": 23.82778073609839,
+      "batch_e2e_tok_s": 22.960363706538395,
+      "median_ttft_s": 1.2874513490023674,
+      "output_tokens": 2048
+    },
+    {
+      "concurrency": 1,
+      "lane": "prose",
+      "requests": 3,
+      "median_request_e2e_tok_s": 26.427898126345813,
+      "batch_e2e_tok_s": 25.79199547025705,
+      "median_ttft_s": 0.34339218300010543,
+      "output_tokens": 7153
+    },
+    {
+      "concurrency": 2,
+      "lane": "short",
+      "requests": 4,
+      "median_request_e2e_tok_s": 22.09407842662658,
+      "batch_e2e_tok_s": 42.08653647659883,
+      "median_ttft_s": 0.5812130805061315,
+      "output_tokens": 1024
+    },
+    {
+      "concurrency": 2,
+      "lane": "medium",
+      "requests": 4,
+      "median_request_e2e_tok_s": 17.465397276809,
+      "batch_e2e_tok_s": 26.31791922992156,
+      "median_ttft_s": 1.3281237935007084,
+      "output_tokens": 2048
+    },
+    {
+      "concurrency": 2,
+      "lane": "prose",
+      "requests": 3,
+      "median_request_e2e_tok_s": 20.85699532227179,
+      "batch_e2e_tok_s": 36.31352922310156,
+      "median_ttft_s": 0.5734930519975023,
+      "output_tokens": 8195
+    }
+  ],
+  "measured_requests": 22,
+  "errors": 0
+}

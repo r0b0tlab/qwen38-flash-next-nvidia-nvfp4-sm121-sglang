@@ -1,0 +1,91 @@
+{
+  "schema": "r0b0tlab.q200-v2-adjudicated.v1",
+  "status": "SCORED_WITH_DISCLOSURES",
+  "suite": "Q200-v2",
+  "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+  "image_id": "sha256:2ee545cf877ae8497c123637e061b6e6313c624e30018f975969b1d554e27f56",
+  "profile_sha256": "e8c754d0442128b6d638a108bb3e349597591db90776ca7089c06766b7f76f8c",
+  "total_count": 200,
+  "correct_count": 185,
+  "incorrect_count": 15,
+  "accuracy_pct": 92.5,
+  "families": {
+    "gsm8k": {
+      "n": 80,
+      "transported": 80,
+      "grade_complete": 80,
+      "correct": 80,
+      "incorrect": 0,
+      "ungraded": 0,
+      "grader_errors": 0,
+      "accuracy_pct": 100.0
+    },
+    "humaneval": {
+      "n": 40,
+      "transported": 40,
+      "grade_complete": 40,
+      "correct": 40,
+      "incorrect": 0,
+      "ungraded": 0,
+      "grader_errors": 0,
+      "accuracy_pct": 100.0
+    },
+    "ifeval": {
+      "n": 40,
+      "transported": 40,
+      "grade_complete": 40,
+      "correct": 36,
+      "incorrect": 4,
+      "ungraded": 0,
+      "grader_errors": 0,
+      "accuracy_pct": 90.0
+    },
+    "hard_reasoning": {
+      "n": 20,
+      "transported": 20,
+      "grade_complete": 20,
+      "correct": 17,
+      "incorrect": 3,
+      "ungraded": 0,
+      "grader_errors": 0,
+      "accuracy_pct": 85.0
+    }
+  },
+  "bfcl_hard20": {
+    "accuracy": 0.6,
+    "correct_count": 12,
+    "failure_rows": 8,
+    "incorrect_count": 8,
+    "score_sha256": "3eb3b555eddc380931cb565f174d98040a57c3d1edc4cdf8c9071c4b661c4aed",
+    "total_count": 20
+  },
+  "bounded_nontermination_failures": [
+    {
+      "id": "ifeval-023",
+      "classification": "MODEL_NONTERMINATION",
+      "passed": false,
+      "max_tokens": 8192,
+      "finish_reason": "length",
+      "raw_error": "invalid completion response: choice.message.content must be non-empty text; finish_reason is missing or unsupported",
+      "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "hard-01",
+      "classification": "MODEL_NONTERMINATION",
+      "passed": false,
+      "max_tokens": 8192,
+      "finish_reason": "length",
+      "raw_error": "invalid completion response: choice.message.content must be non-empty text; finish_reason is missing or unsupported",
+      "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "disclosures": [
+    "Raw strict stop-only harness summary retained; empty final answers after the generous output ceiling are scored as incorrect, not as transport failures.",
+    "Hard-reasoning answers independently adjudicated; known erroneous reference text was not used to mark mathematically correct answers wrong.",
+    "Single-GPU C2 server with two text workers and one BFCL client; no throughput claim from this mixed quality cohort."
+  ],
+  "strict_text_status": "INCOMPLETE",
+  "manual_evidence_sha256": "adcf5c8a4b635f63fda9db1c2cc1f2f6cfd18385c41eef9eed8bc985fe47b054",
+  "text_dataset_sha256": "74623ab9b075120cd6f7a93059cc16d8817a6039dd20118b8f0350279f8b1ed6",
+  "bfcl_manifest_sha256": "0860da504a3db2c3cd73647ecdc2a5ecdb1793d7a5cf3f4f004912f0ef314d4e"
+}
