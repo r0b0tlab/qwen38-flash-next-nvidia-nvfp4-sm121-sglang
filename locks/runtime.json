@@ -20,7 +20,7 @@
     "commit": "535192c2d76ca0c507deb3aec0f13fa16ac56077",
     "main": "20ca564bf77518604b89dc9f7fdba640daabd88b",
     "package_version": "0.5.19+sm121.g535192c2d76c",
-    "patch_sha256": "9913dedf032281a0b513f6de55b5e131128cb596b29bff714698fb42cd8b885f",
+    "patch_sha256": "eb6ed88b982692313e1c4b972f4a15d1eecd27559c55b4fd5891f322af2849cc",
     "python_files": {
       "__init__.py": "0c6bd1b5bc75da013d49d26f7799ca36d682779293405dce1adc193b97a0e6bd",
       "_platform_stubs.py": "79315697f34c57d0809973e32fa68fa89b4260d3d3271a2e0fcfdaa516a339e2",
@@ -3273,7 +3273,7 @@
       "srt/multimodal/transport/__init__.py": "5ada54db0cf95b53fc4452bb2f2bb1a08d7e9e3d51d8736bd0e1914ae453d65c",
       "srt/multimodal/transport/cuda_ipc.py": "664d87e201dfd9831de8d4f615dc6bcf6413d21f50a0c3c0b2b7bd7ab7a0e720",
       "srt/multimodal/transport/memory_pool.py": "56ffd932157fd0f9aeefb68e8b1b84bb0e1e2e696424e99b488b22e5f4e7347c",
-      "srt/multimodal/vit_cuda_graph_runner.py": "9f5ce583d5b7c4e4e78078eb950019abd19db8dcce8853fddfd375536f62a99b",
+      "srt/multimodal/vit_cuda_graph_runner.py": "50215cc26c629239e76b03a7be5c0bee078aa3cc2bf49d8a1254923cfa73ab99",
       "srt/multiplex/multiplexing_mixin.py": "132be1bfc3595013c1f31d0275b0039a8a2c9fca7b948ef2c9f7cdea6f74d5e3",
       "srt/multiplex/pdmux_context.py": "1ce3a20c12c9bcca6108093e368cb9a40d631c3930c02384666ecd30341a2608",
       "srt/observability/cpu_monitor.py": "61ee5b561c432abe4e3a86dd0a09715c82d79dbab7781e0568615bf34d65aec1",
@@ -3654,7 +3654,7 @@
       "kernels/aot/",
       "_version.py"
     ],
-    "tree": "eba6ff567e4e5955d08c97fec3ddb28bd5902415",
+    "tree": "13ee1bc76f150465f4be0da400ab62a7f22f1a96",
     "wheel_omissions": [
       "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py",
       "multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py"
