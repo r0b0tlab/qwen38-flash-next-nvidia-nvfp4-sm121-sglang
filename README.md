@@ -1,15 +1,37 @@
 # Qwen3.8-Flash-Next NVIDIA NVFP4 — Single GB10 SGLang
 
-Status: **NOT QUALIFIED — implementation in progress.**
+Status: **QUALIFIED single-GB10 release** — machine-readable verdict in
+`releases/recovery-stable-20260909/qualification-summary.json`
+(`RUNTIME_Q200_AND_RETRIEVAL_VERIFIED`).
+
+Qualified on the exact pinned image `sha256:2ee545cf…427f56` + profile
+`090b4f10…43b0f`:
+
+- Full-window NIAH **9/9 PASS** (single-key 8K/32K/131K/258K at depths
+  5–95% plus the ordered two-key 33/66 case at 258,044 prompt tokens),
+  exact-token transport, one full-window case per serve epoch (host-memory
+  admission), every attempt retained in per-epoch JSONL.
+- Q200-v2 **185/200 = 92.5%** `SCORED_WITH_DISCLOSURES` — GSM8K 80/80,
+  HumanEval 40/40, IFEval 36/40, hard reasoning 17/20,
+  **BFCL-hard20 12/20 (60%)**, and two disclosed model nonterminations
+  (ifeval-023, hard-01) that burned the 8,192-token ceiling with reasoning
+  and emitted no final answer; scored as incorrect, not transport failures.
+- Vision **11/11** (image / multi-image / video), semantic-checked.
+- NEXTN acceptance gauge **3.3817** vs the W4A16 TP=2 derivative's 3.3830 —
+  acceptance identical; the throughput difference is per-step cost.
+- Honest performance attribution vs the W4A16 TP=2 derivative (identical
+  method): dedicated c1 **37.32 vs 62.10** output tok/s (1.57–1.66×).
+  Not claimed: multi-node, global optimality, NVFP4-KV serving.
 
 Reproducible SGLang runtime for the unchanged `nvidia/Qwen3.8-Flash-Next-NVFP4`
 checkpoint on exactly one NVIDIA GB10 (SM121, Linux ARM64): native W4A4 routed
 experts, BF16 full vision, FP8 block-scaled integrated MTP, bounded file-backed
 PLE on local NVMe, native decode CUDA graphs.
 
-**No speed, quality, fit or correctness claim is made. Nothing here has been
-qualified against the real image on real hardware. No performance numbers
-exist for this repository.**
+**No speed, quality, fit or correctness claim is made beyond the qualified
+evidence in `releases/recovery-stable-20260909/qualification-summary.json`.**
+Numbers on this page trace to that summary and the per-epoch JSONL evidence it
+references; anything not present there remains unqualified.
 
 Layout:
 
