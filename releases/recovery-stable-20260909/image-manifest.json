@@ -1,0 +1,18 @@
+{
+  "image_id": "sha256:2ee545cf877ae8497c123637e061b6e6313c624e30018f975969b1d554e27f56",
+  "size_bytes": 33877765332,
+  "architecture": "arm64",
+  "user": "1001:1001",
+  "labels": {
+    "io.r0b0tlab.model.sha": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+    "io.r0b0tlab.sglang.commit": "84cf99860e3086ee0a458a71178343a8ac04fdab",
+    "io.r0b0tlab.sglang.main": "20ca564bf77518604b89dc9f7fdba640daabd88b",
+    "io.r0b0tlab.sglang.tree": "4957f519e185bfa0388299d8fec3792f4f96102d",
+    "io.r0b0tlab.target": "single-gb10-sm121",
+    "org.opencontainers.image.revision": "818c913cbd23687d6ae5aae1e5ba5f1e0a50af89",
+    "org.opencontainers.image.source": "https://github.com/r0b0tlab/qwen38-flash-next-nvidia-nvfp4-sm121-sglang",
+    "org.opencontainers.image.url": "https://github.com/sgl-project/sglang/actions/runs/34069859043",
+    "org.opencontainers.image.version": "lmsysorg/sglang:nightly-dev-20260907-30705c00"
+  },
+  "qualification": "RELEASE_QUALIFIED_EVIDENCE_BOUND"
+}

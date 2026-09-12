@@ -1,0 +1,114 @@
+{
+  "status": "RUNTIME_Q200_AND_RETRIEVAL_VERIFIED",
+  "checked_utc": "2026-09-12T04:44:27.353790+00:00",
+  "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+  "model_revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+  "image_id": "sha256:2ee545cf877ae8497c123637e061b6e6313c624e30018f975969b1d554e27f56",
+  "profile_sha256": "e8c754d0442128b6d638a108bb3e349597591db90776ca7089c06766b7f76f8c",
+  "context_length": 262144,
+  "physical_kv_tokens": 262144,
+  "kv_cache_dtype": "bf16",
+  "native_mtp_steps": 3,
+  "vision_measured_pass": 11,
+  "semantic_canaries_pass": 2,
+  "q200": {
+    "correct": 185,
+    "total": 200,
+    "accuracy_pct": 92.5,
+    "status": "SCORED_WITH_DISCLOSURES",
+    "model_nontermination_count": 2
+  },
+  "optimization_verdict": "NO_CONSISTENT_WIN; selected best verified balanced C1 profile, not a new global optimum",
+  "archived_performance_effective_profile_equal": true,
+  "packaged_source_tests": {
+    "passed": 558,
+    "skipped": 4
+  },
+  "retrieval": "Full-window NIAH 9/9 PASS incl. ordered two-key 33/66 at 258,044 tokens",
+  "publication": "Local package only; no remote publication",
+  "niah": {
+    "status": "PASS",
+    "passed": 9,
+    "total": 9,
+    "window": 262144,
+    "max_prompt_tokens": 258044,
+    "cases": [
+      {
+        "case_id": "single_8192_d50",
+        "verdict": "pass",
+        "attempt": 1,
+        "wall_s": 5.8397605729987845,
+        "epoch": "ep2-0100Z",
+        "prompt_tokens": 8192
+      },
+      {
+        "case_id": "single_32768_d50",
+        "verdict": "pass",
+        "attempt": 1,
+        "wall_s": 13.61905430999468,
+        "epoch": "ep2-0100Z",
+        "prompt_tokens": 32768
+      },
+      {
+        "case_id": "single_131072_d50",
+        "verdict": "pass",
+        "attempt": 1,
+        "wall_s": 51.74259266498848,
+        "epoch": "ep2-0100Z",
+        "prompt_tokens": 131072
+      },
+      {
+        "case_id": "single_258044_d5",
+        "verdict": "pass",
+        "attempt": 1,
+        "wall_s": 130.09540207101963,
+        "epoch": "ep2-0100Z",
+        "prompt_tokens": 258044
+      },
+      {
+        "case_id": "single_258044_d25",
+        "verdict": "pass",
+        "attempt": 1,
+        "wall_s": 130.89822616698802,
+        "epoch": "ep3-0140Z",
+        "prompt_tokens": 258044
+      },
+      {
+        "case_id": "single_258044_d50",
+        "verdict": "pass",
+        "attempt": 1,
+        "wall_s": 130.63817848300096,
+        "epoch": "ep6-d50",
+        "prompt_tokens": 258044
+      },
+      {
+        "case_id": "single_258044_d75",
+        "verdict": "pass",
+        "attempt": 1,
+        "wall_s": 132.36469519598177,
+        "epoch": "ep4-07530Z",
+        "prompt_tokens": 258044
+      },
+      {
+        "case_id": "single_258044_d95",
+        "verdict": "pass",
+        "attempt": 1,
+        "wall_s": 131.86051870000665,
+        "epoch": "ep5-09530Z",
+        "prompt_tokens": 258044
+      },
+      {
+        "case_id": "multi_258044_d33_66",
+        "verdict": "pass",
+        "attempt": 1,
+        "wall_s": 134.7978373960068,
+        "epoch": "ep1-1905Z",
+        "prompt_tokens": 258044
+      }
+    ],
+    "evidence": ".hermes/evidence/niah-FINAL-SUMMARY.json (per-epoch rows retained)",
+    "note": "single 258,044-token full-window case per serve epoch (host-memory admission); r01/r02 infra failures superseded by these runs"
+  },
+  "spec_accept_length_gauge": 3.3817,
+  "spec_accept_length_note": "server-info avg_spec_accept_length after the identical W4A16-method suite (archived 2026-09-09, gauge 3.3817 vs W4A16 TP=2 3.3830); completion-weighted mean across measurement rows is secondary"
+}
