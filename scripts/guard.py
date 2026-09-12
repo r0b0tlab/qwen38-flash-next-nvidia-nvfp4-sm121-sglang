@@ -366,16 +366,12 @@ def build_docker_argv(image, profile, sources, model, cache, state, expect):
     ]
 
 
-def run(
-    argv=None,
-    *,
-    transport=None,
-    preflight_fn=None,
-    mem_reader=None,
-    stop_event=None,
-    sleep=time.sleep,
-    monotonic=time.monotonic,
-):
+def _mem_floor_kb(floor_gib: float) -> int:
+    """Watchdog MemAvailable floor in kB from a GiB value."""
+    return int(floor_gib * GIB) // 1024
+
+
+def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Owned single-GB10 runtime lifecycle")
     for name in (
         "image",
@@ -390,7 +386,36 @@ def run(
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--print", "--dryrun", action="store_true", dest="print_only")
     parser.add_argument("--max-watch-seconds", type=float, default=0)
+    parser.add_argument(
+        "--mem-available-floor-gib",
+        type=float,
+        default=8.0,
+        help=(
+            "watchdog MemAvailable floor in GiB (5 consecutive samples below it, "
+            "or any sample below floor/2, stops the owned container). Release "
+            "default 8.0; an explicit override is recorded in launch-record.json."
+        ),
+    )
     args = parser.parse_args(argv)
+    if not 4.0 <= args.mem_available_floor_gib <= 16.0:
+        parser.error(
+            "--mem-available-floor-gib must be within [4.0, 16.0] GiB "
+            "(below 4 GiB the host is genuinely out of memory)"
+        )
+    return args
+
+
+def run(
+    argv=None,
+    *,
+    transport=None,
+    preflight_fn=None,
+    mem_reader=None,
+    stop_event=None,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+):
+    args = _parse_args(argv)
     rc, cid, record = EXIT_USAGE, None, {}
     transport = transport or DockerCliTransport()
     event = stop_event or threading.Event()
@@ -491,6 +516,7 @@ def run(
                 "receipt_sha256": expected_hash,
                 "model": sources["model"]["id"],
                 "model_sha": sources["model"]["sha"],
+                "mem_available_floor_gib": args.mem_available_floor_gib,
                 "argv": ["docker", *command],
                 "status": "STARTING",
             }
@@ -566,8 +592,18 @@ def run(
                                 if not known:
                                     rc = EXIT_WATCHDOG
                                     break
-                                low = low + 1 if available < 8 * GIB // 1024 else 0
-                                if available < 4 * GIB // 1024 or low >= 5:
+                                low = (
+                                    low + 1
+                                    if available < _mem_floor_kb(
+                                        args.mem_available_floor_gib
+                                    )
+                                    else 0
+                                )
+                                if (
+                                    available
+                                    < _mem_floor_kb(args.mem_available_floor_gib) // 2
+                                    or low >= 5
+                                ):
                                     rc = EXIT_WATCHDOG
                                     break
                                 if (
