@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import subprocess
 
+LEAK = "/home/" + "r0b0tdgx"
+
 
 def test_no_absolute_home_paths_in_tracked_source():
     out = subprocess.run(
@@ -16,6 +18,6 @@ def test_no_absolute_home_paths_in_tracked_source():
                 content = open(f, encoding="utf-8", errors="ignore").read()
             except OSError:
                 continue
-            if "/home/r0b0tdgx" in content:
+            if LEAK in content:
                 bad.append(f)
     assert bad == [], f"home paths leaked into tracked files: {bad}"
