@@ -3,10 +3,12 @@
 
 Contract:
 - Native context WINDOW = 262,144 tokens; generous RESERVE = 4,096 output
-  tokens. The largest ("full window") prompt therefore uses
-  WINDOW - RESERVE = 258,048 prompt slots.
+  tokens plus MTP_ADMISSION_RESERVE = 4 (the server's num_reserved_tokens for
+  NEXTN steps=3 native MTP). The largest ("full window") prompt therefore uses
+  WINDOW - RESERVE - MTP_ADMISSION_RESERVE = 258,044 prompt slots — the only
+  size the server actually admits at the 262,144 window (r01/r02 evidence).
 - Nine cases: single-key needles at 8192@50%, 32768@50%, 131072@50% and
-  258048@{5,25,50,75,95}% depth, plus one full-window ordered multi-key case
+  258044@{5,25,50,75,95}% depth, plus one full-window ordered multi-key case
   with needles at 33% and 66% that must be answered in order.
 - The SAME actual tokenizer and chat template render the traffic; prompts are
   POSTed to /v1/completions as list[int] token ids (exact-token, no crop, no
@@ -43,7 +45,11 @@ from http_client import CompletionResult, OpenAICompatClient  # noqa: E402
 MODEL_ID = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 WINDOW = 262_144
 RESERVE = 4_096
-MAX_PROMPT = WINDOW - RESERVE  # 258,048 full-window prompt slots
+# Native admission reservation: the server adds num_reserved_tokens (4 for
+# NEXTN steps=3 native FP8 MTP) to every request before admission, so a
+# 258,048-token prompt was rejected with 262,148 > 262,144 (r01 evidence).
+MTP_ADMISSION_RESERVE = 4
+MAX_PROMPT = WINDOW - RESERVE - MTP_ADMISSION_RESERVE  # 258,044, r02-admitted
 MAX_TOKENS = 4_096
 TEMPERATURE = 0.0
 TOP_P = 1.0

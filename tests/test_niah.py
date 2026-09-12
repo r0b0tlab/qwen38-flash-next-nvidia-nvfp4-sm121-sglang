@@ -156,7 +156,7 @@ class TestConstruction:
         cases = nz.build_default_cases(tok)
         m = nz.freeze_manifest(cases, tok)
         assert m["window"] == 262_144 and m["reserve"] == 4_096
-        assert m["max_prompt_tokens"] == 258_048
+        assert m["max_prompt_tokens"] == 258_044
         assert m["sampling"] == {"temperature": 0.0, "top_p": 1.0, "max_tokens": 4_096}
         assert m["timeout_s"] == 43_200.0
         assert len(m["cases"]) == 9
