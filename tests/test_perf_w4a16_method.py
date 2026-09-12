@@ -2,6 +2,9 @@
 
 import json
 import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -62,3 +65,68 @@ def test_transport_failure_marks_row_invalid(fake):
     assert row["valid"] is False
     assert row["aggregate_output_tokens_per_second"] is None
     assert row["error"] in {"transport", "timeout"}
+
+
+# ---------------------------------------------------------------------------
+# ladder admission proof (occupancy sampling)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_metrics_sums_label_sets():
+    text = "\n".join(
+        [
+            "# HELP sglang:num_running_reqs running",
+            'sglang:num_running_reqs{model_name="x"} 2.0',
+            'sglang:num_running_reqs{model_name="y"} 1.0',
+            "sglang:num_queue_reqs 3.0",
+            "sglang:other_metric 99",
+        ]
+    )
+    assert perf.parse_metrics(text) == {"running": 3.0, "queue": 3.0}
+
+
+def test_parse_metrics_empty():
+    assert perf.parse_metrics("") == {}
+
+
+class _MetricsHandler(BaseHTTPRequestHandler):
+    body = "sglang:num_running_reqs 1.0\n"
+
+    def do_GET(self):  # noqa: N802 - stdlib signature
+        data = self.body.encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):  # noqa: A002
+        pass
+
+
+def test_sampler_proves_true_vs_queued_concurrency():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _MetricsHandler)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        _MetricsHandler.body = "sglang:num_running_reqs 4.0\n"
+        sampler = perf.OccupancySampler(base, 4, interval=0.05)
+        with sampler:
+            time.sleep(0.2)
+        report = sampler.report()
+        assert report["true_concurrency"] is True
+        assert report["max_running_observed"] == 4.0
+        assert report["samples"] > 0
+
+        _MetricsHandler.body = (
+            "sglang:num_running_reqs 2.0\nsglang:num_queue_reqs 2.0\n"
+        )
+        queued = perf.OccupancySampler(base, 4, interval=0.05)
+        with queued:
+            time.sleep(0.2)
+        report = queued.report()
+        assert report["true_concurrency"] is False
+        assert report["max_queue_observed"] == 2.0
+    finally:
+        srv.shutdown()
+        srv.server_close()

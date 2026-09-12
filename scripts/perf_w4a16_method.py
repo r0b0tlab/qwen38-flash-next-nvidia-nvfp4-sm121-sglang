@@ -20,12 +20,90 @@ import json
 import math
 import statistics
 import sys
+import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from http_client import MODEL_ID, OpenAICompatClient  # noqa: E402
+
+
+def parse_metrics(text: str) -> Dict[str, float]:
+    """Extract the scheduler occupancy gauges from a /metrics scrape.
+
+    Returns keys ``running`` and ``queue`` with the sum over label sets.
+    Missing series are simply absent from the mapping.
+    """
+    totals: Dict[str, float] = {}
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        for name, key in (
+            ("sglang:num_running_reqs", "running"),
+            ("sglang:num_queue_reqs", "queue"),
+        ):
+            if line.startswith(name + "{") or line.startswith(name + " "):
+                try:
+                    value = float(line.split()[-1])
+                except (ValueError, IndexError):
+                    continue
+                totals[key] = totals.get(key, 0.0) + value
+    return totals
+
+
+class OccupancySampler:
+    """Background sampler proving a ladder level was truly admitted.
+
+    ``queued_only`` is set when the server never ran the requested number of
+    requests concurrently (they queued instead of running), which is exactly
+    the failure mode a max_running_requests cap produces.
+    """
+
+    def __init__(self, base: str, expected: int, interval: float = 0.25):
+        self.base = base.rstrip("/")
+        self.expected = int(expected)
+        self.interval = float(interval)
+        self.max_running = 0.0
+        self.max_queue = 0.0
+        self.samples = 0
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _scrape(self) -> None:
+        try:
+            with urllib.request.urlopen(self.base + "/metrics", timeout=5) as resp:
+                values = parse_metrics(resp.read().decode("utf-8", "replace"))
+        except Exception:
+            return
+        self.samples += 1
+        self.max_running = max(self.max_running, values.get("running", 0.0))
+        self.max_queue = max(self.max_queue, values.get("queue", 0.0))
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._scrape()
+            self._stop.wait(self.interval)
+
+    def __enter__(self) -> "OccupancySampler":
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+
+    def report(self) -> Dict[str, Any]:
+        return {
+            "expected_running": self.expected,
+            "max_running_observed": self.max_running,
+            "max_queue_observed": self.max_queue,
+            "samples": self.samples,
+            "true_concurrency": self.max_running >= self.expected,
+        }
 
 PROMPTS = [
     "Count from 1 to 700, one integer per line. No extra text.",
@@ -91,11 +169,14 @@ def run_group(
     max_tokens: int,
     timeout: float,
     concurrency: int,
+    base: Optional[str] = None,
 ) -> Dict[str, Any]:
+    sampler = OccupancySampler(base or client.base, concurrency)
     start = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [pool.submit(run_row, client, p, max_tokens, timeout) for p in prompts]
-        rows = [f.result() for f in futures]
+    with sampler:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [pool.submit(run_row, client, p, max_tokens, timeout) for p in prompts]
+            rows = [f.result() for f in futures]
     wall = time.perf_counter() - start
     valid = [r for r in rows if r["valid"]]
     errors = len(rows) - len(valid)
@@ -111,6 +192,7 @@ def run_group(
         "completion_tokens": total,
         "batch_wall_seconds": wall,
         "aggregate_output_tokens_per_second": aggregate,
+        "occupancy": sampler.report(),
         "status": "PASS" if errors == 0 and aggregate else "FAIL",
     }
 
@@ -167,6 +249,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.dedicated_max_tokens,
                 args.timeout,
                 1,
+                base=args.base,
             )
         )
 
@@ -180,7 +263,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             ]
             rows.append(
                 run_group(
-                    client, prompts, args.ladder_max_tokens, args.timeout, concurrency
+                    client,
+                    prompts,
+                    args.ladder_max_tokens,
+                    args.timeout,
+                    concurrency,
+                    base=args.base,
                 )
             )
         ladder[str(concurrency)] = rows
@@ -198,6 +286,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     dedicated_median = _median(rates(dedicated))
     ladder_medians = {
         key: _median(rates(rows)) for key, rows in ladder.items() if rates(rows)
+    }
+    levels: Dict[str, Any] = {}
+    for key, rows in ladder.items():
+        occ = [r["occupancy"] for r in rows]
+        levels[key] = {
+            "true_concurrency": bool(occ)
+            and all(o["true_concurrency"] for o in occ),
+            "max_running_observed": max(
+                (o["max_running_observed"] for o in occ), default=0.0
+            ),
+            "max_queue_observed": max(
+                (o["max_queue_observed"] for o in occ), default=0.0
+            ),
+        }
+    true_medians = {
+        key: value
+        for key, value in ladder_medians.items()
+        if levels.get(key, {}).get("true_concurrency")
     }
     errors = sum(r["errors"] for r in dedicated) + sum(
         r["errors"] for rows in ladder.values() for r in rows
@@ -223,6 +329,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         "summary": {
             "dedicated_c1_median": dedicated_median,
             "ladder_medians": ladder_medians,
+            "ladder_medians_true_concurrency": true_medians,
+            "true_concurrency_levels": sorted(true_medians, key=int),
+            "queued_only_levels": sorted(
+                [k for k, v in levels.items() if not v["true_concurrency"]], key=int
+            ),
+            "occupancy": levels,
             "ladder_geomean": _geomean(
                 [float(v) for v in ladder_medians.values() if v is not None]
             ),
