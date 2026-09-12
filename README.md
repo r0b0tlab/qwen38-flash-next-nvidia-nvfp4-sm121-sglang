@@ -4,8 +4,10 @@ Status: **QUALIFIED single-GB10 release** — machine-readable verdict in
 `releases/recovery-stable-20260909/qualification-summary.json`
 (`RUNTIME_Q200_AND_RETRIEVAL_VERIFIED`).
 
-Qualified on the exact pinned image `sha256:2ee545cf…427f56` + profile
-`090b4f10…43b0f`:
+Qualified on the exact pinned image `sha256:2ee545cf…427f56` and profile
+`nextn-262k-c2-s3` (repo file `090b4f10…`, packaged as `production-profile.json`
+file `e8c754d0…` — the same profile, JSON key order only; canonical digest
+`c8521cde67470848f608e79ee78ad74eca91d74dd85da50cd4ce3ed9db7166a3`):
 
 - Full-window NIAH **9/9 PASS** (single-key 8K/32K/131K/258K at depths
   5–95% plus the ordered two-key 33/66 case at 258,044 prompt tokens),

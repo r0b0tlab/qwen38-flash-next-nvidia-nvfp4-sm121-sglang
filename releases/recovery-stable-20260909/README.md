@@ -17,6 +17,13 @@ This is the best verified balanced C1 configuration selected from the completed 
 
 Use `qualification-summary.json` for the final machine-readable state. Missing or pending fields are not passing results. Q200-v2 means the frozen text-180 corpus plus official BFCL v4 multi_turn_base structural-hard20, not GSM8K-200. Source build provenance and runtime qualification are separate.
 
+**Profile digest equivalence.** `production-profile.json` (this package, file SHA-256
+`e8c754d0…`) and the repository's `profiles/nextn-262k-c2-s3.json` (file SHA-256
+`090b4f10…`) are the same qualified profile and differ only in JSON key order. Both reduce to
+the identical canonical JSON digest `c8521cde67470848f608e79ee78ad74eca91d74dd85da50cd4ce3ed9db7166a3`.
+Retrieval (NIAH) evidence rows bind the repository file hash `090b4f10…`; this package and its
+summary bind `e8c754d0…`. Use the canonical digest above to reconcile the evidence chain.
+
 The README inside `repro-source/` is preserved from the historical image-build commit. Its historical development status is not the current qualification report.
 
 ## Load the container

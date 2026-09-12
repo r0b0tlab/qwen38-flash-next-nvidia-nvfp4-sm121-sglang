@@ -1,6 +1,6 @@
 {
   "status": "RUNTIME_Q200_AND_RETRIEVAL_VERIFIED",
-  "checked_utc": "2026-09-12T04:44:27.353790+00:00",
+  "checked_utc": "2026-09-12T12:54:01.029674+00:00",
   "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
   "model_revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
   "image_id": "sha256:2ee545cf877ae8497c123637e061b6e6313c624e30018f975969b1d554e27f56",
@@ -110,5 +110,11 @@
     "note": "single 258,044-token full-window case per serve epoch (host-memory admission); r01/r02 infra failures superseded by these runs"
   },
   "spec_accept_length_gauge": 3.3817,
-  "spec_accept_length_note": "server-info avg_spec_accept_length after the identical W4A16-method suite (archived 2026-09-09, gauge 3.3817 vs W4A16 TP=2 3.3830); completion-weighted mean across measurement rows is secondary"
+  "spec_accept_length_note": "server-info avg_spec_accept_length after the identical W4A16-method suite (archived 2026-09-09, gauge 3.3817 vs W4A16 TP=2 3.3830); completion-weighted mean across measurement rows is secondary",
+  "profile_digest_equivalence": {
+    "packaged_profile_file_sha256": "e8c754d0442128b6d638a108bb3e349597591db90776ca7089c06766b7f76f8c",
+    "repo_profile_file_sha256": "090b4f101f154fc02f8ea49959819f0f6ffe2decfb81e4257508b5b804cf3b0f",
+    "canonical_json_sha256": "c8521cde67470848f608e79ee78ad74eca91d74dd85da50cd4ce3ed9db7166a3",
+    "note": "production-profile.json (packaged) and profiles/nextn-262k-c2-s3.json (repo) are the same profile; the files differ only in JSON key order. Both reduce to the identical canonical JSON digest (sort_keys, compact separators) above. When reconciling evidence hashes, the retrieval (NIAH) rows bind the repo file hash 090b4f10 and this summary binds the packaged file hash e8c754d0; both refer to the same qualified profile."
+  }
 }
