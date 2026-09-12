@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Matched dedicated/ladder decode suite replicating the W4A16 TP=2 method.
 
-Frozen method for cross-project comparability with
-``/home/r0b0tdgx/qwen38-flash-next-w4a16/repo/scripts/run_perf_suite.py``:
+Frozen method for cross-project comparability with the W4A16 TP=2 project's
+``repo/scripts/run_perf_suite.py`` (sibling campaign repository):
 
 - the same 16 frozen prompts, thinking OFF, temperature 0, top_p 1, streaming;
 - 1 warmup (128 tokens), dedicated c1 x5 (2048 tokens), ladder c1/c2/c4 x3 (512);
