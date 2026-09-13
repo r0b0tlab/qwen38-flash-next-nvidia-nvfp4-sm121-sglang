@@ -1,0 +1,244 @@
+{
+  "assembly": {
+    "complete": true,
+    "epochs": {
+      "main": "qwen38fn-nvidia-v101-boundedvit-FULL-20260912T225716Z (4371 rows: cvbench+mmvp+realworldqa complete, ocrbench 668)",
+      "ocrbench_resume": "qwen38fn-nvidia-v101-boundedvit-FINAL-20260913T002138Z (332 missing rows, resume_run=true)"
+    },
+    "method": "Single v1.0.1 image (sha256:47219fecc31b\u2026), vision-novitgraph profile (dd84962c\u2026), identical frozen protocol; rows merged across two serve epochs of the same image/profile because the late-ocrbench retainer (defect 2, ~6.5 MiB/row) still trips a 4 GiB safety floor after ~670 consecutive ocrbench rows.",
+    "rows_completed": 4703,
+    "rows_expected": 4703
+  },
+  "benchmark": "r0b0bench-vision",
+  "candidate_id": "qwen38fn-nvidia-v101-boundedvit",
+  "contract_sha256": "2b80e543d489e86eb8fd2abf145ae2c5647166f8a9ef5567a243d0974c4ef210",
+  "defects": [
+    {
+      "evidence": "graphs-ON run on v1.0.1 held the 16-graph budget (bounded), but each large-image graph retains ~1 GiB private pool; production vision profile ships graphs off",
+      "fix": "LRU budget SGLANG_VIT_MAX_GRAPHS=16 + in-flight replay refcount (patches/sglang.patch)",
+      "id": "vit-cuda-graph-shape-cache",
+      "status": "FIXED in v1.0.1"
+    },
+    {
+      "id": "late-ocrbench-retainer",
+      "note": "~6.5 MiB/row growth specific to ocrbench-suite traffic; memory stable (~6 GiB) across cvbench/mmvp/realworldqa. Full single-epoch completion requires the retainer fix or a per-suite floor policy; two-epoch assembly used.",
+      "status": "PARTIALLY MITIGATED"
+    }
+  ],
+  "image_id": "sha256:47219fecc31bd674f18b165ac442682f7149834ea3efab168bd66bc5eca6cdd5",
+  "mean_row_seconds": 2.28,
+  "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+  "partial": {
+    "complete": true,
+    "note": "Re-graded offline from the runner's streamed rows.jsonl after the serve was stopped by the memory watchdog; graders are the runner's own deterministic functions. Not a completed frozen run.",
+    "rows_completed": 4703,
+    "rows_expected": 4703
+  },
+  "profile_id": "090b4f101f154fc02f8ea49959819f0f6ffe2decfb81e4257508b5b804cf3b0f",
+  "protocol": {
+    "answer_instruction": "Answer with the letter or value only.",
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "image_transport": "base64 data URL (jpeg/png)",
+    "max_tokens": {
+      "cvbench": 32,
+      "mmvp": 32,
+      "ocrbench": 64,
+      "realworldqa": 32
+    },
+    "serve_requirement": "max_model_len >= 32768 (image prefill + 64 output)",
+    "temperature": 0.0,
+    "workers_default": 4
+  },
+  "runner_sha256": "2b3ce03faf30e26f27d29dd3aabb03859bbaf55272899bf67e9550cd8b81449e",
+  "salvaged_utc": "2026-09-13T00:55:26Z",
+  "schema": "r0b0bench.vision.v1",
+  "suites": {
+    "cvbench": {
+      "accuracy": 0.8795,
+      "complete": true,
+      "correct": 2320,
+      "expected_rows": 2638,
+      "license": "Apache-2.0",
+      "revision": "bc284db50d036958861cb60cdd7b77612052ce0d",
+      "rows": 2638,
+      "subaxes": {
+        "Count": {
+          "accuracy": 0.7525,
+          "correct": 593,
+          "n": 788
+        },
+        "Depth": {
+          "accuracy": 0.9533,
+          "correct": 572,
+          "n": 600
+        },
+        "Distance": {
+          "accuracy": 0.8917,
+          "correct": 535,
+          "n": 600
+        },
+        "Relation": {
+          "accuracy": 0.9538,
+          "correct": 620,
+          "n": 650
+        }
+      },
+      "wall_seconds": 4485.0,
+      "wilson95": [
+        0.8665,
+        0.8913
+      ]
+    },
+    "mmvp": {
+      "accuracy": 0.83,
+      "complete": true,
+      "correct": 249,
+      "expected_rows": 300,
+      "license": "MIT",
+      "paired": {
+        "both_correct": 104,
+        "paired_accuracy": 0.6933,
+        "pairs": 150
+      },
+      "revision": "37eafecab8a3940c50c2ade5b36de69dbc99a8cf",
+      "rows": 300,
+      "wall_seconds": 215.4,
+      "wilson95": [
+        0.7834,
+        0.8683
+      ]
+    },
+    "ocrbench": {
+      "accuracy": 0.857,
+      "complete": true,
+      "correct": 857,
+      "expected_rows": 1000,
+      "license": "MIT",
+      "official_type_scores": {
+        "Artistic Text Recognition": {
+          "n": 50,
+          "score": 46
+        },
+        "Digit String Recognition": {
+          "n": 50,
+          "score": 45
+        },
+        "Doc-oriented VQA": {
+          "n": 200,
+          "score": 170
+        },
+        "Handwriting Recognition": {
+          "n": 50,
+          "score": 39
+        },
+        "Handwritten Mathematical Expression Recognition": {
+          "n": 100,
+          "score": 78
+        },
+        "Irregular Text Recognition": {
+          "n": 50,
+          "score": 48
+        },
+        "Key Information Extraction": {
+          "n": 200,
+          "score": 177
+        },
+        "Non-Semantic Text Recognition": {
+          "n": 50,
+          "score": 43
+        },
+        "Regular Text Recognition": {
+          "n": 50,
+          "score": 49
+        },
+        "Scene Text-centric VQA": {
+          "n": 200,
+          "score": 162
+        }
+      },
+      "revision": "92a54bd1384387c178d5a07140a2d85e0a3d12e1",
+      "rows": 1000,
+      "subaxes": {
+        "Artistic Text Recognition": {
+          "accuracy": 0.92,
+          "correct": 46,
+          "n": 50
+        },
+        "Digit String Recognition": {
+          "accuracy": 0.9,
+          "correct": 45,
+          "n": 50
+        },
+        "Doc-oriented VQA": {
+          "accuracy": 0.85,
+          "correct": 170,
+          "n": 200
+        },
+        "Handwriting Recognition": {
+          "accuracy": 0.78,
+          "correct": 39,
+          "n": 50
+        },
+        "Handwritten Mathematical Expression Recognition": {
+          "accuracy": 0.78,
+          "correct": 78,
+          "n": 100
+        },
+        "Irregular Text Recognition": {
+          "accuracy": 0.96,
+          "correct": 48,
+          "n": 50
+        },
+        "Key Information Extraction": {
+          "accuracy": 0.885,
+          "correct": 177,
+          "n": 200
+        },
+        "Non-Semantic Text Recognition": {
+          "accuracy": 0.86,
+          "correct": 43,
+          "n": 50
+        },
+        "Regular Text Recognition": {
+          "accuracy": 0.98,
+          "correct": 49,
+          "n": 50
+        },
+        "Scene Text-centric VQA": {
+          "accuracy": 0.81,
+          "correct": 162,
+          "n": 200
+        }
+      },
+      "wall_seconds": 4013.7,
+      "wilson95": [
+        0.8339,
+        0.8773
+      ]
+    },
+    "realworldqa": {
+      "accuracy": 0.8039,
+      "complete": true,
+      "correct": 615,
+      "expected_rows": 765,
+      "license": "CC-BY-ND-4.0",
+      "revision": "17e7f75e092e47169732462ea3cdfebe911105dd",
+      "rows": 765,
+      "wall_seconds": 2006.9,
+      "wilson95": [
+        0.7743,
+        0.8305
+      ]
+    }
+  },
+  "total_accuracy": 0.8592,
+  "total_correct": 4041,
+  "total_rows": 4703,
+  "total_wilson95": [
+    0.849,
+    0.8689
+  ],
+  "version": "1.0.0"
+}

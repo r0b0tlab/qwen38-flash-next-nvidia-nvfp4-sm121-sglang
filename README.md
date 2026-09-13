@@ -168,13 +168,13 @@ Frozen public contract (`r0b0tlab/r0b0bench` `scripts/vision/`; pinned dataset
 revisions, deterministic graders, thinking-off, temperature 0, single image per
 request). Two result sets:
 
-| Suite | v1.0.0 image (graphs off, 3 serve epochs) | v1.0.1 image (graphs off, single epoch) |
+| Suite | v1.0.0 image (graphs off, 3 serve epochs) | v1.0.1 image (graphs off, 2 serve epochs) |
 |---|---|---|
-| cvbench (2,638) | 87.9% | see `results/vision/r0b0bench-vision-v1-summary-v101-image.json` |
-| mmvp (300) | 83.0% (paired 69.3%) | " |
-| realworldqa (765) | 80.4% | " |
-| ocrbench (1,000) | 85.9% | " |
-| **total (4,703)** | **86.0%** | " |
+| cvbench (2,638) | 87.9% | 87.9% |
+| mmvp (300) | 83.0% (paired 69.3%) | 83.0% (paired 69.3%) |
+| realworldqa (765) | 80.4% | 80.4% |
+| ocrbench (1,000) | 85.9% | 85.7% |
+| **total (4,703)** | **86.0%** | **85.9%** |
 
 Protocol notes: `--workers 2` (matches `max_running_requests` 2; the contract's
 default 4 assumes ≥4), MMVP's paired metric is directional (±8 pp at p≈0.5),
@@ -182,6 +182,13 @@ RealWorldQA is CC-BY-ND (aggregates only, no images redistributed). The v1.0.0
 numbers were assembled across three serve epochs with identical
 protocol/loaders/graders — full disclosure in the summary JSON's `assembly`
 and `defects` blocks (`results/vision/`).
+
+v1.0.1 numbers: same frozen protocol on the rebuilt image
+(`sha256:47219fecc31b…`), assembled across two serve epochs of that one
+image/profile (4,371 rows + 332-row ocrbench resume) because the
+late-ocrbench retainer below still trips a 4 GiB safety floor after ~670
+consecutive ocrbench rows. Within-Wilson agreement with the v1.0.0 result on
+every suite.
 
 **v1.0.1 vision-serving fixes** (why the image was rebuilt): upstream
 `ViTCudaGraphRunner` retained an unbounded per-image-shape graph cache; real
