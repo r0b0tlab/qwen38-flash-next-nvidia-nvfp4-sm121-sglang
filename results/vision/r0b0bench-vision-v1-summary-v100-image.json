@@ -1,0 +1,253 @@
+{
+  "assembly": {
+    "complete": true,
+    "epochs": {
+      "main": "qwen38fn-nvidia-single-gb10-c2-finalist-20260912T181412Z (cvbench+mmvp+realworldqa complete, ocrbench 667)",
+      "ocrbench_partial": "qwen38fn-nvidia-single-gb10-c2-finalist-ocrbench-20260912T194301Z (ocrbench 721)",
+      "ocrbench_resume": "qwen38fn-nvidia-single-gb10-c2-finalist-FINAL-20260912T212731Z (279 missing rows, resume_run=true)"
+    },
+    "graders": "run_vision.py deterministic graders, applied offline via salvage_summary.py to the streamed rows.jsonl (no re-generation, no re-scoring by hand)",
+    "method": "Identical protocol in every epoch (frozen benchmark.json: thinking-off, temperature 0, max_tokens 32/64, base64 single-image, deterministic graders imported from run_vision.py). The serve was restarted between epochs because of two engine memory defects (see defects), so rows carry the same image/profile/model bindings but originate from three serve epochs.",
+    "rows_completed": 4703,
+    "rows_expected": 4703
+  },
+  "benchmark": "r0b0bench-vision",
+  "candidate_id": "qwen38fn-nvidia-single-gb10-c2-finalist",
+  "contract_sha256": "2b80e543d489e86eb8fd2abf145ae2c5647166f8a9ef5567a243d0974c4ef210",
+  "defects": [
+    {
+      "evidence": "185 distinct image sizes in the first 400 cvbench rows; telemetry traces in .hermes/evidence/vision*/vision-state/telemetry.jsonl",
+      "id": "vit-cuda-graph-shape-cache",
+      "mitigation": "vision.cuda_graph=false (SGLANG_VIT_ENABLE_CUDA_GRAPH=0); LM decode graphs unchanged",
+      "root_cause": "sglang/srt/multimodal/vit_cuda_graph_runner.py ViTCudaGraphRunner retains unbounded per-shape dicts (graphs + input/output/workspace + rotary-window buffers) keyed by (tokens, attention_layout); no cap/eviction",
+      "symptom": "host MemAvailable declined ~48 MiB per vision row; two serves stopped by the memory watchdog"
+    },
+    {
+      "evidence": "run logs + telemetry in .hermes/evidence/vision3*/ and vision5*/; follow-up work item",
+      "id": "second-vision-retainer",
+      "status": "unattributed; per-process RSS snapshots captured at run start only (containers were already stopped at the post-run snapshot)",
+      "symptom": "with ViT graphs off, memory still declined ~0.4-0.6 GiB/min under vision traffic (not per-row constant)"
+    }
+  ],
+  "image_id": "sha256:2ee545cf877ae8497c123637e061b6e6313c624e30018f975969b1d554e27f56",
+  "mean_row_seconds": 2.286,
+  "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+  "partial": {
+    "complete": true,
+    "note": "Re-graded offline from the runner's streamed rows.jsonl after the serve was stopped by the memory watchdog; graders are the runner's own deterministic functions. Not a completed frozen run.",
+    "rows_completed": 4703,
+    "rows_expected": 4703
+  },
+  "profile_id": "e8c754d0442128b6d638a108bb3e349597591db90776ca7089c06766b7f76f8c",
+  "protocol": {
+    "answer_instruction": "Answer with the letter or value only.",
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "image_transport": "base64 data URL (jpeg/png)",
+    "max_tokens": {
+      "cvbench": 32,
+      "mmvp": 32,
+      "ocrbench": 64,
+      "realworldqa": 32
+    },
+    "serve_requirement": "max_model_len >= 32768 (image prefill + 64 output)",
+    "temperature": 0.0,
+    "workers_default": 4
+  },
+  "runner_sha256": "2b3ce03faf30e26f27d29dd3aabb03859bbaf55272899bf67e9550cd8b81449e",
+  "salvaged_utc": "2026-09-12T21:48:06Z",
+  "schema": "r0b0bench.vision.v1",
+  "served_profile": {
+    "note": "sha256 of the file the guard served. The shipped finalist profile (e8c754d0\u2026) is byte-identical except vision.cuda_graph; the first two epochs were labelled with e8c754d0 in rows (label defect), the resume epoch used the served sha.",
+    "profile_file_sha256": "dd84962c1dbe3c790c84f58675bcacfeb6ebfc52440bc5c39f57c60421b0fdbc",
+    "profile_path": "profiles/vision-novitgraph.json"
+  },
+  "suites": {
+    "cvbench": {
+      "accuracy": 0.8791,
+      "complete": true,
+      "correct": 2319,
+      "expected_rows": 2638,
+      "license": "Apache-2.0",
+      "revision": "bc284db50d036958861cb60cdd7b77612052ce0d",
+      "rows": 2638,
+      "subaxes": {
+        "Count": {
+          "accuracy": 0.7525,
+          "correct": 593,
+          "n": 788
+        },
+        "Depth": {
+          "accuracy": 0.9533,
+          "correct": 572,
+          "n": 600
+        },
+        "Distance": {
+          "accuracy": 0.8917,
+          "correct": 535,
+          "n": 600
+        },
+        "Relation": {
+          "accuracy": 0.9523,
+          "correct": 619,
+          "n": 650
+        }
+      },
+      "wall_seconds": 4493.9,
+      "wilson95": [
+        0.8661,
+        0.891
+      ]
+    },
+    "mmvp": {
+      "accuracy": 0.83,
+      "complete": true,
+      "correct": 249,
+      "expected_rows": 300,
+      "license": "MIT",
+      "paired": {
+        "both_correct": 104,
+        "paired_accuracy": 0.6933,
+        "pairs": 150
+      },
+      "revision": "37eafecab8a3940c50c2ade5b36de69dbc99a8cf",
+      "rows": 300,
+      "wall_seconds": 220.4,
+      "wilson95": [
+        0.7834,
+        0.8683
+      ]
+    },
+    "ocrbench": {
+      "accuracy": 0.859,
+      "complete": true,
+      "correct": 859,
+      "expected_rows": 1000,
+      "license": "MIT",
+      "official_type_scores": {
+        "Artistic Text Recognition": {
+          "n": 50,
+          "score": 45
+        },
+        "Digit String Recognition": {
+          "n": 50,
+          "score": 44
+        },
+        "Doc-oriented VQA": {
+          "n": 200,
+          "score": 167
+        },
+        "Handwriting Recognition": {
+          "n": 50,
+          "score": 39
+        },
+        "Handwritten Mathematical Expression Recognition": {
+          "n": 100,
+          "score": 81
+        },
+        "Irregular Text Recognition": {
+          "n": 50,
+          "score": 48
+        },
+        "Key Information Extraction": {
+          "n": 200,
+          "score": 179
+        },
+        "Non-Semantic Text Recognition": {
+          "n": 50,
+          "score": 45
+        },
+        "Regular Text Recognition": {
+          "n": 50,
+          "score": 49
+        },
+        "Scene Text-centric VQA": {
+          "n": 200,
+          "score": 162
+        }
+      },
+      "revision": "92a54bd1384387c178d5a07140a2d85e0a3d12e1",
+      "rows": 1000,
+      "subaxes": {
+        "Artistic Text Recognition": {
+          "accuracy": 0.9,
+          "correct": 45,
+          "n": 50
+        },
+        "Digit String Recognition": {
+          "accuracy": 0.88,
+          "correct": 44,
+          "n": 50
+        },
+        "Doc-oriented VQA": {
+          "accuracy": 0.835,
+          "correct": 167,
+          "n": 200
+        },
+        "Handwriting Recognition": {
+          "accuracy": 0.78,
+          "correct": 39,
+          "n": 50
+        },
+        "Handwritten Mathematical Expression Recognition": {
+          "accuracy": 0.81,
+          "correct": 81,
+          "n": 100
+        },
+        "Irregular Text Recognition": {
+          "accuracy": 0.96,
+          "correct": 48,
+          "n": 50
+        },
+        "Key Information Extraction": {
+          "accuracy": 0.895,
+          "correct": 179,
+          "n": 200
+        },
+        "Non-Semantic Text Recognition": {
+          "accuracy": 0.9,
+          "correct": 45,
+          "n": 50
+        },
+        "Regular Text Recognition": {
+          "accuracy": 0.98,
+          "correct": 49,
+          "n": 50
+        },
+        "Scene Text-centric VQA": {
+          "accuracy": 0.81,
+          "correct": 162,
+          "n": 200
+        }
+      },
+      "wall_seconds": 3970.1,
+      "wilson95": [
+        0.8361,
+        0.8792
+      ]
+    },
+    "realworldqa": {
+      "accuracy": 0.8039,
+      "complete": true,
+      "correct": 615,
+      "expected_rows": 765,
+      "license": "CC-BY-ND-4.0",
+      "revision": "17e7f75e092e47169732462ea3cdfebe911105dd",
+      "rows": 765,
+      "wall_seconds": 2065.4,
+      "wilson95": [
+        0.7743,
+        0.8305
+      ]
+    }
+  },
+  "total_accuracy": 0.8595,
+  "total_correct": 4042,
+  "total_rows": 4703,
+  "total_wilson95": [
+    0.8492,
+    0.8691
+  ],
+  "version": "1.0.0"
+}

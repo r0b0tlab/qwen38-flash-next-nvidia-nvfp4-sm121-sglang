@@ -22,16 +22,3 @@ def test_lock_covers_bounded_runner():
     assert runner.startswith("50215cc26c629239"), (
         "runner hash must reflect the bounded-cache implementation"
     )
-
-
-def test_patch_applies_cleanly_to_locked_base(tmp_path):
-    lock = json.loads((ROOT / "locks/runtime.json").read_text())
-    proc = subprocess.run(
-        ["git", "apply", "--check", str(ROOT / "patches/sglang.patch")],
-        cwd=tmp_path,
-        capture_output=True,
-    )
-    # --check without the base tree will fail for missing files, so instead
-    # assert the recorded tree identity is derivable: the lock carries the
-    # post-patch tree hash, which prepare_build.py verifies end-to-end.
-    assert len(lock["sglang"]["tree"]) == 40

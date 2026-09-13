@@ -95,7 +95,7 @@ returns cleanly with `finish_reason: stop`.
 | PLE embedding offload | file-backed, 4 GiB RSS budget (`/cache/ple/<model-sha>`) |
 | Memory admission | `mem_fraction_static` 0.88, chunked prefill 4096 |
 | Page size | 64 |
-| Vision | triton mm attention, ViT CUDA graphs on, 1 mm processor worker |
+| Vision | triton mm attention, 1 mm processor worker; ViT CUDA graphs **bounded** (LRU cap `SGLANG_VIT_MAX_GRAPHS`, default 16; see v1.0.1 note) — vision benchmarking and sustained mixed-shape vision traffic run with graphs off (`profiles/vision-novitgraph.json`) because each retained large-image graph holds a ~1 GiB private pool on the unified GB10 memory |
 
 ## Measured host/GPU memory & startup (post-suite server telemetry)
 
@@ -161,6 +161,40 @@ no throughput claim from this run.
 
 8 image (color/geometry/OCR/counting), 1 multi-image, 2 video order-tracking;
 median TTFT 2.88 s. Input/media hashes validated.
+
+### Vision benchmark — r0b0bench-vision v1.0 (4,703 rows, 4 suites)
+
+Frozen public contract (`r0b0tlab/r0b0bench` `scripts/vision/`; pinned dataset
+revisions, deterministic graders, thinking-off, temperature 0, single image per
+request). Two result sets:
+
+| Suite | v1.0.0 image (graphs off, 3 serve epochs) | v1.0.1 image (graphs off, single epoch) |
+|---|---|---|
+| cvbench (2,638) | 87.9% | see `results/vision/r0b0bench-vision-v1-summary-v101-image.json` |
+| mmvp (300) | 83.0% (paired 69.3%) | " |
+| realworldqa (765) | 80.4% | " |
+| ocrbench (1,000) | 85.9% | " |
+| **total (4,703)** | **86.0%** | " |
+
+Protocol notes: `--workers 2` (matches `max_running_requests` 2; the contract's
+default 4 assumes ≥4), MMVP's paired metric is directional (±8 pp at p≈0.5),
+RealWorldQA is CC-BY-ND (aggregates only, no images redistributed). The v1.0.0
+numbers were assembled across three serve epochs with identical
+protocol/loaders/graders — full disclosure in the summary JSON's `assembly`
+and `defects` blocks (`results/vision/`).
+
+**v1.0.1 vision-serving fixes** (why the image was rebuilt): upstream
+`ViTCudaGraphRunner` retained an unbounded per-image-shape graph cache; real
+benchmark traffic (185 distinct image sizes in the first 400 cvbench rows)
+drove ~48 MiB/row of permanent unified-memory growth until the safety watchdog
+stopped the serve. The shipped patch adds an LRU budget
+(`SGLANG_VIT_MAX_GRAPHS`, default 16) with an in-flight replay refcount so a
+live replay is never evicted. With graphs ON the budget now holds — but each
+retained large-image graph keeps a ~1 GiB private pool, so bounded-16 still
+costs ~20 GiB on a 128 GiB unified node; sustained mixed-shape vision work
+therefore ships graphs OFF (`profiles/vision-novitgraph.json`, byte-identical
+to the production profile except `vision.cuda_graph`). The 4 GiB
+`MultiModalStaticCache` behaves as a configured bound, not a leak.
 
 ### Throughput & speculative decoding
 
